@@ -382,6 +382,93 @@ class TestProjectMapping(unittest.TestCase):
             html = m.get_root().render()
             self.assertIn("District 4 (1 projects)", html)
             self.assertIn("PID 418000244", html)
+            self.assertIn("Georgia", html)
+
+
+class TestFormattingAndSensors(unittest.TestCase):
+    """Tests verifying float postmile cleanup, compound sensor extraction, and bare-bones serif styling."""
+
+    def test_format_pm_float_precision(self):
+        self.assertEqual(pems_interface.format_pm("8.6999999999999993"), "8.7")
+        self.assertEqual(pems_interface.format_pm(78.400000000000006), "78.4")
+        self.assertEqual(pems_interface.format_pm("R11.400000000000002"), "R11.4")
+        self.assertEqual(pems_interface.format_pm("I-10 30.3"), "30.3")
+        self.assertEqual(pems_interface.format_pm(None), "")
+
+    def test_split_ca_pm_route_prefix_and_precision(self):
+        pfx, val = pems_interface.split_ca_pm("I-10 30.3")
+        self.assertEqual(pfx, "")
+        self.assertAlmostEqual(val, 30.3, places=2)
+
+        pfx, val = pems_interface.split_ca_pm("8.6999999999999993")
+        self.assertEqual(pfx, "")
+        self.assertAlmostEqual(val, 8.7, places=2)
+
+    def test_parse_master_row_compound_sensors_and_census(self):
+        row = {
+            "Project ID": "1200020279",
+            "Dist": "12",
+            "County": "Orange",
+            "State": "CA",
+            "Route": "5",
+            "Direction": "NB",
+            "Begin PM": "6.2",
+            "End PM": "8.6999999999999993",
+            "temp_abs_begin": "78.400000000000006",
+            "temp_abs_end": "80.900000000000006",
+            "Sensor Station 1 ID ": "1204409",
+            "Sensor Station 1 HOV ID": "1210066",
+            "Sensor Station 2 ID ": "1204395+1210063 (HOV)\t",
+            "Sensor Station 3 ID ": "SHEEP CREEK ROAD [5.764]",
+            "area_type": "suburban"
+        }
+        rec = pems_interface.parse_master_row(row)
+        self.assertEqual(rec.begin_pm, "6.2")
+        self.assertEqual(rec.end_pm, "8.7")
+        self.assertEqual(rec.abs_begin_pm, 78.4)
+        self.assertEqual(rec.abs_end_pm, 80.9)
+        # Asserts each station is isolated and not concatenated
+        self.assertEqual(rec.sensor_stations, ["1204409", "1210066", "1204395", "1210063"])
+        self.assertNotIn("12043951210063", rec.sensor_stations)
+        self.assertNotIn("5764", rec.sensor_stations)
+
+    def test_popup_and_tooltip_bare_bones_serif(self):
+        rec = pems_interface.ProjectRecord(
+            project_id="1200020279",
+            dist="12",
+            county="Orange",
+            state="CA",
+            route="5",
+            direction="NB",
+            begin_pm="6.2",
+            end_pm="8.6999999999999993",
+            abs_begin_pm=78.400000000000006,
+            abs_end_pm=80.900000000000006,
+            sensor_stations=["1204409", "1204395", "1210063"],
+            raw_row={"area_type": "suburban"}
+        )
+        builder = pems_interface.ProjectPeMSQueryBuilder(rec)
+        popup = pems_interface.make_project_popup_html(rec, builder, length_mi=2.5)
+        tooltip = pems_interface.make_project_tooltip_html(rec, length_mi=2.5)
+
+        # Basic serif typography check
+        self.assertIn("font-family: Georgia, 'Times New Roman', Times, serif", popup)
+        self.assertIn("font-family: Georgia, 'Times New Roman', Times, serif", tooltip)
+
+        # Postmile clean formatting check
+        self.assertIn("PM 6.2 &rarr; 8.7 (2.50 mi)", popup)
+        self.assertIn("78.4 &rarr; 80.9", popup)
+        self.assertNotIn("8.6999999999999993", popup)
+        self.assertNotIn("8.6999999999999993", tooltip)
+
+        # Classified area type check (not "Unknown")
+        self.assertIn("Area: Suburban", popup)
+        self.assertNotIn("Area: Unknown", popup)
+
+        # Individual sensor links check
+        self.assertIn("station_id=1204409", popup)
+        self.assertIn("station_id=1204395", popup)
+        self.assertIn("station_id=1210063", popup)
 
 
 if __name__ == "__main__":

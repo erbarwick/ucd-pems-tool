@@ -79,40 +79,41 @@ PAGE = """<!doctype html>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-         background:#f4f6f8; color:#16181d; }
-  .wrap { max-width:1180px; margin:0 auto; padding:22px 20px 40px; }
-  h1 { font-size:19px; margin:0 0 3px; }
-  p.sub { margin:0 0 16px; color:#667085; font-size:13px; }
-  form { background:#fff; border:1px solid #e2e5ea; border-radius:10px; padding:14px 16px;
-         display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  body { margin:0; font:15px/1.45 Georgia, "Times New Roman", Times, serif;
+         background:#ffffff; color:#000000; }
+  .wrap { max-width:1180px; margin:0 auto; padding:18px 16px 36px; }
+  h1 { font-size:20px; font-weight:bold; margin:0 0 2px; }
+  p.sub { margin:0 0 14px; color:#333333; font-size:13px; }
+  form { background:#ffffff; border:1px solid #000000; border-radius:0; padding:10px 12px;
+         display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
          align-items:end; }
-  label { display:block; font-size:11px; font-weight:700; color:#475467;
-          text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
-  input[type=text] { width:100%; padding:8px 10px; font-size:14px; border:1px solid #cfd4dc;
-                     border-radius:6px; background:#fff; font-variant-numeric:tabular-nums; }
-  input:disabled { background:#f2f4f7; color:#98a2b3; }
-  .chk { display:flex; align-items:center; gap:7px; font-size:13px; padding-bottom:8px; }
-  .chk label { margin:0; text-transform:none; letter-spacing:0; font-size:13px; font-weight:500; }
-  button { padding:9px 16px; font-size:14px; font-weight:600; border:0; border-radius:6px;
-           background:#2563eb; color:#fff; cursor:pointer; width:100%; }
-  button:hover { background:#1d4ed8; }
-  .hint { font-size:12px; color:#667085; min-height:18px; margin:8px 2px 0; }
-  .banner { margin:14px 0 0; padding:10px 14px; border-radius:8px; font-size:13px;
-            background:#fff7e6; border:1px solid #f0c36d; color:#7a5200; }
-  .card { margin-top:16px; background:#fff; border:1px solid #e2e5ea; border-radius:10px;
+  label { display:block; font-size:11.5px; font-weight:bold; color:#000000;
+          text-transform:uppercase; letter-spacing:.03em; margin-bottom:4px; }
+  input[type=text] { width:100%; padding:5px 8px; font-size:14px; font-family:inherit;
+                     border:1px solid #000000; border-radius:0; background:#ffffff; }
+  input:disabled { background:#eeeeee; color:#777777; }
+  .chk { display:flex; align-items:center; gap:6px; font-size:13px; padding-bottom:6px; }
+  .chk label { margin:0; text-transform:none; letter-spacing:0; font-size:13px; font-weight:normal; }
+  button { padding:6px 14px; font-size:14px; font-family:inherit; font-weight:bold;
+           border:1px solid #000000; border-radius:0; background:#f0f0f0; color:#000000;
+           cursor:pointer; width:100%; }
+  button:hover { background:#e0e0e0; }
+  .hint { font-size:12px; color:#444444; min-height:16px; margin:6px 2px 0; }
+  .banner { margin:12px 0 0; padding:8px 12px; border-radius:0; font-size:13px;
+            background:#ffffff; border:1px solid #000000; color:#000000; }
+  .card { margin-top:14px; background:#ffffff; border:1px solid #000000; border-radius:0;
           overflow:hidden; }
-  .card > header { padding:9px 14px; border-bottom:1px solid #eef0f3; font-size:12.5px;
-                   color:#475467; display:flex; justify-content:space-between; align-items:center; gap:10px; }
-  .card a { color:#2563eb; text-decoration:none; font-weight:600; }
+  .card > header { padding:6px 10px; border-bottom:1px solid #000000; font-size:13px;
+                   background:#f4f4f4; color:#000000; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .card a { color:#0000ee; text-decoration:underline; font-weight:normal; }
   .card a:hover { text-decoration:underline; }
-  iframe { display:block; width:100%; height:620px; border:0; background:#fff; }
-  code { background:#eef1f5; padding:1px 5px; border-radius:4px; font-size:12px; }
+  iframe { display:block; width:100%; height:620px; border:0; background:#ffffff; }
+  code { background:#eeeeee; padding:1px 4px; border:1px solid #cccccc; border-radius:0; font-size:12px; font-family:monospace; }
 </style>
 <div class="wrap">
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; border-bottom: 1px solid #000; padding-bottom: 8px;">
     <h1 style="margin:0;">PeMS Postmile Verification</h1>
-    <a href="/projects/map" target="_blank" style="background:#2563eb; color:#fff; padding:6px 14px; border-radius:6px; text-decoration:none; font-size:13px; font-weight:600;">🗺️ View All CA Projects Map</a>
+    <a href="/projects/map" target="_blank" style="color:#0000ee; text-decoration:underline; font-size:14px;">[View All CA Projects Map]</a>
   </div>
   <form id="f" method="get" action="/map" target="mapframe">
     <div>

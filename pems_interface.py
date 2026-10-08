@@ -172,10 +172,36 @@ def normalize_route(r: Any) -> str:
     return re.sub(r"[^0-9]", "", str(r))
 
 
+def format_pm(val: Any) -> str:
+    """
+    Format a postmile cleanly, eliminating floating-point artifacts (e.g. 8.6999999999999993 -> 8.7).
+    Preserves letter prefixes (e.g. R, M, L), suffixes (e.g. L, R), and strips route prefixes.
+    """
+    if val is None or pd.isna(val) or val == "":
+        return ""
+    s = str(val).strip()
+    s = re.sub(r"^(?:I|SR|US|RTE|ROUTE|HWY)\s*[-]?\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    m = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s)
+    if m:
+        pfx = m.group(1).strip()
+        num = float(m.group(2))
+        sfx = m.group(3).strip()
+        rounded = round(num, 3)
+        num_str = f"{rounded:.3f}".rstrip("0").rstrip(".")
+        return f"{pfx}{num_str}{sfx}"
+    try:
+        num = float(s)
+        rounded = round(num, 3)
+        return f"{rounded:.3f}".rstrip("0").rstrip(".")
+    except (ValueError, TypeError):
+        return s
+
+
 def split_ca_pm(ca_pm: Any) -> Tuple[str, float]:
     """
     Split a California postmile string into prefix and float number.
-    Handles letter prefixes (R, L, M) and suffix letters (L, R, A).
+    Handles letter prefixes (R, L, M) and suffix letters (L, R, A),
+    as well as embedded route markers (e.g. 'I-10 30.3').
     e.g. 'R3.80' -> ('R', 3.8), '12.4L' -> ('', 12.4), 'R12.4A' -> ('R', 12.4)
     """
     if ca_pm is None or (isinstance(ca_pm, float) and np.isnan(ca_pm)):
@@ -184,15 +210,15 @@ def split_ca_pm(ca_pm: Any) -> Tuple[str, float]:
     if not s:
         return "", np.nan
 
-    # Prefix: non-digits; Numeric: digits + decimal; Suffix: trailing non-digits
-    match = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s)
+    s_clean = re.sub(r"^(?:I|SR|US|RTE|ROUTE|HWY)\s*[-]?\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    match = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s_clean)
     if match:
         pfx = match.group(1).strip()
-        num = float(match.group(2))
+        num = round(float(match.group(2)), 4)
         return pfx, num
 
     try:
-        return "", float(s)
+        return "", round(float(s_clean), 4)
     except (TypeError, ValueError):
         return s, np.nan
 
@@ -747,8 +773,8 @@ def parse_master_row(row: Dict[str, Any]) -> ProjectRecord:
     state = str(row.get("State", "CA")).strip()
     route = str(row.get("Route", "")).strip()
     direction = str(row.get("Direction", "")).strip().upper()
-    begin_pm = str(row.get("Begin PM", "")).strip()
-    end_pm = str(row.get("End PM", "")).strip()
+    begin_pm = format_pm(str(row.get("Begin PM", "")).strip())
+    end_pm = format_pm(str(row.get("End PM", "")).strip())
 
     # Absolute PMs
     abs_beg = None
@@ -756,7 +782,7 @@ def parse_master_row(row: Dict[str, Any]) -> ProjectRecord:
     for k in ("temp_abs_begin", "Absolute Begin PM", "Abs Begin PM"):
         if k in row and pd.notna(row[k]):
             try:
-                abs_beg = float(row[k])
+                abs_beg = round(float(row[k]), 3)
                 break
             except ValueError:
                 pass
@@ -764,7 +790,7 @@ def parse_master_row(row: Dict[str, Any]) -> ProjectRecord:
     for k in ("temp_abs_end", "Absolute End PM", "Abs End PM"):
         if k in row and pd.notna(row[k]):
             try:
-                abs_end = float(row[k])
+                abs_end = round(float(row[k]), 3)
                 break
             except ValueError:
                 pass
@@ -809,15 +835,16 @@ def parse_master_row(row: Dict[str, Any]) -> ProjectRecord:
     sensor_stations = []
     for col in (
         "Sensor Station 1 ID ", "Sensor Station 1 ID",
+        "Sensor Station 1 HOV ID",
         "Sensor Station 2 ID ", "Sensor Station 2 ID",
         "Sensor Station 3 ID ", "Sensor Station 3 ID",
         "Sensor Station 4 ID ", "Sensor Station 4 ID"
     ):
         s_val = str(row.get(col, "")).strip()
         if s_val and s_val.lower() not in ("nan", "none", "0", ""):
-            digits = "".join(filter(str.isdigit, s_val))
-            if digits and digits not in sensor_stations:
-                sensor_stations.append(digits)
+            for sid in re.findall(r"\b\d{5,9}\b", s_val):
+                if sid not in sensor_stations:
+                    sensor_stations.append(sid)
 
     return ProjectRecord(
         project_id=pid,
@@ -1045,31 +1072,33 @@ def get_project_corridor_geometry(
 
 
 def make_project_tooltip_html(project: ProjectRecord, length_mi: float = 0.0) -> str:
-    """Generate compact hover tooltip HTML for a road path."""
+    """Generate compact hover tooltip HTML for a road path with bare-bones serif aesthetic."""
     sensors_str = ", ".join(project.sensor_stations) if project.sensor_stations else "None listed"
     b_lanes = project.raw_row.get("dir_lanes_before", "?")
     a_lanes = project.raw_row.get("dir_lanes_after", "?")
+    b_pm = format_pm(project.begin_pm)
+    e_pm = format_pm(project.end_pm)
     desc = str(project.raw_row.get("Project Description", "")).strip()
     if len(desc) > 85:
         desc = desc[:82] + "..."
 
     return f"""
-    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; line-height: 1.4; min-width: 210px;">
-      <div style="font-weight: 700; font-size: 13px; color: #1e3a8a; margin-bottom: 2px;">
+    <div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 13px; line-height: 1.4; min-width: 210px; color: #000; background: #fff; padding: 6px 8px; border: 1px solid #000;">
+      <div style="font-weight: bold; font-size: 13px; color: #000; margin-bottom: 2px;">
         PID {project.project_id} &middot; Route {project.route} {project.direction}
       </div>
       <div><b>Dist {project.dist}</b> &middot; {project.county} County</div>
-      <div><b>Postmiles:</b> PM {project.begin_pm} &rarr; {project.end_pm} ({length_mi:.1f} mi)</div>
+      <div><b>Postmiles:</b> PM {b_pm} &rarr; {e_pm} ({length_mi:.2f} mi)</div>
       <div><b>Directional Lanes:</b> {b_lanes} &rarr; {a_lanes}</div>
       <div><b>Dates:</b> Const: {project.construction_begin_date or 'N/A'} | Open: {project.open_to_traffic_date or 'N/A'}</div>
       <div><b>Sensors:</b> {sensors_str}</div>
-      {f'<div style="color: #475467; font-size: 11px; margin-top: 4px; border-top: 1px solid #e2e8f0; padding-top: 2px;">{desc}</div>' if desc else ''}
+      {f'<div style="color: #333; font-size: 12px; margin-top: 4px; border-top: 1px solid #666; padding-top: 3px;">{desc}</div>' if desc else ''}
     </div>
     """
 
 
 def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBuilder, length_mi: float = 0.0) -> str:
-    """Generate detailed click popup card HTML with live PeMS links."""
+    """Generate detailed click popup card HTML with bare-bones serif aesthetic and live links."""
     urls = builder.generate_all_urls()
     raw = project.raw_row
     tot_b = raw.get("Total Lanes Before", raw.get("total_lanes_before", "?"))
@@ -1077,45 +1106,46 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
     dir_b = raw.get("dir_lanes_before", "?")
     dir_a = raw.get("dir_lanes_after", "?")
     added_lm = raw.get("Total Added Lanes (Lane Miles)", raw.get("New GP Lanes (Lane Miles)", "?"))
-    facility = raw.get("Facility Class", "Freeway")
-    area_type = raw.get("Area Type", raw.get('Area Type ("Urban", "Suburban", "Exurban", "Rural", or "Unknown")', "Unknown"))
-    desc = raw.get("Project Description", "")
+    facility = str(raw.get("Facility Class checked by Lu") or raw.get("Facility Class") or raw.get("facility_class") or "Freeway").strip()
+    area_type = str(raw.get("area_type") or raw.get("Area Type") or raw.get('Area Type ("Urban", "Suburban", "Exurban", "Rural", or "Unknown")') or "Unknown").strip().capitalize()
+    desc = str(raw.get("Project Description", "")).strip()
+
+    b_pm = format_pm(project.begin_pm)
+    e_pm = format_pm(project.end_pm)
+    abs_b = format_pm(project.abs_begin_pm)
+    abs_e = format_pm(project.abs_end_pm)
 
     sensor_links = []
     for s_id in project.sensor_stations:
         s_url = urls["station_summary_urls"].get(s_id, f"https://pems.dot.ca.gov/?dnode=VDS&station_id={s_id}")
-        sensor_links.append(f'<a href="{s_url}" target="_blank" style="color: #2563eb; text-decoration: underline; font-weight: 600;">{s_id}</a>')
+        sensor_links.append(f'<a href="{s_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">{s_id}</a>')
     sensor_html = ", ".join(sensor_links) if sensor_links else "None listed"
 
     return f"""
-    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; line-height: 1.5; width: 330px; padding: 2px;">
-      <div style="border-bottom: 2px solid #2563eb; padding-bottom: 6px; margin-bottom: 8px;">
-        <span style="background: #2563eb; color: #fff; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; text-transform: uppercase;">Dist {project.dist}</span>
-        <span style="background: #e2e8f0; color: #334155; font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-left: 4px;">{facility}</span>
-        <h3 style="margin: 6px 0 0; font-size: 16px; color: #0f172a;">PID {project.project_id} &middot; Route {project.route} {project.direction}</h3>
-        <div style="color: #64748b; font-size: 12px;">{project.county} County &middot; Area: {area_type}</div>
+    <div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 13px; line-height: 1.45; width: 330px; padding: 6px; color: #000; background: #fff;">
+      <div style="border-bottom: 1px solid #000; padding-bottom: 4px; margin-bottom: 6px;">
+        <div style="font-size: 12px; font-weight: bold; text-transform: uppercase;">District {project.dist} &middot; {facility}</div>
+        <h3 style="margin: 4px 0 2px; font-size: 15px; font-weight: bold; color: #000;">PID {project.project_id} &middot; Route {project.route} {project.direction}</h3>
+        <div style="font-size: 12px; color: #333;">{project.county} County &middot; Area: {area_type}</div>
       </div>
 
-      <table style="width: 100%; font-size: 12px; margin-bottom: 8px; border-collapse: collapse;">
-        <tr><td style="color: #64748b; padding: 2px 0;">Postmiles:</td><td style="font-weight: 600;">PM {project.begin_pm} &rarr; {project.end_pm} ({length_mi:.2f} mi)</td></tr>
-        {f'<tr><td style="color: #64748b; padding: 2px 0;">Abs PMs:</td><td>{project.abs_begin_pm} &rarr; {project.abs_end_pm}</td></tr>' if project.abs_begin_pm else ''}
-        <tr><td style="color: #64748b; padding: 2px 0;">Directional Lanes:</td><td style="font-weight: 600;">{dir_b} &rarr; {dir_a}</td></tr>
-        <tr><td style="color: #64748b; padding: 2px 0;">Total Roadway Lanes:</td><td>{tot_b} &rarr; {tot_a}</td></tr>
-        <tr><td style="color: #64748b; padding: 2px 0;">Lane Miles Added:</td><td>{added_lm}</td></tr>
-        <tr><td style="color: #64748b; padding: 2px 0;">Construction Date:</td><td>{project.construction_begin_date or 'N/A'}</td></tr>
-        <tr><td style="color: #64748b; padding: 2px 0;">Open to Traffic:</td><td>{project.open_to_traffic_date or 'N/A'}</td></tr>
-        <tr><td style="color: #64748b; padding: 2px 0;">Sensors:</td><td>{sensor_html}</td></tr>
+      <table style="width: 100%; font-size: 12px; margin-bottom: 8px; border-collapse: collapse; border: 1px solid #666;">
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Postmiles:</td><td style="padding: 2px 4px; font-weight: bold;">PM {b_pm} &rarr; {e_pm} ({length_mi:.2f} mi)</td></tr>
+        {f'<tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Abs PMs:</td><td style="padding: 2px 4px;">{abs_b} &rarr; {abs_e}</td></tr>' if abs_b else ''}
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Directional Lanes:</td><td style="padding: 2px 4px; font-weight: bold;">{dir_b} &rarr; {dir_a}</td></tr>
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Total Roadway Lanes:</td><td style="padding: 2px 4px;">{tot_b} &rarr; {tot_a}</td></tr>
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Lane Miles Added:</td><td style="padding: 2px 4px;">{added_lm}</td></tr>
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Construction Date:</td><td style="padding: 2px 4px;">{project.construction_begin_date or 'N/A'}</td></tr>
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Open to Traffic:</td><td style="padding: 2px 4px;">{project.open_to_traffic_date or 'N/A'}</td></tr>
+        <tr><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Sensors:</td><td style="padding: 2px 4px;">{sensor_html}</td></tr>
       </table>
 
-      {f'<div style="font-size: 11px; color: #475467; background: #f8fafc; padding: 6px; border-radius: 4px; margin-bottom: 8px; max-height: 55px; overflow-y: auto;">{desc}</div>' if desc else ''}
+      {f'<div style="font-size: 11.5px; color: #333; border: 1px solid #ccc; padding: 4px; margin-bottom: 6px; max-height: 55px; overflow-y: auto;">{desc}</div>' if desc else ''}
 
-      <div style="display: flex; gap: 8px; margin-top: 8px;">
-        <a href="{urls['lane_config_url']}" target="_blank" style="display: inline-block; flex: 1; text-align: center; background: #2563eb; color: #fff; text-decoration: none; font-size: 11px; font-weight: 600; padding: 6px 8px; border-radius: 4px;">
-          PeMS Lane Config &rarr;
-        </a>
-        <a href="{urls['geometry_url']}" target="_blank" style="display: inline-block; text-align: center; background: #f1f5f9; color: #334155; text-decoration: none; font-size: 11px; font-weight: 600; padding: 6px 8px; border-radius: 4px; border: 1px solid #cbd5e1;">
-          Geometry
-        </a>
+      <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #000; font-size: 12px;">
+        <a href="{urls['lane_config_url']}" target="_blank" style="color: #0000ee; text-decoration: underline;">[PeMS Lane Config]</a>
+        &nbsp;&nbsp;
+        <a href="{urls['geometry_url']}" target="_blank" style="color: #0000ee; text-decoration: underline;">[Route Geometry]</a>
       </div>
     </div>
     """
@@ -1200,6 +1230,26 @@ def build_single_project_map(
 
     folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
     folium.LayerControl(position='topright').add_to(m)
+
+    m.get_root().header.add_child(folium.Element("""
+<style>
+  body, .leaflet-container, .leaflet-popup-content, .leaflet-control-layers, .leaflet-tooltip {
+    font-family: Georgia, 'Times New Roman', Times, serif !important;
+  }
+  .leaflet-popup-content-wrapper {
+    border-radius: 0px !important;
+    border: 1px solid #000 !important;
+    box-shadow: none !important;
+  }
+  .leaflet-popup-tip {
+    box-shadow: none !important;
+  }
+  .leaflet-tooltip {
+    border-radius: 0px !important;
+    box-shadow: none !important;
+  }
+</style>
+"""))
 
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -1304,6 +1354,26 @@ def build_multi_project_map(
 
     folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
     folium.LayerControl(position='topright', collapsed=False).add_to(m)
+
+    m.get_root().header.add_child(folium.Element("""
+<style>
+  body, .leaflet-container, .leaflet-popup-content, .leaflet-control-layers, .leaflet-tooltip {
+    font-family: Georgia, 'Times New Roman', Times, serif !important;
+  }
+  .leaflet-popup-content-wrapper {
+    border-radius: 0px !important;
+    border: 1px solid #000 !important;
+    box-shadow: none !important;
+  }
+  .leaflet-popup-tip {
+    box-shadow: none !important;
+  }
+  .leaflet-tooltip {
+    border-radius: 0px !important;
+    box-shadow: none !important;
+  }
+</style>
+"""))
 
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)

@@ -243,19 +243,41 @@ def clean_dataset():
                 r['dir_lanes_after'] = str(derived_a)
                 r['total_lanes_after'] = str(derived_a * 2)
 
-        # Clean PM prefixes
-        b_pm = str(r.get('Begin PM', '')).strip()
-        e_pm = str(r.get('End PM', '')).strip()
-        if 'SCL' in b_pm: b_pm = b_pm.replace('SCL', '').strip()
-        if 'I-10S' in b_pm: b_pm = b_pm.replace('I-10S', '').strip()
-        if 'SM' in e_pm: e_pm = e_pm.replace('SM', '').strip()
-        r['Begin PM'] = b_pm
-        r['End PM'] = e_pm
+        # Clean PM prefixes & float precision
+        def clean_pm_str(val):
+            if not val: return ""
+            s = str(val).strip()
+            for pfx_strip in ['SCL', 'I-10S', 'I-10', 'SM']:
+                s = s.replace(pfx_strip, '').strip()
+            m = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s)
+            if m:
+                pfx = m.group(1).strip()
+                num = float(m.group(2))
+                sfx = m.group(3).strip()
+                num_str = f"{round(num, 3):.3f}".rstrip('0').rstrip('.')
+                return f"{pfx}{num_str}{sfx}"
+            return s
+
+        r['Begin PM'] = clean_pm_str(r.get('Begin PM', ''))
+        r['End PM'] = clean_pm_str(r.get('End PM', ''))
+
+        for abs_col in ['temp_abs_begin', 'temp_abs_end', 'Absolute Begin PM', 'Absolute End PM']:
+            if abs_col in r and r[abs_col]:
+                try:
+                    num = float(str(r[abs_col]).strip())
+                    r[abs_col] = f"{round(num, 3):.3f}".rstrip('0').rstrip('.')
+                except ValueError:
+                    pass
         
         # Fix Route 46 Kern County Abs PM (PID 612000175)
         if pid == '612000175':
             r['temp_abs_begin'] = '84.4'
             r['temp_abs_end'] = '86.1'
+
+        # Clean sensor fields whitespace/tabs
+        for c in list(r.keys()):
+            if 'Sensor' in c and isinstance(r[c], str):
+                r[c] = r[c].strip()
 
         # --- SENSORS & HOV SEPARATION ---
         s1 = r.get('Sensor Station 1 ID ', '').strip()
