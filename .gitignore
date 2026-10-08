@@ -34,4 +34,6 @@ Thumbs.db
 
 # Output HTML maps and logs
 route_map_*.html
+all_ca_projects_map.html
+district_*_projects_map.html
 *.log

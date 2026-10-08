@@ -22,7 +22,7 @@ ag.workspace/
 │   ├── transform_master.py                 # Pipeline that produced cleaned dataset
 │   └── validate_lane_counts.py             # Lane count consistency validator
 ├── tests/
-│   └── test_pems_interface.py  # Branch-proven automated test suite (32 unit tests)
+│   └── test_pems_interface.py  # Branch-proven automated test suite (36 unit tests)
 └── README.md
 ```
 
@@ -70,7 +70,23 @@ Query coordinates, corridor reference segments, and generate a lane configuratio
 python pems_interface.py --route 80 --dir E --begin-pm 11.4 --end-pm 12.8 --county Solano
 ```
 
-#### 4. Batch URL Overview
+#### 4. Interactive Project Mapping
+Generate interactive Folium/Leaflet web maps showing road paths/corridors, postmile boundaries, and hover/click metadata:
+```bash
+# Map a single project by PID (creates route_map_<PID>.html and opens in browser)
+python pems_interface.py --map 418000244
+
+# Map all 118 projects across California simultaneously (with layer controls by District)
+python pems_interface.py --map-all
+
+# Map all projects within a specific District (e.g. District 4 - Bay Area)
+python pems_interface.py --map-all --dist 4
+
+# Save map to a custom path without automatically launching the browser
+python pems_interface.py --map-all --output-map maps/california_all.html --no-open
+```
+
+#### 5. Batch URL Overview
 Generate and preview PeMS URLs across the master dataset:
 ```bash
 python pems_interface.py --list-urls
@@ -121,7 +137,31 @@ client.download_file(lane_url, "downloads/lane_config_80E.txt")
 
 # 5. Closest Caltrans Census stations
 census_df = find_closest_census_stations(route="80", district="4", ca_pm=11.4, top_n=3)
+
+# 6. Interactive Folium Road Path Mapping
+from pems_interface import build_single_project_map, build_multi_project_map
+
+# Generate and view map for a single project (or split project pairs)
+single_map = build_single_project_map("418000244", output_path="route_map_418000244.html")
+
+# Generate and view map for all 118 projects with District layer controls
+all_map = build_multi_project_map(output_path="all_ca_projects_map.html")
 ```
+
+---
+
+### C. Web Interface (Flask)
+
+The local Flask application includes full interactive mapping:
+
+```bash
+python app.py
+```
+
+- Open `http://127.0.0.1:5000/projects/map` to view all 118 highway projects statewide on an interactive Leaflet map with District toggle controls.
+- Filter by district: `http://127.0.0.1:5000/projects/map?dist=4`.
+- View an individual project corridor: `http://127.0.0.1:5000/projects/map/<pid>`.
+- Hovering over any corridor reveals the Project ID, Route, Direction, District, County, Postmile bounds, and directional lane counts. Clicking opens a comprehensive project card with direct external links to Caltrans PeMS and sensor stations.
 
 ---
 

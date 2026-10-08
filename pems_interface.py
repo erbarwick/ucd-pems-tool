@@ -56,6 +56,13 @@ EXAMPLE USAGE
   # E. Find Closest Caltrans Census Stations:
   census_stations = find_closest_census_stations(route="80", district="4", ca_pm=11.4, top_n=3)
 
+  # F. Interactive Map Generation (Folium / Leaflet with hover & popups):
+  from pems_interface import build_single_project_map, build_multi_project_map
+  # Map a single project corridor and open in browser:
+  build_single_project_map("418000244", output_path="map_418000244.html", open_browser=True)
+  # Map all 118 projects across California with district layer toggles:
+  build_multi_project_map(output_path="all_projects.html", open_browser=True)
+
 2. Command-Line Interface (CLI):
 --------------------------------
   # Test PeMS credentials and login
@@ -66,6 +73,15 @@ EXAMPLE USAGE
 
   # Inspect a project and find closest Census stations
   python pems_interface.py --inspect 300000061 --census
+
+  # Map a specific project as a road path and open in browser
+  python pems_interface.py --map 418000244
+
+  # Map ALL 118 projects across California and open in browser
+  python pems_interface.py --map-all
+
+  # Map all projects in a specific District (e.g. District 4 - Bay Area)
+  python pems_interface.py --map-all --dist 4
 
   # Ad-hoc query for coordinates and corridor segments
   python pems_interface.py --route 80 --dir E --begin-pm 11.4 --end-pm 12.8 --county Solano
@@ -92,6 +108,8 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 import numpy as np
+import folium
+import webbrowser
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -840,9 +858,17 @@ def load_master_csv(csv_path: Optional[str] = None) -> List[ProjectRecord]:
 class ProjectPeMSQueryBuilder:
     """Builds and resolves PeMS queries for a given ProjectRecord."""
 
-    def __init__(self, project: ProjectRecord, ref_df: Optional[pd.DataFrame] = None):
+    def __init__(self, project: ProjectRecord, ref_df: Optional[Any] = None):
         self.project = project
-        self.ref_df = ref_df if ref_df is not None else load_geo_reference()
+        if isinstance(ref_df, IndexedGeoReference):
+            self.idx_ref = ref_df
+            self.ref_df = ref_df.raw_df
+        elif ref_df is not None:
+            self.idx_ref = IndexedGeoReference(ref_df)
+            self.ref_df = ref_df
+        else:
+            self.idx_ref = get_indexed_geo_ref()
+            self.ref_df = self.idx_ref.raw_df
 
     def resolve_geometry(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
         """Resolve start and end coordinates from postmiles if not already present."""
@@ -856,12 +882,12 @@ class ProjectPeMSQueryBuilder:
         if start is None and b_pm:
             start = pm_to_coordinates(
                 self.project.route, self.project.pems_direction, b_pm,
-                county=self.project.county, is_absolute=is_abs, ref_df=self.ref_df
+                county=self.project.county, is_absolute=is_abs, ref_df=self.idx_ref
             )
         if end is None and e_pm:
             end = pm_to_coordinates(
                 self.project.route, self.project.pems_direction, e_pm,
-                county=self.project.county, is_absolute=is_abs, ref_df=self.ref_df
+                county=self.project.county, is_absolute=is_abs, ref_df=self.idx_ref
             )
         return start, end
 
@@ -884,7 +910,7 @@ class ProjectPeMSQueryBuilder:
         df = get_corridor_stations(
             self.project.route, self.project.pems_direction,
             b_pm, e_pm, is_absolute=is_abs, county=self.project.county,
-            ref_df=self.ref_df
+            ref_df=self.idx_ref
         )
         if df.empty:
             return []
@@ -950,6 +976,346 @@ class ProjectPeMSQueryBuilder:
 
 
 # ---------------------------------------------------------------------------
+# INTERACTIVE MAP ENGINE (FOLIUM / LEAFLET)
+# ---------------------------------------------------------------------------
+DISTRICT_COLORS = {
+    "1": "#2563eb",   # Royal Blue
+    "2": "#059669",   # Emerald
+    "3": "#16a34a",   # Green
+    "4": "#0284c7",   # Sky Blue
+    "5": "#d97706",   # Amber
+    "6": "#0d9488",   # Teal
+    "7": "#dc2626",   # Crimson
+    "8": "#9333ea",   # Purple
+    "9": "#b45309",   # Brown
+    "10": "#ea580c",  # Orange
+    "11": "#c026d3",  # Fuchsia
+    "12": "#e11d48",  # Rose
+}
+
+
+def get_project_corridor_geometry(
+    project: ProjectRecord,
+    idx_ref: Optional[IndexedGeoReference] = None
+) -> List[Tuple[float, float]]:
+    """
+    Extract ordered list of (lat, lng) points representing the actual road path.
+    Prefers high-resolution 0.1-mile PeMS reference segments, falling back to endpoints.
+    """
+    ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
+    sub = ref.get_corridor(project.route, project.pems_direction)
+    coords: List[Tuple[float, float]] = []
+
+    if sub is not None and not sub.empty:
+        b_pm = project.abs_begin_pm
+        e_pm = project.abs_end_pm
+        is_abs = True
+
+        if b_pm is None or e_pm is None:
+            _, b_num = split_ca_pm(project.begin_pm)
+            _, e_num = split_ca_pm(project.end_pm)
+            b_pm = b_num
+            e_pm = e_num
+            is_abs = False
+
+        if b_pm is not None and e_pm is not None and not np.isnan(b_pm) and not np.isnan(e_pm):
+            min_pm, max_pm = min(float(b_pm), float(e_pm)), max(float(b_pm), float(e_pm))
+            ascending = float(b_pm) <= float(e_pm)
+
+            if is_abs:
+                pts = sub[(sub["_abs_pm"] >= min_pm - 0.05) & (sub["_abs_pm"] <= max_pm + 0.05)]
+                pts = pts.sort_values(by="_abs_pm", ascending=ascending)
+            else:
+                county_clean = str(project.county).strip().lower()
+                pts = sub[
+                    (sub["_ca_num"] >= min_pm - 0.05) &
+                    (sub["_ca_num"] <= max_pm + 0.05) &
+                    (sub["_county"] == county_clean)
+                ]
+                pts = pts.sort_values(by="_ca_num", ascending=ascending)
+
+            if len(pts) >= 2:
+                valid_pts = pts.dropna(subset=["_lat", "_lng"])
+                coords = [(float(r["_lat"]), float(r["_lng"])) for _, r in valid_pts.iterrows()]
+
+    if len(coords) < 2 and project.start_coords and project.end_coords:
+        coords = [project.start_coords, project.end_coords]
+
+    return coords
+
+
+def make_project_tooltip_html(project: ProjectRecord, length_mi: float = 0.0) -> str:
+    """Generate compact hover tooltip HTML for a road path."""
+    sensors_str = ", ".join(project.sensor_stations) if project.sensor_stations else "None listed"
+    b_lanes = project.raw_row.get("dir_lanes_before", "?")
+    a_lanes = project.raw_row.get("dir_lanes_after", "?")
+    desc = str(project.raw_row.get("Project Description", "")).strip()
+    if len(desc) > 85:
+        desc = desc[:82] + "..."
+
+    return f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 12px; line-height: 1.4; min-width: 210px;">
+      <div style="font-weight: 700; font-size: 13px; color: #1e3a8a; margin-bottom: 2px;">
+        PID {project.project_id} &middot; Route {project.route} {project.direction}
+      </div>
+      <div><b>Dist {project.dist}</b> &middot; {project.county} County</div>
+      <div><b>Postmiles:</b> PM {project.begin_pm} &rarr; {project.end_pm} ({length_mi:.1f} mi)</div>
+      <div><b>Directional Lanes:</b> {b_lanes} &rarr; {a_lanes}</div>
+      <div><b>Dates:</b> Const: {project.construction_begin_date or 'N/A'} | Open: {project.open_to_traffic_date or 'N/A'}</div>
+      <div><b>Sensors:</b> {sensors_str}</div>
+      {f'<div style="color: #475467; font-size: 11px; margin-top: 4px; border-top: 1px solid #e2e8f0; padding-top: 2px;">{desc}</div>' if desc else ''}
+    </div>
+    """
+
+
+def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBuilder, length_mi: float = 0.0) -> str:
+    """Generate detailed click popup card HTML with live PeMS links."""
+    urls = builder.generate_all_urls()
+    raw = project.raw_row
+    tot_b = raw.get("Total Lanes Before", raw.get("total_lanes_before", "?"))
+    tot_a = raw.get("Total Lanes After", raw.get("total_lanes_after", "?"))
+    dir_b = raw.get("dir_lanes_before", "?")
+    dir_a = raw.get("dir_lanes_after", "?")
+    added_lm = raw.get("Total Added Lanes (Lane Miles)", raw.get("New GP Lanes (Lane Miles)", "?"))
+    facility = raw.get("Facility Class", "Freeway")
+    area_type = raw.get("Area Type", raw.get('Area Type ("Urban", "Suburban", "Exurban", "Rural", or "Unknown")', "Unknown"))
+    desc = raw.get("Project Description", "")
+
+    sensor_links = []
+    for s_id in project.sensor_stations:
+        s_url = urls["station_summary_urls"].get(s_id, f"https://pems.dot.ca.gov/?dnode=VDS&station_id={s_id}")
+        sensor_links.append(f'<a href="{s_url}" target="_blank" style="color: #2563eb; text-decoration: underline; font-weight: 600;">{s_id}</a>')
+    sensor_html = ", ".join(sensor_links) if sensor_links else "None listed"
+
+    return f"""
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; line-height: 1.5; width: 330px; padding: 2px;">
+      <div style="border-bottom: 2px solid #2563eb; padding-bottom: 6px; margin-bottom: 8px;">
+        <span style="background: #2563eb; color: #fff; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; text-transform: uppercase;">Dist {project.dist}</span>
+        <span style="background: #e2e8f0; color: #334155; font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-left: 4px;">{facility}</span>
+        <h3 style="margin: 6px 0 0; font-size: 16px; color: #0f172a;">PID {project.project_id} &middot; Route {project.route} {project.direction}</h3>
+        <div style="color: #64748b; font-size: 12px;">{project.county} County &middot; Area: {area_type}</div>
+      </div>
+
+      <table style="width: 100%; font-size: 12px; margin-bottom: 8px; border-collapse: collapse;">
+        <tr><td style="color: #64748b; padding: 2px 0;">Postmiles:</td><td style="font-weight: 600;">PM {project.begin_pm} &rarr; {project.end_pm} ({length_mi:.2f} mi)</td></tr>
+        {f'<tr><td style="color: #64748b; padding: 2px 0;">Abs PMs:</td><td>{project.abs_begin_pm} &rarr; {project.abs_end_pm}</td></tr>' if project.abs_begin_pm else ''}
+        <tr><td style="color: #64748b; padding: 2px 0;">Directional Lanes:</td><td style="font-weight: 600;">{dir_b} &rarr; {dir_a}</td></tr>
+        <tr><td style="color: #64748b; padding: 2px 0;">Total Roadway Lanes:</td><td>{tot_b} &rarr; {tot_a}</td></tr>
+        <tr><td style="color: #64748b; padding: 2px 0;">Lane Miles Added:</td><td>{added_lm}</td></tr>
+        <tr><td style="color: #64748b; padding: 2px 0;">Construction Date:</td><td>{project.construction_begin_date or 'N/A'}</td></tr>
+        <tr><td style="color: #64748b; padding: 2px 0;">Open to Traffic:</td><td>{project.open_to_traffic_date or 'N/A'}</td></tr>
+        <tr><td style="color: #64748b; padding: 2px 0;">Sensors:</td><td>{sensor_html}</td></tr>
+      </table>
+
+      {f'<div style="font-size: 11px; color: #475467; background: #f8fafc; padding: 6px; border-radius: 4px; margin-bottom: 8px; max-height: 55px; overflow-y: auto;">{desc}</div>' if desc else ''}
+
+      <div style="display: flex; gap: 8px; margin-top: 8px;">
+        <a href="{urls['lane_config_url']}" target="_blank" style="display: inline-block; flex: 1; text-align: center; background: #2563eb; color: #fff; text-decoration: none; font-size: 11px; font-weight: 600; padding: 6px 8px; border-radius: 4px;">
+          PeMS Lane Config &rarr;
+        </a>
+        <a href="{urls['geometry_url']}" target="_blank" style="display: inline-block; text-align: center; background: #f1f5f9; color: #334155; text-decoration: none; font-size: 11px; font-weight: 600; padding: 6px 8px; border-radius: 4px; border: 1px solid #cbd5e1;">
+          Geometry
+        </a>
+      </div>
+    </div>
+    """
+
+
+def build_single_project_map(
+    target_pid: str,
+    projects: Optional[List[ProjectRecord]] = None,
+    output_path: Optional[str] = None,
+    open_browser: bool = False,
+    tiles: str = "cartodbpositron"
+) -> Optional[folium.Map]:
+    """
+    Build a folium map for a single project (or both directions if split).
+    """
+    projs = projects or load_master_csv()
+    matched = [p for p in projs if p.project_id == str(target_pid).strip()]
+    if not matched:
+        LOGGER.error(f"Project ID '{target_pid}' not found.")
+        return None
+
+    idx_ref = get_indexed_geo_ref()
+    m = folium.Map(tiles=tiles)
+    all_coords: List[Tuple[float, float]] = []
+
+    for p in matched:
+        coords = get_project_corridor_geometry(p, idx_ref)
+        if not coords:
+            continue
+        all_coords.extend(coords)
+        color = DISTRICT_COLORS.get(p.dist, "#2563eb")
+
+        length_mi = 0.0
+        if p.abs_begin_pm is not None and p.abs_end_pm is not None:
+            length_mi = abs(p.abs_end_pm - p.abs_begin_pm)
+        else:
+            _, b_n = split_ca_pm(p.begin_pm)
+            _, e_n = split_ca_pm(p.end_pm)
+            if not np.isnan(b_n) and not np.isnan(e_n):
+                length_mi = abs(e_n - b_n)
+
+        builder = ProjectPeMSQueryBuilder(p, idx_ref)
+        tooltip_html = make_project_tooltip_html(p, length_mi)
+        popup_html = make_project_popup_html(p, builder, length_mi)
+
+        folium.PolyLine(
+            coords,
+            weight=6,
+            color=color,
+            opacity=0.9,
+            tooltip=folium.Tooltip(tooltip_html, sticky=True),
+            popup=folium.Popup(popup_html, max_width=370)
+        ).add_to(m)
+
+        folium.CircleMarker(
+            coords[0],
+            radius=5,
+            color="#16a34a",
+            fill=True,
+            fill_color="#16a34a",
+            fill_opacity=1.0,
+            tooltip=f"Start: Route {p.route} {p.direction} PM {p.begin_pm}"
+        ).add_to(m)
+
+        folium.CircleMarker(
+            coords[-1],
+            radius=5,
+            color="#dc2626",
+            fill=True,
+            fill_color="#dc2626",
+            fill_opacity=1.0,
+            tooltip=f"End: Route {p.route} {p.direction} PM {p.end_pm}"
+        ).add_to(m)
+
+    if all_coords:
+        lats = [c[0] for c in all_coords]
+        lngs = [c[1] for c in all_coords]
+        m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]], padding=(30, 30))
+    else:
+        m.location = [36.7783, -119.4179]
+        m.zoom_start = 6
+
+    folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
+    folium.LayerControl(position='topright').add_to(m)
+
+    if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        m.save(output_path)
+        LOGGER.info(f"Project map saved to {output_path}")
+        if open_browser:
+            webbrowser.open("file://" + os.path.abspath(output_path))
+
+    return m
+
+
+def build_multi_project_map(
+    projects: Optional[List[ProjectRecord]] = None,
+    dist: Optional[str] = None,
+    output_path: Optional[str] = None,
+    open_browser: bool = False,
+    tiles: str = "cartodbpositron"
+) -> folium.Map:
+    """
+    Build a multi-project interactive folium map across California.
+    Projects are mapped as highway road paths with hover tooltips and click popups,
+    organized into toggleable District feature groups.
+    """
+    projs = projects or load_master_csv()
+    if dist:
+        dist_clean = str(dist).replace(".0", "").strip()
+        projs = [p for p in projs if p.dist == dist_clean]
+        LOGGER.info(f"Filtered to District {dist_clean} ({len(projs)} projects)")
+
+    idx_ref = get_indexed_geo_ref()
+    m = folium.Map(tiles=tiles)
+    all_coords: List[Tuple[float, float]] = []
+
+    dist_groups: Dict[str, List[ProjectRecord]] = {}
+    for p in projs:
+        dist_groups.setdefault(p.dist, []).append(p)
+
+    sorted_dists = sorted(dist_groups.keys(), key=lambda d: int(d) if d.isdigit() else 999)
+
+    for d in sorted_dists:
+        p_list = dist_groups[d]
+        color = DISTRICT_COLORS.get(d, "#2563eb")
+        fg = folium.FeatureGroup(name=f"District {d} ({len(p_list)} projects)", show=True)
+
+        for p in p_list:
+            coords = get_project_corridor_geometry(p, idx_ref)
+            if not coords:
+                continue
+            all_coords.extend(coords)
+
+            length_mi = 0.0
+            if p.abs_begin_pm is not None and p.abs_end_pm is not None:
+                length_mi = abs(p.abs_end_pm - p.abs_begin_pm)
+            else:
+                _, b_n = split_ca_pm(p.begin_pm)
+                _, e_n = split_ca_pm(p.end_pm)
+                if not np.isnan(b_n) and not np.isnan(e_n):
+                    length_mi = abs(e_n - b_n)
+
+            builder = ProjectPeMSQueryBuilder(p, idx_ref)
+            tooltip_html = make_project_tooltip_html(p, length_mi)
+            popup_html = make_project_popup_html(p, builder, length_mi)
+
+            folium.PolyLine(
+                coords,
+                weight=5,
+                color=color,
+                opacity=0.85,
+                tooltip=folium.Tooltip(tooltip_html, sticky=True),
+                popup=folium.Popup(popup_html, max_width=370)
+            ).add_to(fg)
+
+            folium.CircleMarker(
+                coords[0],
+                radius=3.5,
+                color="#16a34a",
+                fill=True,
+                fill_color="#16a34a",
+                fill_opacity=0.9,
+                tooltip=f"PID {p.project_id} Start PM {p.begin_pm}"
+            ).add_to(fg)
+
+            folium.CircleMarker(
+                coords[-1],
+                radius=3.5,
+                color="#dc2626",
+                fill=True,
+                fill_color="#dc2626",
+                fill_opacity=0.9,
+                tooltip=f"PID {p.project_id} End PM {p.end_pm}"
+            ).add_to(fg)
+
+        fg.add_to(m)
+
+    if all_coords:
+        lats = [c[0] for c in all_coords]
+        lngs = [c[1] for c in all_coords]
+        m.fit_bounds([[min(lats), min(lngs)], [max(lats), max(lngs)]], padding=(20, 20))
+    else:
+        m.location = [36.7783, -119.4179]
+        m.zoom_start = 6
+
+    folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
+    folium.LayerControl(position='topright', collapsed=False).add_to(m)
+
+    if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        m.save(output_path)
+        LOGGER.info(f"Multi-project map saved to {output_path}")
+        if open_browser:
+            webbrowser.open("file://" + os.path.abspath(output_path))
+
+    return m
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main():
@@ -958,6 +1324,11 @@ def main():
     )
     parser.add_argument("--input", "-i", default=DEFAULT_MASTER_CSV, help="Path to cleaned Master CSV.")
     parser.add_argument("--inspect", "-p", help="Inspect a specific Project ID.")
+    parser.add_argument("--map", metavar="PID", help="Generate interactive map for a specific Project ID and open in browser.")
+    parser.add_argument("--map-all", action="store_true", help="Generate interactive map for all projects and open in browser.")
+    parser.add_argument("--output-map", "-o", help="Custom output path for generated HTML map.")
+    parser.add_argument("--no-open", action="store_true", help="Do not automatically open map in browser.")
+    parser.add_argument("--dist", help="Filter --map-all to a specific Caltrans District (e.g. '4').")
     parser.add_argument("--list-urls", action="store_true", help="List generated PeMS URLs for projects.")
     parser.add_argument("--test-login", action="store_true", help="Test PeMS login credentials.")
     parser.add_argument("--census", action="store_true", help="Search closest Census stations.")
@@ -1001,6 +1372,23 @@ def main():
 
     projects = load_master_csv(args.input)
     print(f"Loaded {len(projects)} projects from {args.input}")
+
+    if args.map:
+        target_pid = str(args.map).strip()
+        out_file = args.output_map or f"route_map_{target_pid}.html"
+        open_b = not args.no_open
+        m = build_single_project_map(target_pid, projects=projects, output_path=out_file, open_browser=open_b)
+        if m is None:
+            sys.exit(1)
+        print(f"\n✓ Generated interactive map for Project {target_pid} -> {out_file}")
+        return
+
+    if args.map_all:
+        out_file = args.output_map or ("all_ca_projects_map.html" if not args.dist else f"district_{args.dist}_projects_map.html")
+        open_b = not args.no_open
+        m = build_multi_project_map(projects=projects, dist=args.dist, output_path=out_file, open_browser=open_b)
+        print(f"\n✓ Generated interactive multi-project map -> {out_file}")
+        return
 
     if args.inspect:
         target_pid = str(args.inspect).strip()

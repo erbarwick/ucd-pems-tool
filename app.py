@@ -110,7 +110,10 @@ PAGE = """<!doctype html>
   code { background:#eef1f5; padding:1px 5px; border-radius:4px; font-size:12px; }
 </style>
 <div class="wrap">
-  <h1>PeMS Postmile Verification</h1>
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+    <h1 style="margin:0;">PeMS Postmile Verification</h1>
+    <a href="/projects/map" target="_blank" style="background:#2563eb; color:#fff; padding:6px 14px; border-radius:6px; text-decoration:none; font-size:13px; font-weight:600;">🗺️ View All CA Projects Map</a>
+  </div>
   <form id="f" method="get" action="/map" target="mapframe">
     <div>
       <label for="route">Route</label>
@@ -402,6 +405,28 @@ def api_reload():
     df = reference_df()
     return jsonify({"reloaded": True, "rows": None if df is None else int(len(df)),
                     "columns": [] if df is None else list(df.columns)})
+
+
+# ----------------------------------------------------------------------------
+# project maps (multi-project and single-project)
+# ----------------------------------------------------------------------------
+@app.get("/projects/map")
+def projects_map_view():
+    import pems_interface
+    dist = request.args.get("dist")
+    m = pems_interface.build_multi_project_map(dist=dist)
+    html = m.get_root().render()
+    return Response(html, mimetype="text/html")
+
+
+@app.get("/projects/map/<pid>")
+def project_single_map_view(pid):
+    import pems_interface
+    m = pems_interface.build_single_project_map(pid)
+    if m is None:
+        return _err("Project not found", detail=f"No project with ID {pid}", code=404)
+    html = m.get_root().render()
+    return Response(html, mimetype="text/html")
 
 
 @app.get("/healthz")

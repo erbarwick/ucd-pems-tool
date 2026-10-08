@@ -307,5 +307,82 @@ class TestMasterRowParsing(unittest.TestCase):
         self.assertEqual(rec.sensor_stations, ["410756", "429041"])
 
 
+class TestProjectMapping(unittest.TestCase):
+    """Tests verifying Folium interactive map generation for projects."""
+
+    def setUp(self):
+        self.mock_ref_df = pd.DataFrame([
+            {"District": "4", "County": "Solano", "CA PM": "11.4", "Abs PM": "38.9", "Latitude": "38.201", "Longitude": "-122.156", "Route": "80", "Direction": "E"},
+            {"District": "4", "County": "Solano", "CA PM": "12.0", "Abs PM": "39.5", "Latitude": "38.208", "Longitude": "-122.147", "Route": "80", "Direction": "E"},
+            {"District": "4", "County": "Solano", "CA PM": "12.8", "Abs PM": "40.3", "Latitude": "38.216", "Longitude": "-122.138", "Route": "80", "Direction": "E"},
+        ])
+        self.mock_idx = pems_interface.IndexedGeoReference(self.mock_ref_df)
+
+        self.mock_project = pems_interface.ProjectRecord(
+            project_id="418000244",
+            dist="4",
+            county="Solano",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="11.4",
+            end_pm="12.8",
+            abs_begin_pm=38.9,
+            abs_end_pm=40.3,
+            start_coords=(38.201, -122.156),
+            end_coords=(38.216, -122.138),
+            construction_begin_date="2021-09-01",
+            open_to_traffic_date="2022-10-01",
+            sensor_stations=["410756", "429041"],
+            raw_row={
+                "Project Description": "I-80 Managed Lanes expansion",
+                "dir_lanes_before": "3",
+                "dir_lanes_after": "4"
+            }
+        )
+
+    def test_get_project_corridor_geometry_from_reference(self):
+        coords = pems_interface.get_project_corridor_geometry(self.mock_project, self.mock_idx)
+        self.assertEqual(len(coords), 3)
+        self.assertAlmostEqual(coords[0][0], 38.201, places=3)
+        self.assertAlmostEqual(coords[-1][0], 38.216, places=3)
+
+    def test_get_project_corridor_geometry_fallback_to_endpoints(self):
+        orphan_project = pems_interface.ProjectRecord(
+            project_id="999",
+            dist="1",
+            county="Mendocino",
+            state="CA",
+            route="999",
+            direction="NB",
+            begin_pm="1.0",
+            end_pm="2.0",
+            start_coords=(39.1, -123.1),
+            end_coords=(39.2, -123.2),
+            sensor_stations=[]
+        )
+        coords = pems_interface.get_project_corridor_geometry(orphan_project, self.mock_idx)
+        self.assertEqual(len(coords), 2)
+        self.assertEqual(coords[0], (39.1, -123.1))
+        self.assertEqual(coords[1], (39.2, -123.2))
+
+    def test_build_single_project_map(self):
+        with patch.object(pems_interface, "get_indexed_geo_ref", return_value=self.mock_idx):
+            m = pems_interface.build_single_project_map("418000244", projects=[self.mock_project])
+            self.assertIsNotNone(m)
+            html = m.get_root().render()
+            self.assertIn("PID 418000244", html)
+            self.assertIn("Route 80 EB", html)
+            self.assertIn("Solano County", html)
+
+    def test_build_multi_project_map_layers(self):
+        with patch.object(pems_interface, "get_indexed_geo_ref", return_value=self.mock_idx):
+            m = pems_interface.build_multi_project_map(projects=[self.mock_project])
+            self.assertIsNotNone(m)
+            html = m.get_root().render()
+            self.assertIn("District 4 (1 projects)", html)
+            self.assertIn("PID 418000244", html)
+
+
 if __name__ == "__main__":
     unittest.main()
