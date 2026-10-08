@@ -10,6 +10,72 @@ Consolidates and optimizes all PeMS interaction code across the CERCET Californi
   - Strict input validation and regex parsing for postmiles, directions, and routes.
   - Validated URL builders conforming to Caltrans PeMS parameters.
   - Master project CSV integration (Dist, County, State, coordinates, route, direction, PMs).
+
+=============================================================================
+EXAMPLE USAGE
+=============================================================================
+
+1. Python Module API:
+---------------------
+  from pems_interface import (
+      PeMSClient,
+      load_master_csv,
+      ProjectPeMSQueryBuilder,
+      pm_to_coordinates,
+      build_lane_config_url,
+      build_station_aadt_url,
+      build_station_flow_url,
+      find_closest_census_stations,
+  )
+
+  # A. Postmile to Coordinate Conversion (O(1) indexed lookup):
+  coords = pm_to_coordinates(route="80", direction="E", pm="11.4", county="Solano")
+  # Returns: (38.201952, -122.156967)
+
+  # B. Generate PeMS Download URLs:
+  lane_url = build_lane_config_url(
+      route="80", direction="E", start_date="2021-01-01", end_date="2024-12-31"
+  )
+  aadt_url = build_station_aadt_url(station_id="410756", start_year=2021, end_year=2022)
+  flow_url = build_station_flow_url(station_id="410756", start_year=2021, granularity="month")
+
+  # C. Process Projects from Master CSV:
+  projects = load_master_csv("staging/Master_CA_Project_List_Cleaned.csv")
+  for proj in projects:
+      builder = ProjectPeMSQueryBuilder(proj)
+      start_coords, end_coords = builder.resolve_geometry()
+      urls = builder.generate_all_urls()
+      print(f"Project {proj.project_id}: {urls['corridor']}")
+      print(f"  Lane config URL: {urls['lane_config_url']}")
+
+  # D. Authenticate & Download from PeMS:
+  client = PeMSClient()  # Reads PEMS_USERNAME and PEMS_PASSWORD from .env
+  client.login()
+  client.download_file(url=lane_url, out_path="downloads/lane_config_80E.txt")
+
+  # E. Find Closest Caltrans Census Stations:
+  census_stations = find_closest_census_stations(route="80", district="4", ca_pm=11.4, top_n=3)
+
+2. Command-Line Interface (CLI):
+--------------------------------
+  # Test PeMS credentials and login
+  python pems_interface.py --test-login
+
+  # Inspect a specific project by Project ID (PID)
+  python pems_interface.py --inspect 418000244
+
+  # Inspect a project and find closest Census stations
+  python pems_interface.py --inspect 300000061 --census
+
+  # Ad-hoc query for coordinates and corridor segments
+  python pems_interface.py --route 80 --dir E --begin-pm 11.4 --end-pm 12.8 --county Solano
+
+  # Generate PeMS URLs for projects in the master CSV
+  python pems_interface.py --list-urls
+
+  # Run automated test suite
+  python -m unittest tests/test_pems_interface.py -v
+=============================================================================
 """
 
 import os
