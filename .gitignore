@@ -1,0 +1,37 @@
+# Environment and credentials
+.env
+.env.*
+*.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/*.txt
+downloads/*.txt.*
+downloads/*.zip
+*.bk
+*.bak
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Output HTML maps and logs
+route_map_*.html
+*.log
