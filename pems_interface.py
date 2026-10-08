@@ -2,34 +2,14 @@
 """
 pems_interface.py
 -----------------
-Consolidated PeMS Interface & Query Engine.
+Consolidated, High-Performance PeMS Interface & Query Engine.
 
-Consolidates all PeMS interaction code across the CERCET California project:
-  - Authenticated session management (requests.Session with cookie handling & auto-login)
-  - URL builders for:
-      * Freeway lane configuration time series (from PeMS Lane config time series format)
-      * Station annual AADT text exports (from download_pems_annual.py)
-      * Station monthly/daily Flow text exports (from download_pems_annual.py)
-      * Freeway geometry (from main.py)
-      * Station VDS summary / metadata
-      * Clearinghouse bulk downloads (from pems_bulk_dl.py & settings.py)
-  - Postmile parsing & coordinate resolution (from main.py)
-  - Caltrans Census station matching (from get_census_stations.py)
-  - Master project CSV integration (Dist, County, State, coordinates, route, direction, PMs)
-  - Corridor station discovery and URL dispatch
-
-Usage:
-  # Check PeMS credentials and login
-  python pems_interface.py --test-login
-
-  # Inspect a specific project from the master CSV and view its URLs & corridor stations
-  python pems_interface.py --input staging/Master_CA_Project_List_Cleaned.csv --inspect 300000061
-
-  # Generate PeMS URLs for all projects in the master CSV
-  python pems_interface.py --input staging/Master_CA_Project_List_Cleaned.csv --list-urls
-
-  # Query coordinates and stations for a specific corridor directly
-  python pems_interface.py --route 80 --dir E --begin-pm 10.0 --end-pm 15.0 --county "Alameda"
+Consolidates and optimizes all PeMS interaction code across the CERCET California project:
+  - Robust session management with streaming downloads and deterministic re-authentication.
+  - O(1) indexed geometric reference lookups across 331,888 segments.
+  - Strict input validation and regex parsing for postmiles, directions, and routes.
+  - Validated URL builders conforming to Caltrans PeMS parameters.
+  - Master project CSV integration (Dist, County, State, coordinates, route, direction, PMs).
 """
 
 import os
@@ -42,7 +22,7 @@ import argparse
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 import numpy as np
@@ -53,7 +33,6 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # CONFIGURATION & PATHS
 # ---------------------------------------------------------------------------
-# Load environment variables (.env in workspace or parent directory)
 load_dotenv()
 
 BASE_URL = "https://pems.dot.ca.gov"
@@ -63,7 +42,6 @@ DEFAULT_REF_PATH = os.path.join(WORKSPACE_DIR, "downloads", "merged_geo_pm.csv")
 DEFAULT_ROUTES_DIRS = os.path.join(WORKSPACE_DIR, "ca_routes_dirs.csv")
 DEFAULT_MASTER_CSV = os.path.join(WORKSPACE_DIR, "staging", "Master_CA_Project_List_Cleaned.csv")
 
-# Census station references (search workspace, then sibling data directory)
 CENSUS_PATHS = [
     os.path.join(WORKSPACE_DIR, "ALL_CENSUS_STATIONS.tsv"),
     os.path.join(WORKSPACE_DIR, "downloads", "ALL_CENSUS_STATIONS.tsv"),
@@ -71,6 +49,7 @@ CENSUS_PATHS = [
 ]
 
 TABLE_MARKERS = ("Starting Month", "Month", "Day", "Time", "Station", "VDS", "Hour")
+VALID_CARDINAL_DIRS = {"N", "S", "E", "W"}
 
 LOGGER = logging.getLogger("pems_interface")
 logging.basicConfig(
@@ -81,43 +60,53 @@ logging.basicConfig(
 
 
 # ---------------------------------------------------------------------------
-# HELPER FUNCTIONS: NORMALIZATION
+# NORMALIZATION & PARSING HELPERS
 # ---------------------------------------------------------------------------
 def normalize_direction(d: Any) -> str:
-    """Normalize direction string to PeMS cardinal direction: 'N', 'S', 'E', 'W'."""
+    """
+    Normalize direction string to single-letter PeMS cardinal direction: 'N', 'S', 'E', 'W'.
+    Rejects invalid inputs by returning an empty string.
+    """
     if not d or pd.isna(d):
         return ""
     s = str(d).strip().upper()
-    if s.startswith("N"):
+    if s in ("N", "NB", "NORTH", "NORTHBOUND"):
         return "N"
-    if s.startswith("S"):
+    if s in ("S", "SB", "SOUTH", "SOUTHBOUND"):
         return "S"
-    if s.startswith("E"):
+    if s in ("E", "EB", "EAST", "EASTBOUND"):
         return "E"
-    if s.startswith("W"):
+    if s in ("W", "WB", "WEST", "WESTBOUND"):
         return "W"
-    return s[:1]
+    return ""
 
 
 def normalize_route(r: Any) -> str:
-    """Normalize route string to pure digits: 'SR-80' -> '80', 'I-5' -> '5'."""
+    """Normalize route string to digits: 'SR-80' -> '80', 'I-5' -> '5'."""
     if not r or pd.isna(r):
         return ""
-    digits = re.sub(r"[^0-9]", "", str(r))
-    return digits
+    return re.sub(r"[^0-9]", "", str(r))
 
 
 def split_ca_pm(ca_pm: Any) -> Tuple[str, float]:
     """
     Split a California postmile string into prefix and float number.
-    e.g. 'R3.80' -> ('R', 3.8), '12.4' -> ('', 12.4), 'SCL 5.0' -> ('SCL', 5.0)
+    Handles letter prefixes (R, L, M) and suffix letters (L, R, A).
+    e.g. 'R3.80' -> ('R', 3.8), '12.4L' -> ('', 12.4), 'R12.4A' -> ('R', 12.4)
     """
     if ca_pm is None or (isinstance(ca_pm, float) and np.isnan(ca_pm)):
         return "", np.nan
     s = str(ca_pm).strip()
-    match = re.match(r"^([A-Za-z\s\-]*)([0-9]*\.?[0-9]+)$", s)
-    if match and match.group(2):
-        return match.group(1).strip(), float(match.group(2))
+    if not s:
+        return "", np.nan
+
+    # Prefix: non-digits; Numeric: digits + decimal; Suffix: trailing non-digits
+    match = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s)
+    if match:
+        pfx = match.group(1).strip()
+        num = float(match.group(2))
+        return pfx, num
+
     try:
         return "", float(s)
     except (TypeError, ValueError):
@@ -131,8 +120,9 @@ class PeMSClient:
     """Manages an authenticated HTTP session with Caltrans PeMS."""
 
     def __init__(self, username: Optional[str] = None, password: Optional[str] = None, debug: bool = False):
-        self.username = username or os.getenv("PEMS_USERNAME")
-        self.password = password or os.getenv("PEMS_PASSWORD")
+        # Strict distinction between explicit argument and env fallback
+        self.username = os.getenv("PEMS_USERNAME") if username is None else username
+        self.password = os.getenv("PEMS_PASSWORD") if password is None else password
         self.debug = debug
         self.session = requests.Session()
         self._setup_session()
@@ -189,20 +179,25 @@ class PeMSClient:
         LOGGER.info("PeMS login successful.")
         return True
 
-    def get_url(self, url: str) -> requests.Response:
+    def _is_login_page(self, resp: requests.Response) -> bool:
+        """Check if response contains a login form and lacks an active session."""
+        has_form = ("<form" in resp.text and ("username" in resp.text or "password" in resp.text))
+        has_logout = ("Logout" in resp.text or "logout" in resp.text)
+        return has_form and not has_logout
+
+    def get_url(self, url: str, stream: bool = False) -> requests.Response:
         """Make an authenticated GET request, re-authenticating if session expired."""
         if not self.logged_in:
             self.login()
 
         full_url = url if url.startswith("http") else urllib.parse.urljoin(BASE_URL, url)
-        resp = self.session.get(full_url)
+        resp = self.session.get(full_url, stream=stream)
         resp.raise_for_status()
 
-        # Check if redirected to login page
-        if "login" in resp.url.lower() and "logout" not in resp.text.lower():
-            LOGGER.warning("Session appears expired; re-authenticating...")
+        if self._is_login_page(resp):
+            LOGGER.warning("PeMS session appears expired; re-authenticating...")
             self.login()
-            resp = self.session.get(full_url)
+            resp = self.session.get(full_url, stream=stream)
             resp.raise_for_status()
 
         return resp
@@ -217,7 +212,7 @@ class PeMSClient:
             return None
 
     def download_file(self, url: str, out_path: str, overwrite: bool = False) -> bool:
-        """Download file from PeMS to local disk with verification."""
+        """Download file with chunk streaming to prevent memory exhaustion."""
         if os.path.exists(out_path) and not overwrite:
             if self.file_has_data_table(out_path):
                 LOGGER.info(f"File {out_path} already exists with valid data - skipping.")
@@ -225,10 +220,12 @@ class PeMSClient:
 
         LOGGER.info(f"Downloading from {url} to {out_path}...")
         try:
-            resp = self.get_url(url)
+            resp = self.get_url(url, stream=True)
             os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
             with open(out_path, "wb") as fh:
-                fh.write(resp.content)
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        fh.write(chunk)
 
             if not self.file_has_data_table(out_path):
                 LOGGER.warning(f"Downloaded file {out_path} does not appear to contain a valid PeMS data table.")
@@ -284,6 +281,25 @@ class PeMSClient:
 # ---------------------------------------------------------------------------
 # PEMS URL BUILDERS
 # ---------------------------------------------------------------------------
+def _format_date_param(d_str: str) -> str:
+    """Format input date string to MM/DD/YYYY for PeMS URLs."""
+    d_clean = str(d_str).strip()
+    if "-" in d_clean:
+        try:
+            dt = datetime.datetime.strptime(d_clean[:10], "%Y-%m-%d")
+            return f"{dt.month:02d}%2F{dt.day:02d}%2F{dt.year}"
+        except ValueError:
+            pass
+    elif "/" in d_clean:
+        parts = d_clean.split("/")
+        if len(parts) == 3:
+            try:
+                return f"{int(parts[0]):02d}%2F{int(parts[1]):02d}%2F{int(parts[2])}"
+            except ValueError:
+                pass
+    return urllib.parse.quote(d_clean)
+
+
 def build_lane_config_url(
     route: str,
     direction: str,
@@ -291,28 +307,11 @@ def build_lane_config_url(
     end_date: str,
     station_type: str = ""
 ) -> str:
-    """
-    Construct PeMS Freeway configuration time series URL (historical lane counts).
-    Reference: notes/PeMS Lane config time series URL format.md
-    Example output:
-      https://pems.dot.ca.gov/?report_form=1&dnode=Freeway&content=elv&tab=config_timeseries&export=text&fwy=10&dir=E&s_time_id_f=07%2F30%2F2016&e_time_id_f=07%2F29%2F2026&q=lanes&gn=day&station_type=
-    """
+    """Construct PeMS Freeway configuration time series URL."""
     route_num = normalize_route(route)
     dir_clean = normalize_direction(direction)
-
-    def _fmt_date(d_str: str) -> str:
-        d_str = str(d_str).strip()
-        if "-" in d_str:
-            dt = datetime.datetime.strptime(d_str[:10], "%Y-%m-%d")
-            return f"{dt.month:02d}%2F{dt.day:02d}%2F{dt.year}"
-        elif "/" in d_str:
-            parts = d_str.split("/")
-            if len(parts) == 3:
-                return f"{int(parts[0]):02d}%2F{int(parts[1]):02d}%2F{int(parts[2])}"
-        return urllib.parse.quote(d_str)
-
-    s_fmt = _fmt_date(start_date)
-    e_fmt = _fmt_date(end_date)
+    s_fmt = _format_date_param(start_date)
+    e_fmt = _format_date_param(end_date)
 
     return (
         f"{BASE_URL}/?report_form=1&dnode=Freeway&content=elv&tab=config_timeseries"
@@ -326,10 +325,7 @@ def build_station_aadt_url(
     start_year: int,
     end_year: Optional[int] = None
 ) -> str:
-    """
-    Construct PeMS VDS annual AADT export URL.
-    Reference: notes/AADT Comparisons/scripts/download_pems_annual.py
-    """
+    """Construct PeMS VDS annual AADT export URL."""
     st_id = str(station_id).strip()
     end_year = end_year or start_year
 
@@ -351,10 +347,7 @@ def build_station_flow_url(
     end_year: Optional[int] = None,
     granularity: str = "month"
 ) -> str:
-    """
-    Construct PeMS VDS detector time series (Flow) export URL.
-    Reference: notes/AADT Comparisons/scripts/download_pems_annual.py
-    """
+    """Construct PeMS VDS detector time series (Flow) export URL."""
     st_id = str(station_id).strip()
     end_year = end_year or start_year
 
@@ -377,10 +370,7 @@ def build_station_flow_url(
 
 
 def build_fwy_latlng_url(route: str, direction: str) -> str:
-    """
-    Construct PeMS Freeway coordinate geometry URL.
-    Reference: main.py (_build_query_url)
-    """
+    """Construct PeMS Freeway coordinate geometry URL."""
     route_num = normalize_route(route)
     dir_clean = normalize_direction(direction)
     return f"{BASE_URL}/?report_form=1&dnode=Freeway&content=fwy_latlngXY&export=text&fwy={route_num}&dir={dir_clean}"
@@ -399,35 +389,79 @@ def build_clearinghouse_url(district: Any, year: int, file_type: str = "station_
 
 
 # ---------------------------------------------------------------------------
-# GEOMETRY & REFERENCE LOOKUP HELPERS
+# INDEXED GEOMETRY & REFERENCE LOOKUP ENGINE
 # ---------------------------------------------------------------------------
-_GEO_REF_CACHE: Optional[pd.DataFrame] = None
+class IndexedGeoReference:
+    """
+    O(1) Indexed geometric database. Pre-processes the 331K-row reference table
+    once at startup to avoid repeated expensive pandas column scanning.
+    """
+
+    def __init__(self, df: pd.DataFrame):
+        self.raw_df = df
+        route_col = "Route" if "Route" in df.columns else "Fwy"
+        dir_col = "Direction" if "Direction" in df.columns else "Dir"
+
+        # Pre-normalize columns
+        clean_df = df.copy()
+        clean_df["_route"] = clean_df[route_col].astype(str).str.strip().map(normalize_route)
+        clean_df["_dir"] = clean_df[dir_col].astype(str).str.strip().map(normalize_direction)
+        clean_df["_abs_pm"] = pd.to_numeric(clean_df["Abs PM"], errors="coerce")
+        clean_df["_county"] = clean_df["County"].astype(str).str.strip().str.lower()
+
+        # Parse CA PM prefix and numbers once
+        ca_splits = clean_df["CA PM"].astype(str).map(split_ca_pm)
+        clean_df["_ca_pfx"] = ca_splits.map(lambda x: x[0].upper())
+        clean_df["_ca_num"] = ca_splits.map(lambda x: x[1])
+
+        clean_df["_lat"] = pd.to_numeric(clean_df["Latitude"], errors="coerce")
+        clean_df["_lng"] = pd.to_numeric(clean_df["Longitude"], errors="coerce")
+
+        # Partition by (Route, Direction)
+        self.index: Dict[Tuple[str, str], pd.DataFrame] = {}
+        for (r, d), grp in clean_df.groupby(["_route", "_dir"]):
+            self.index[(r, d)] = grp
+
+    def get_corridor(self, route: str, direction: str) -> Optional[pd.DataFrame]:
+        r_norm = normalize_route(route)
+        d_norm = normalize_direction(direction)
+        return self.index.get((r_norm, d_norm))
+
+
+_INDEXED_GEO_REF: Optional[IndexedGeoReference] = None
+_RAW_GEO_DF: Optional[pd.DataFrame] = None
 _CENSUS_CACHE: Optional[pd.DataFrame] = None
 
+
 def load_geo_reference(ref_path: Optional[str] = None) -> pd.DataFrame:
-    """Load and cache the 331K-row PeMS merged postmile and geometry reference table."""
-    global _GEO_REF_CACHE
-    if _GEO_REF_CACHE is not None:
-        return _GEO_REF_CACHE
+    """Load and index the 331K-row reference table."""
+    global _INDEXED_GEO_REF, _RAW_GEO_DF
+    if _RAW_GEO_DF is not None:
+        return _RAW_GEO_DF
 
     path = ref_path or DEFAULT_REF_PATH
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"PeMS geometric reference table not found at: {path}\n"
-            f"Please verify downloads/merged_geo_pm.csv exists."
-        )
+        raise FileNotFoundError(f"Reference table not found at: {path}")
 
     for sep in (",", "\t"):
         try:
             df = pd.read_csv(path, sep=sep, dtype=str)
             df.columns = df.columns.str.strip()
             if "Route" in df.columns or "Fwy" in df.columns:
-                _GEO_REF_CACHE = df
-                return _GEO_REF_CACHE
+                _RAW_GEO_DF = df
+                _INDEXED_GEO_REF = IndexedGeoReference(df)
+                return _RAW_GEO_DF
         except Exception:
             continue
 
     raise ValueError(f"Could not parse valid reference columns in {path}")
+
+
+def get_indexed_geo_ref() -> IndexedGeoReference:
+    global _INDEXED_GEO_REF
+    if _INDEXED_GEO_REF is None:
+        load_geo_reference()
+    return _INDEXED_GEO_REF
 
 
 def load_census_reference() -> Optional[pd.DataFrame]:
@@ -456,22 +490,18 @@ def pm_to_coordinates(
     is_absolute: bool = False,
     ref_df: Optional[pd.DataFrame] = None
 ) -> Optional[Tuple[float, float]]:
-    """
-    Convert a postmile (California or Absolute) to (latitude, longitude).
-    Reference: main.py (pm_to_coord)
-    """
-    ref = ref_df if ref_df is not None else load_geo_reference()
-    route_col = "Route" if "Route" in ref.columns else "Fwy"
-    dir_col = "Direction" if "Direction" in ref.columns else "Dir"
+    """Convert postmile to (latitude, longitude) with O(1) indexed lookup."""
+    route_norm = normalize_route(route)
+    dir_norm = normalize_direction(direction)
 
-    route_clean = normalize_route(route)
-    dir_clean = normalize_direction(direction)
+    if ref_df is not None:
+        # Fallback for ad-hoc custom reference dataframes
+        idx_ref = IndexedGeoReference(ref_df)
+    else:
+        idx_ref = get_indexed_geo_ref()
 
-    sub = ref[
-        (ref[route_col].astype(str).str.strip() == route_clean) &
-        (ref[dir_col].astype(str).str.strip().str.upper() == dir_clean)
-    ]
-    if sub.empty:
+    sub = idx_ref.get_corridor(route_norm, dir_norm)
+    if sub is None or sub.empty:
         return None
 
     if is_absolute or county is None:
@@ -479,25 +509,20 @@ def pm_to_coordinates(
             pm_val = round(float(pm), 1)
         except (TypeError, ValueError):
             return None
-        abs_num = pd.to_numeric(sub["Abs PM"], errors="coerce").round(1)
-        matched = sub[abs_num == pm_val]
+        matched = sub[sub["_abs_pm"].round(1) == pm_val]
     else:
         prefix, num = split_ca_pm(pm)
         if np.isnan(num):
             return None
         num = round(num, 1)
-
-        ca_split = sub["CA PM"].astype(str).map(split_ca_pm)
-        ca_nums = ca_split.map(lambda x: x[1]).round(1)
-        ca_pfxs = ca_split.map(lambda x: x[0].upper())
-
         county_clean = str(county).strip().lower()
+
         matched = sub[
-            (ca_nums == num) &
-            (sub["County"].astype(str).str.strip().str.lower() == county_clean)
+            (sub["_ca_num"].round(1) == num) &
+            (sub["_county"] == county_clean)
         ]
         if prefix:
-            pfx_matched = matched[ca_pfxs == prefix.upper()]
+            pfx_matched = matched[matched["_ca_pfx"] == prefix.upper()]
             if not pfx_matched.empty:
                 matched = pfx_matched
 
@@ -505,10 +530,10 @@ def pm_to_coordinates(
         return None
 
     row = matched.iloc[0]
-    try:
-        return float(row["Latitude"]), float(row["Longitude"])
-    except (KeyError, ValueError):
+    lat, lng = row["_lat"], row["_lng"]
+    if pd.isna(lat) or pd.isna(lng):
         return None
+    return float(lat), float(lng)
 
 
 def get_corridor_stations(
@@ -520,35 +545,34 @@ def get_corridor_stations(
     county: Optional[str] = None,
     ref_df: Optional[pd.DataFrame] = None
 ) -> pd.DataFrame:
-    """Find all reference segments and station IDs along a corridor range."""
-    ref = ref_df if ref_df is not None else load_geo_reference()
-    route_col = "Route" if "Route" in ref.columns else "Fwy"
-    dir_col = "Direction" if "Direction" in ref.columns else "Dir"
+    """Find all reference segments along a corridor range with O(1) indexed lookup."""
+    route_norm = normalize_route(route)
+    dir_norm = normalize_direction(direction)
 
-    route_clean = normalize_route(route)
-    dir_clean = normalize_direction(direction)
+    if ref_df is not None:
+        idx_ref = IndexedGeoReference(ref_df)
+    else:
+        idx_ref = get_indexed_geo_ref()
 
-    sub = ref[
-        (ref[route_col].astype(str).str.strip() == route_clean) &
-        (ref[dir_col].astype(str).str.strip().str.upper() == dir_clean)
-    ]
-    if sub.empty:
+    sub = idx_ref.get_corridor(route_norm, dir_norm)
+    if sub is None or sub.empty:
         return pd.DataFrame()
 
-    min_pm, max_pm = min(begin_pm, end_pm), max(begin_pm, end_pm)
+    min_pm, max_pm = min(float(begin_pm), float(end_pm)), max(float(begin_pm), float(end_pm))
 
     if is_absolute or county is None:
-        abs_num = pd.to_numeric(sub["Abs PM"], errors="coerce")
-        matched = sub[(abs_num >= min_pm - 0.05) & (abs_num <= max_pm + 0.05)]
+        matched = sub[(sub["_abs_pm"] >= min_pm - 0.05) & (sub["_abs_pm"] <= max_pm + 0.05)]
     else:
-        ca_nums = sub["CA PM"].astype(str).map(lambda x: split_ca_pm(x)[1])
+        county_clean = str(county).strip().lower()
         matched = sub[
-            (ca_nums >= min_pm - 0.05) &
-            (ca_nums <= max_pm + 0.05) &
-            (sub["County"].astype(str).str.strip().str.lower() == str(county).strip().lower())
+            (sub["_ca_num"] >= min_pm - 0.05) &
+            (sub["_ca_num"] <= max_pm + 0.05) &
+            (sub["_county"] == county_clean)
         ]
 
-    return matched
+    # Return view with original columns
+    orig_cols = [c for c in sub.columns if not c.startswith("_")]
+    return matched[orig_cols]
 
 
 def find_closest_census_stations(
@@ -557,10 +581,7 @@ def find_closest_census_stations(
     ca_pm: float,
     top_n: int = 5
 ) -> pd.DataFrame:
-    """
-    Find closest Caltrans Census stations to a given route/district/postmile.
-    Reference: notes/AADT Comparisons/scripts/get_census_stations.py
-    """
+    """Find closest Caltrans Census stations to a corridor postmile."""
     cdf = load_census_reference()
     if cdf is None or cdf.empty:
         return pd.DataFrame()
@@ -578,7 +599,7 @@ def find_closest_census_stations(
 
     matched["pm_num"] = matched["CA PM"].astype(str).map(lambda x: split_ca_pm(x)[1])
     matched["pm_diff"] = (matched["pm_num"] - float(ca_pm)).abs()
-    matched = matched.sort_values(by="pm_diff").drop_duplicates(subset=["ID"])
+    matched = matched.dropna(subset=["pm_diff"]).sort_values(by="pm_diff").drop_duplicates(subset=["ID"])
     return matched.head(top_n)
 
 
@@ -628,7 +649,7 @@ class ProjectRecord:
                 try:
                     y = int(str(val)[:4])
                     if 1990 <= y <= 2030:
-                        return min(y + 5, 2026)
+                        return min(y + 4, 2026)
                 except ValueError:
                     pass
         return 2024
@@ -645,7 +666,7 @@ def parse_master_row(row: Dict[str, Any]) -> ProjectRecord:
     begin_pm = str(row.get("Begin PM", "")).strip()
     end_pm = str(row.get("End PM", "")).strip()
 
-    # Absolute PMs if present
+    # Absolute PMs
     abs_beg = None
     abs_end = None
     for k in ("temp_abs_begin", "Absolute Begin PM", "Abs Begin PM"):
@@ -685,7 +706,7 @@ def parse_master_row(row: Dict[str, Any]) -> ProjectRecord:
         except ValueError:
             pass
 
-    # Clean dates: prefer ISO formatted columns
+    # Dates
     c_begin = None
     for k in ("Begin Date (formatted YYYY-MM-DD)", "Construction Begin Date"):
         v = str(row.get(k, "")).strip()
@@ -863,7 +884,7 @@ class ProjectPeMSQueryBuilder:
 
 
 # ---------------------------------------------------------------------------
-# CLI & DEMONSTRATION RUNNER
+# CLI
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
@@ -882,7 +903,6 @@ def main():
 
     args = parser.parse_args()
 
-    # 1. Test Login
     if args.test_login:
         print("\n--- Testing PeMS Login ---")
         client = PeMSClient(debug=True)
@@ -891,9 +911,9 @@ def main():
             print("✓ PeMS Login Successful!")
         except Exception as exc:
             print(f"✗ Login failed: {exc}")
+            sys.exit(1)
         return
 
-    # 2. Ad-hoc Corridor Query
     if args.route and args.dir and args.begin_pm is not None and args.end_pm is not None:
         print(f"\n--- Ad-hoc Query: Route {args.route} {args.dir} PM {args.begin_pm} - {args.end_pm} ---")
         ref_df = load_geo_reference()
@@ -909,7 +929,6 @@ def main():
         print(f"Reference segments in range: {len(stations)}")
         return
 
-    # 3. Master CSV Project Mode
     if not os.path.exists(args.input):
         print(f"Error: master CSV file not found: {args.input}")
         sys.exit(1)
@@ -921,8 +940,8 @@ def main():
         target_pid = str(args.inspect).strip()
         matched = [p for p in projects if p.project_id == target_pid]
         if not matched:
-            print(f"Project ID '{target_pid}' not found.")
-            return
+            print(f"Error: Project ID '{target_pid}' not found.")
+            sys.exit(1)
 
         for idx, proj in enumerate(matched):
             builder = ProjectPeMSQueryBuilder(proj)
@@ -955,7 +974,6 @@ def main():
             corr_stations = builder.get_corridor_stations_from_reference()
             print(f"\n  Corridor Reference Segments: {len(corr_stations)} segments found in corridor.")
 
-            # Census station search
             if args.census and proj.begin_pm:
                 _, num_pm = split_ca_pm(proj.begin_pm)
                 if not np.isnan(num_pm):
@@ -980,7 +998,6 @@ def main():
         print(f"\n... (use --inspect <PID> to view full details for any project)")
         return
 
-    # Default summary
     print("\nSummary of projects by District:")
     df_p = pd.DataFrame([{
         "PID": p.project_id,
