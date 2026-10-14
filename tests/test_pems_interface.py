@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 import urllib.parse
 import os
+import glob
 import pandas as pd
 import numpy as np
 
@@ -471,5 +472,350 @@ class TestFormattingAndSensors(unittest.TestCase):
         self.assertIn("station_id=1210063", popup)
 
 
+class TestVDSStationMatcherAndComparison(unittest.TestCase):
+    """
+    Unit tests for VDS detector metadata indexing, corridor matching,
+    diagnostic discrepancy reporting, dry-run safety, and apply updates.
+    """
+
+    def setUp(self):
+        # Create a synthetic VDS metadata table
+        self.meta_df = pd.DataFrame([
+            {
+                "ID": "301001",
+                "Fwy": "80",
+                "Dir": "E",
+                "District": "3",
+                "County": "61",
+                "City": "Colfax",
+                "State_PM": "34.5",
+                "Abs_PM": "135.5",
+                "Latitude": "39.1",
+                "Longitude": "-120.9",
+                "Length": "1.0",
+                "Type": "ML",
+                "Lanes": "3",
+                "Name": "Colfax Curve EB"
+            },
+            {
+                "ID": "301002",
+                "Fwy": "80",
+                "Dir": "E",
+                "District": "3",
+                "County": "61",
+                "City": "Colfax",
+                "State_PM": "36.0",
+                "Abs_PM": "137.0",
+                "Latitude": "39.12",
+                "Longitude": "-120.88",
+                "Length": "1.0",
+                "Type": "ML",
+                "Lanes": "3",
+                "Name": "Colfax East ML"
+            },
+            {
+                "ID": "301003",
+                "Fwy": "80",
+                "Dir": "E",
+                "District": "3",
+                "County": "61",
+                "City": "Colfax",
+                "State_PM": "37.5",
+                "Abs_PM": "138.5",
+                "Latitude": "39.14",
+                "Longitude": "-120.85",
+                "Length": "1.0",
+                "Type": "HV",
+                "Lanes": "1",
+                "Name": "Colfax East HV"
+            },
+            {
+                "ID": "301004",
+                "Fwy": "80",
+                "Dir": "E",
+                "District": "3",
+                "County": "61",
+                "City": "Colfax",
+                "State_PM": "36.5",
+                "Abs_PM": "137.5",
+                "Latitude": "39.13",
+                "Longitude": "-120.86",
+                "Length": "0.5",
+                "Type": "OR",
+                "Lanes": "1",
+                "Name": "Colfax On-Ramp"
+            },
+            {
+                "ID": "301005",
+                "Fwy": "80",
+                "Dir": "W",
+                "District": "3",
+                "County": "61",
+                "City": "Colfax",
+                "State_PM": "36.0",
+                "Abs_PM": "137.0",
+                "Latitude": "39.12",
+                "Longitude": "-120.88",
+                "Length": "1.0",
+                "Type": "ML",
+                "Lanes": "3",
+                "Name": "Colfax West ML"
+            }
+        ])
+        self.indexed_meta = pems_interface.IndexedVDSMetadata(self.meta_df)
+
+    def test_indexed_vds_metadata_partitioning_and_id_index(self):
+        """Proof: Metadata is partitioned by (district, route, dir) and ID index resolves records."""
+        sub = self.indexed_meta.index.get(("3", "80", "E"))
+        self.assertIsNotNone(sub)
+        self.assertEqual(len(sub), 4)
+
+        rec = self.indexed_meta.by_id.get("301003")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.type, "HV")
+        self.assertEqual(rec.abs_pm, 138.5)
+        self.assertEqual(rec.name, "Colfax East HV")
+
+    def test_find_corridor_stations_abs_pm(self):
+        """Proof: Querying by absolute PM retrieves exactly the stations in corridor sorted by PM."""
+        found = self.indexed_meta.find_corridor_stations(
+            district="3",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            buffer_mi=0.1,
+            station_types=("ML", "HV")
+        )
+        self.assertEqual([s.id for s in found], ["301002", "301003"])
+        self.assertEqual(found[0].abs_pm, 137.0)
+        self.assertEqual(found[1].abs_pm, 138.5)
+
+    def test_find_corridor_stations_county_pm_fallback(self):
+        """Proof: When absolute PMs are None, falls back to numeric State_PM matching."""
+        found = self.indexed_meta.find_corridor_stations(
+            district="3",
+            route="80",
+            direction="EB",
+            begin_pm="34.0",
+            end_pm="36.2",
+            abs_begin_pm=None,
+            abs_end_pm=None,
+            buffer_mi=0.1,
+            station_types=("ML",)
+        )
+        self.assertEqual([s.id for s in found], ["301001", "301002"])
+
+    def test_find_corridor_stations_type_filtering(self):
+        """Proof: Non-ramp types ('ML', 'HV') exclude on-ramps ('OR') unless explicitly included."""
+        non_ramp = self.indexed_meta.find_corridor_stations(
+            district="3",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            buffer_mi=0.1,
+            station_types=("ML", "HV")
+        )
+        self.assertNotIn("301004", [s.id for s in non_ramp])
+
+        with_ramps = self.indexed_meta.find_corridor_stations(
+            district="3",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            buffer_mi=0.1,
+            station_types=("ML", "HV", "OR")
+        )
+        self.assertIn("301004", [s.id for s in with_ramps])
+
+    def test_compare_project_stations_exact_match(self):
+        """Proof: When spreadsheet contains exactly the corridor stations, status is EXACT_MATCH."""
+        proj = pems_interface.ProjectRecord(
+            project_id="P_EXACT",
+            dist="3",
+            county="Placer",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            sensor_stations=["301002", "301003"]
+        )
+        res = pems_interface.compare_project_stations(proj, vds_meta=self.indexed_meta, buffer_mi=0.1)
+        self.assertEqual(res.status, "EXACT_MATCH")
+        self.assertEqual(res.matched_stations, ["301002", "301003"])
+        self.assertEqual(res.missing_in_sheet, [])
+        self.assertEqual(res.discrepancies, [])
+
+    def test_compare_project_stations_partial_match(self):
+        """Proof: When spreadsheet has subset of active corridor stations, status is PARTIAL_MATCH."""
+        proj = pems_interface.ProjectRecord(
+            project_id="P_PARTIAL",
+            dist="3",
+            county="Placer",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            sensor_stations=["301002"]
+        )
+        res = pems_interface.compare_project_stations(proj, vds_meta=self.indexed_meta, buffer_mi=0.1)
+        self.assertEqual(res.status, "PARTIAL_MATCH")
+        self.assertEqual(res.matched_stations, ["301002"])
+        self.assertEqual(res.missing_in_sheet, ["301003"])
+        self.assertEqual(res.discrepancies, [])
+
+    def test_compare_project_stations_out_of_range_discrepancy(self):
+        """Proof: When spreadsheet station is outside corridor bounds, reports out-of-range reason."""
+        proj = pems_interface.ProjectRecord(
+            project_id="P_DISC",
+            dist="3",
+            county="Placer",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="36.0",
+            end_pm="39.0",
+            abs_begin_pm=136.5,
+            abs_end_pm=139.0,
+            sensor_stations=["301001"]  # at Abs PM 135.5 (1.0 mi before corridor start)
+        )
+        res = pems_interface.compare_project_stations(proj, vds_meta=self.indexed_meta, buffer_mi=0.1)
+        self.assertEqual(res.status, "DISCREPANCY")
+        self.assertEqual(len(res.discrepancies), 1)
+        d = res.discrepancies[0]
+        self.assertEqual(d["station_id"], "301001")
+        self.assertTrue(d["found_in_pems"])
+        self.assertTrue(any("Out of range" in r and "1.00 mi before" in r for r in d["reasons"]))
+
+    def test_compare_project_stations_opposite_direction_discrepancy(self):
+        """Proof: When spreadsheet station is on opposite direction, diagnoses direction mismatch."""
+        proj = pems_interface.ProjectRecord(
+            project_id="P_DIR_DISC",
+            dist="3",
+            county="Placer",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            sensor_stations=["301005"]  # 301005 is WB
+        )
+        res = pems_interface.compare_project_stations(proj, vds_meta=self.indexed_meta, buffer_mi=0.1)
+        self.assertEqual(res.status, "DISCREPANCY")
+        d = res.discrepancies[0]
+        self.assertEqual(d["station_id"], "301005")
+        self.assertTrue(any("Opposite/Different Direction" in r for r in d["reasons"]))
+
+    def test_compare_project_stations_unknown_sensor_discrepancy(self):
+        """Proof: Obsolete or invalid sensor ID not found in metadata is flagged as unknown."""
+        proj = pems_interface.ProjectRecord(
+            project_id="P_UNKNOWN",
+            dist="3",
+            county="Placer",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            sensor_stations=["9999999"]
+        )
+        res = pems_interface.compare_project_stations(proj, vds_meta=self.indexed_meta, buffer_mi=0.1)
+        self.assertEqual(res.status, "DISCREPANCY")
+        d = res.discrepancies[0]
+        self.assertEqual(d["station_id"], "9999999")
+        self.assertFalse(d["found_in_pems"])
+        self.assertIn("Invalid or obsolete PeMS VDS ID", d["reasons"][0])
+
+    def test_dry_run_pipeline_leaves_csv_untouched(self):
+        """Proof: Dry run mode guarantees the input CSV file is untouched."""
+        import tempfile
+        with tempfile.NamedTemporaryFile("w+", suffix=".csv", delete=False) as tf:
+            tf.write("Project ID,Dist,County,Route,Direction,Begin PM,End PM,temp_abs_begin,temp_abs_end\n")
+            tf.write("1001,3,Placer,80,EB,35.0,39.0,136.0,139.0\n")
+            temp_path = tf.name
+
+        try:
+            mtime_before = os.path.getmtime(temp_path)
+            with open(temp_path, "r", encoding="utf-8") as f:
+                content_before = f.read()
+
+            with patch("pems_interface.load_vds_metadata", return_value=self.indexed_meta):
+                pems_interface.run_station_comparison_pipeline(
+                    master_csv_path=temp_path,
+                    dry_run=True,
+                    apply_updates=False,
+                    verbose=False
+                )
+
+            mtime_after = os.path.getmtime(temp_path)
+            with open(temp_path, "r", encoding="utf-8") as f:
+                content_after = f.read()
+            self.assertEqual(mtime_before, mtime_after)
+            self.assertEqual(content_before, content_after)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_apply_pipeline_creates_backup_and_updates_csv(self):
+        """Proof: Apply mode creates a timestamped safety backup and populates sensor columns."""
+        import tempfile
+        header = (
+            "Project ID,Dist,County,Route,Direction,Begin PM,End PM,temp_abs_begin,temp_abs_end,"
+            "Number of Active Non-Ramp Sensors,Sensor Station 1 ID ,Sensor Station 1 HOV ID,"
+            "Sensor Station 1 Name,Sensor Station 1 Type,Sensor Station 1: number of lanes after,"
+            "Sensor Station 2 ID ,Sensor Station 2: number of lanes after\n"
+        )
+        row = "1001,3,Placer,80,EB,35.0,39.0,136.0,139.0,,,,,,,,\n"
+        with tempfile.NamedTemporaryFile("w+", suffix=".csv", delete=False) as tf:
+            tf.write(header + row)
+            temp_path = tf.name
+
+        try:
+            with patch("pems_interface.load_vds_metadata", return_value=self.indexed_meta):
+                pems_interface.run_station_comparison_pipeline(
+                    master_csv_path=temp_path,
+                    dry_run=False,
+                    apply_updates=True,
+                    verbose=False
+                )
+
+            # Check backup file exists
+            backups = glob.glob(f"{temp_path}.bak_*")
+            self.assertEqual(len(backups), 1)
+
+            # Check updated CSV
+            df_updated = pd.read_csv(temp_path, dtype=str)
+            self.assertEqual(df_updated.at[0, "Number of Active Non-Ramp Sensors"], "2")
+            self.assertEqual(df_updated.at[0, "Sensor Station 1 ID "], "301002")
+            self.assertEqual(df_updated.at[0, "Sensor Station 1 Type"], "ML")
+            self.assertEqual(df_updated.at[0, "Sensor Station 1 Name"], "Colfax East ML")
+            self.assertEqual(df_updated.at[0, "Sensor Station 1 HOV ID"], "301003")
+            self.assertEqual(df_updated.at[0, "Sensor Station 2 ID "], "301003")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            for b in glob.glob(f"{temp_path}.bak_*"):
+                os.remove(b)
+
+
 if __name__ == "__main__":
     unittest.main()
+

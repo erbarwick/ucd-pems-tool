@@ -15,14 +15,15 @@ ag.workspace/
 ├── main.py                      # Original postmile verification and Folium map generator
 ├── ca_routes_dirs.csv           # Official Caltrans PeMS route direction conventions
 ├── downloads/
-│   └── merged_geo_pm.csv        # 331,888-row reference database (Route, Dir, CA PM, Abs PM, Lat, Lng)
+│   ├── merged_geo_pm.csv        # 331,888-row reference database (Route, Dir, CA PM, Abs PM, Lat, Lng)
+│   └── metadata/                # Cached PeMS VDS detector metadata (19,672 stations across 9 districts)
 ├── staging/
 │   ├── Master_CA_Project_List_Cleaned.csv   # Cleaned master project dataset (118 rows)
 │   ├── Master_CA_Project_List_Cleaned.xlsx  # Excel formatted cleaned dataset
 │   ├── transform_master.py                 # Pipeline that produced cleaned dataset
 │   └── validate_lane_counts.py             # Lane count consistency validator
 ├── tests/
-│   └── test_pems_interface.py  # Branch-proven automated test suite (36 unit tests)
+│   └── test_pems_interface.py  # Branch-proven automated test suite (51 unit tests)
 └── README.md
 ```
 
@@ -35,7 +36,7 @@ ag.workspace/
 Activate the Python virtual environment and configure your `.env` file with Caltrans PeMS credentials:
 
 ```bash
-# In California/python/.env or ag.workspace/.env:
+# In `.env` at the repo root 
 PEMS_USERNAME="your_email@domain.edu"
 PEMS_PASSWORD="your_pems_password"
 ```
@@ -52,25 +53,47 @@ python pems_interface.py --test-login
 
 ### A. Command-Line Interface (CLI)
 
-#### 1. Inspect a Specific Project
-Inspect all project details (route, direction, postmile span, coordinates, dates, sensors) and generate all PeMS export URLs:
+#### 1. Inspect by project ID
+Inspect all project details (**route, direction, postmile span, coordinates, dates, sensors**) and generate all PeMS export URLs:
 ```bash
 python pems_interface.py --inspect 418000244
 ```
 
 #### 2. Inspect with Census Station Lookup
-Find the closest Caltrans Census count stations to the project's begin postmile:
+Input a project ID and find the closest Caltrans Census count stations (to the project's begin postmile).
 ```bash
 python pems_interface.py --inspect 300000061 --census
 ```
 
-#### 3. Ad-Hoc Corridor Query
+#### 3. Match Active PeMS VDS Stations & Compare Spreadsheet (Dry Run by Default)
+Compare existing sensor station columns across all 118 projects with active Caltrans PeMS corridor detectors (Mainline `ML` and HOV `HV`).
+Safe **dry-run mode is enabled permanently by default**, leaving the spreadsheet untouched:
+
+```bash
+# Run comparison across all projects (DRY RUN by default)
+python pems_interface.py --match-stations
+
+# Run dry run and export detailed project-by-project comparison report (CSV or Markdown)
+python pems_interface.py --match-stations --dry-run --output-report reports/station_comparison_report.csv
+
+# Match stations filtered to a specific District or Project ID
+python pems_interface.py --match-stations --dist 4
+python pems_interface.py --match-stations -p 300020420
+
+# Adjust postmile buffer tolerance (default 0.1 mi) and station types
+python pems_interface.py --match-stations --buffer 0.2 --station-types ML,HV
+
+# When ready: apply updates to master CSV (creates an automated timestamped backup first)
+python pems_interface.py --match-stations --apply
+```
+
+#### 4. Ad-Hoc Corridor Query
 Query coordinates, corridor reference segments, and generate a lane configuration URL for arbitrary freeway bounds:
 ```bash
 python pems_interface.py --route 80 --dir E --begin-pm 11.4 --end-pm 12.8 --county Solano
 ```
 
-#### 4. Interactive Project Mapping
+#### 5. Interactive Project Mapping
 Generate interactive Folium/Leaflet web maps showing road paths/corridors, postmile boundaries, and hover/click metadata:
 ```bash
 # Map a single project by PID (creates route_map_<PID>.html and opens in browser)
@@ -86,7 +109,7 @@ python pems_interface.py --map-all --dist 4
 python pems_interface.py --map-all --output-map maps/california_all.html --no-open
 ```
 
-#### 5. Batch URL Overview
+#### 6. Batch URL Overview
 Generate and preview PeMS URLs across the master dataset:
 ```bash
 python pems_interface.py --list-urls
