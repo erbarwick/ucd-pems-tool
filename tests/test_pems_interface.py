@@ -341,6 +341,12 @@ class TestProjectMapping(unittest.TestCase):
                 "dir_lanes_after": "4"
             }
         )
+        self.mock_vds_df = pd.DataFrame([
+            {"ID": "410756", "Fwy": "80", "Dir": "E", "District": "4", "County": "Solano", "City": "Fairfield", "State_PM": "12.0", "Abs_PM": "39.5", "Latitude": "38.208", "Longitude": "-122.147", "Length": "0.5", "Type": "ML", "Lanes": "4", "Name": "WEST TEXAS ST"},
+            {"ID": "429041", "Fwy": "80", "Dir": "E", "District": "4", "County": "Solano", "City": "Fairfield", "State_PM": "12.5", "Abs_PM": "40.0", "Latitude": "38.212", "Longitude": "-122.142", "Length": "0.4", "Type": "HV", "Lanes": "1", "Name": "TRAVIS BLVD HOV"},
+            {"ID": "410999", "Fwy": "80", "Dir": "E", "District": "4", "County": "Solano", "City": "Fairfield", "State_PM": "15.0", "Abs_PM": "42.5", "Latitude": "38.230", "Longitude": "-122.120", "Length": "0.6", "Type": "ML", "Lanes": "4", "Name": "OUT OF BOUNDS DETECTOR"},
+        ])
+        self.mock_vds_meta = pems_interface.IndexedVDSMetadata(self.mock_vds_df)
 
     def test_get_project_corridor_geometry_from_reference(self):
         coords = pems_interface.get_project_corridor_geometry(self.mock_project, self.mock_idx)
@@ -367,23 +373,88 @@ class TestProjectMapping(unittest.TestCase):
         self.assertEqual(coords[0], (39.1, -123.1))
         self.assertEqual(coords[1], (39.2, -123.2))
 
+    def test_classify_station_relative_to_project_bounds(self):
+        st_in = self.mock_vds_meta.by_id["410756"]
+        is_in, note, delta = pems_interface.classify_station_relative_to_project(st_in, self.mock_project)
+        self.assertTrue(is_in)
+        self.assertEqual(delta, 0.0)
+        self.assertIn("PM 38.90 - 40.30", note)
+
+        st_out = self.mock_vds_meta.by_id["410999"]
+        is_in_out, note_out, delta_out = pems_interface.classify_station_relative_to_project(st_out, self.mock_project)
+        self.assertFalse(is_in_out)
+        self.assertAlmostEqual(delta_out, 2.2, places=2)
+        self.assertIn("downstream", note_out)
+
+    def test_make_station_tooltip_html(self):
+        st_in = self.mock_vds_meta.by_id["410756"]
+        tt_html = pems_interface.make_station_tooltip_html(st_in, True, "PM 38.9 - 40.3", True)
+        self.assertIn("✓ IN PROJECT BOUNDS", tt_html)
+        self.assertIn("Station ID:</strong> 410756", tt_html)
+        self.assertIn("Mainline", tt_html)
+        self.assertIn("Listed in Master CSV (Verified)", tt_html)
+
+        st_out = self.mock_vds_meta.by_id["410999"]
+        tt_oob_html = pems_interface.make_station_tooltip_html(st_out, False, "2.2 mi downstream", False)
+        self.assertIn("⚠ OUTSIDE BOUNDS (2.2 mi downstream)", tt_oob_html)
+        self.assertIn("Not listed in Master CSV", tt_oob_html)
+
+    def test_make_station_popup_html(self):
+        st_in = self.mock_vds_meta.by_id["410756"]
+        pop_html = pems_interface.make_station_popup_html(st_in, self.mock_project, True, "In bounds", True)
+        self.assertIn("Station 410756 · ML (Mainline)", pop_html)
+        self.assertIn("Corridor Context (PID 418000244)", pop_html)
+        self.assertIn("PeMS Station Summary", pop_html)
+        self.assertIn("AADT Export", pop_html)
+        self.assertIn("Flow Export", pop_html)
+
     def test_build_single_project_map(self):
         with patch.object(pems_interface, "get_indexed_geo_ref", return_value=self.mock_idx):
-            m = pems_interface.build_single_project_map("418000244", projects=[self.mock_project])
+            m = pems_interface.build_single_project_map(
+                "418000244",
+                projects=[self.mock_project],
+                vds_metadata=self.mock_vds_meta,
+                station_buffer_mi=3.0
+            )
             self.assertIsNotNone(m)
             html = m.get_root().render()
             self.assertIn("PID 418000244", html)
             self.assertIn("Route 80 EB", html)
             self.assertIn("Solano County", html)
+            self.assertIn("Stations: Mainline (ML)", html)
+            self.assertIn("Stations: Carpool/HOV (HV)", html)
+            self.assertIn("PeMS Ground-Truth Checker", html)
+            self.assertIn("pems-inbounds", html)
+            self.assertIn("pems-oob", html)
+            self.assertIn("pems-in-sheet", html)
+
+    def test_build_single_project_map_no_stations(self):
+        with patch.object(pems_interface, "get_indexed_geo_ref", return_value=self.mock_idx):
+            m = pems_interface.build_single_project_map(
+                "418000244",
+                projects=[self.mock_project],
+                include_stations=False
+            )
+            self.assertIsNotNone(m)
+            html = m.get_root().render()
+            self.assertIn("PID 418000244", html)
+            self.assertNotIn("PeMS Ground-Truth Checker", html)
+            self.assertNotIn("Stations: Mainline", html)
 
     def test_build_multi_project_map_layers(self):
         with patch.object(pems_interface, "get_indexed_geo_ref", return_value=self.mock_idx):
-            m = pems_interface.build_multi_project_map(projects=[self.mock_project])
+            m = pems_interface.build_multi_project_map(
+                projects=[self.mock_project],
+                include_stations=True,
+                vds_metadata=self.mock_vds_meta
+            )
             self.assertIsNotNone(m)
             html = m.get_root().render()
             self.assertIn("District 4 (1 projects)", html)
             self.assertIn("PID 418000244", html)
             self.assertIn("Georgia", html)
+            self.assertIn("Stations: Mainline (ML)", html)
+            self.assertIn("Stations: Carpool/HOV (HV)", html)
 
 
 class TestFormattingAndSensors(unittest.TestCase):

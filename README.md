@@ -23,7 +23,7 @@ ag.workspace/
 │   ├── transform_master.py                 # Pipeline that produced cleaned dataset
 │   └── validate_lane_counts.py             # Lane count consistency validator
 ├── tests/
-│   └── test_pems_interface.py  # Branch-proven automated test suite (51 unit tests)
+│   └── test_pems_interface.py  # Branch-proven automated test suite (55 unit tests)
 └── README.md
 ```
 
@@ -93,21 +93,34 @@ Query coordinates, corridor reference segments, and generate a lane configuratio
 python pems_interface.py --route 80 --dir E --begin-pm 11.4 --end-pm 12.8 --county Solano
 ```
 
-#### 5. Interactive Project Mapping
-Generate interactive Folium/Leaflet web maps showing road paths/corridors, postmile boundaries, and hover/click metadata:
+#### 5. Interactive Project Mapping & Ground-Truth Detector Checking
+Generate interactive Folium/Leaflet web maps showing road paths/corridors, postmile boundaries, and detector stations partitioned by type. Hover over any detector station to view rich metadata and ground-truth boundary status:
 ```bash
-# Map a single project by PID (creates route_map_<PID>.html and opens in browser)
-python pems_interface.py --map 418000244
+# Map a single project by PID with detector layers and ground-truth checker toolbar
+python pems_interface.py --map 1200020279
+
+# Filter corridor buffer width (default: 3.0 miles upstream/downstream)
+python pems_interface.py --map 1200020279 --station-buffer 5.0
+
+# Map road path only without detector stations
+python pems_interface.py --map 1200020279 --no-stations
 
 # Map all 118 projects across California simultaneously (with layer controls by District)
 python pems_interface.py --map-all
 
-# Map all projects within a specific District (e.g. District 4 - Bay Area)
-python pems_interface.py --map-all --dist 4
+# Map multi-project view including toggleable detector layers across project corridors
+python pems_interface.py --map-all --include-stations --dist 4
 
 # Save map to a custom path without automatically launching the browser
-python pems_interface.py --map-all --output-map maps/california_all.html --no-open
+python pems_interface.py --map 1200020279 --output-map maps/project_1200020279.html --no-open
 ```
+
+**Key Map Features for Ground-Truth Verification**:
+- **Layer Toggles by Station Type**: Detectors are organized into toggleable Leaflet feature groups: Mainline (`ML`), Carpool/HOV (`HV`), On-Ramp (`OR`), Off-Ramp (`FR`), and Connectors (`FF`/`CD`/`CH`).
+- **Ground-Truth Visual Distinction**: Detectors within project bounds are rendered as bold solid markers (`✓ IN PROJECT BOUNDS`). Nearby buffer detectors outside the corridor are rendered as dashed, semi-transparent markers (`⚠ OUTSIDE BOUNDS`).
+- **Master Spreadsheet Cross-Verification**: Stations currently listed in the master spreadsheet are highlighted with gold borders (if verified in-bounds) or red warning rings (if out-of-bounds discrepancies).
+- **Ground-Truth Toolbar**: Includes quick buttons for `In-Bounds Only` (hides all buffer detectors instantly) and `Toggle All Stations`.
+- **Rich Hover Tooltips & Click Popups**: Hovering over any detector displays its ID, Type, Name, Postmile, Lanes, Length, and Corridor Ground-Truth status. Clicking opens direct links to PeMS Station Summary, AADT, and Flow detector exports.
 
 #### 6. Batch URL Overview
 Generate and preview PeMS URLs across the master dataset:

@@ -1848,15 +1848,331 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
     """
 
 
+# ---------------------------------------------------------------------------
+# Station Metadata Mapping Constants & Utilities
+# ---------------------------------------------------------------------------
+STATION_TYPE_NAMES: Dict[str, str] = {
+    "ML": "Mainline",
+    "HV": "HOV / Carpool",
+    "OR": "On-Ramp",
+    "FR": "Off-Ramp",
+    "FF": "Freeway Connector",
+    "CD": "Collector-Distributor",
+    "CH": "Commercial / Inspection",
+}
+
+STATION_TYPE_COLORS: Dict[str, str] = {
+    "ML": "#1d4ed8",  # Bold Blue
+    "HV": "#7e22ce",  # Purple
+    "OR": "#15803d",  # Forest Green
+    "FR": "#b45309",  # Amber Bronze
+    "FF": "#475569",  # Slate Gray
+    "CD": "#0f766e",  # Deep Teal
+    "CH": "#6b7280",  # Cool Gray
+}
+
+
+def classify_station_relative_to_project(
+    station: VDSStationRecord,
+    project: ProjectRecord,
+    tolerance_mi: float = 0.05
+) -> Tuple[bool, str, Optional[float]]:
+    """
+    Determine if a station falls within project corridor bounds.
+    Returns:
+        (is_in_bounds, bounds_note, delta_mi)
+    """
+    # 1. Use absolute postmiles if both project and station have them
+    use_abs = (
+        project.abs_begin_pm is not None
+        and project.abs_end_pm is not None
+        and station.abs_pm is not None
+        and not np.isnan(project.abs_begin_pm)
+        and not np.isnan(project.abs_end_pm)
+        and not np.isnan(station.abs_pm)
+    )
+    if use_abs:
+        min_p = min(float(project.abs_begin_pm), float(project.abs_end_pm))
+        max_p = max(float(project.abs_begin_pm), float(project.abs_end_pm))
+        st_p = float(station.abs_pm)
+
+        if min_p - tolerance_mi <= st_p <= max_p + tolerance_mi:
+            if min_p <= st_p <= max_p:
+                return True, f"PM {min_p:.2f} - {max_p:.2f}", 0.0
+            return True, f"Boundary tolerance (±{tolerance_mi:.2f} mi)", 0.0
+        elif st_p < min_p:
+            delta = min_p - st_p
+            return False, f"{delta:.2f} mi upstream / before start", delta
+        else:
+            delta = st_p - max_p
+            return False, f"{delta:.2f} mi downstream / after end", delta
+
+    # 2. Fall back to state postmiles
+    _, b_num = split_ca_pm(project.begin_pm)
+    _, e_num = split_ca_pm(project.end_pm)
+    _, st_num = station.ca_pm_prefix_and_num
+
+    if not np.isnan(b_num) and not np.isnan(e_num) and not np.isnan(st_num):
+        min_p = min(b_num, e_num)
+        max_p = max(b_num, e_num)
+        if min_p - tolerance_mi <= st_num <= max_p + tolerance_mi:
+            if min_p <= st_num <= max_p:
+                return True, f"PM {min_p:.2f} - {max_p:.2f}", 0.0
+            return True, f"Boundary tolerance (±{tolerance_mi:.2f} mi)", 0.0
+        elif st_num < min_p:
+            delta = min_p - st_num
+            return False, f"{delta:.2f} mi upstream / before start", delta
+        else:
+            delta = st_num - max_p
+            return False, f"{delta:.2f} mi downstream / after end", delta
+
+    return False, "Unable to determine postmile bounds", None
+
+
+def make_station_tooltip_html(
+    station: VDSStationRecord,
+    is_in_bounds: bool,
+    bounds_note: str,
+    is_in_sheet: bool,
+    delta_mi: Optional[float] = None
+) -> str:
+    """Build compact serif hover tooltip HTML displaying station metadata and ground-truth status."""
+    type_name = STATION_TYPE_NAMES.get(station.type, station.type)
+    if is_in_bounds:
+        status_badge = '<span style="color: #15803d; font-weight: bold;">✓ IN PROJECT BOUNDS</span>'
+    else:
+        status_badge = f'<span style="color: #b91c1c; font-weight: bold;">⚠ OUTSIDE BOUNDS ({bounds_note})</span>'
+
+    if is_in_sheet:
+        if is_in_bounds:
+            sheet_badge = '<span style="color: #15803d; font-weight: bold;">✓ Listed in Master CSV (Verified)</span>'
+        else:
+            sheet_badge = '<span style="color: #b91c1c; font-weight: bold;">⚠ Listed in Master CSV (Discrepancy)</span>'
+    else:
+        sheet_badge = '<span style="color: #555555;">Not listed in Master CSV</span>'
+
+    abs_str = f" · Abs PM {station.abs_pm:.2f}" if station.abs_pm is not None else ""
+    lanes_str = f"{station.lanes}" if station.lanes else "N/A"
+    len_str = f"{station.length:.2f} mi" if station.length else "N/A"
+
+    return f"""<div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 12px; line-height: 1.4; padding: 4px; min-width: 240px; color: #000; background: #fff;">
+  <div style="font-weight: bold; font-size: 12.5px; border-bottom: 1px solid #000; padding-bottom: 3px; margin-bottom: 4px;">
+    {status_badge}
+  </div>
+  <div><strong>Station ID:</strong> {station.id} &nbsp;({station.type} · {type_name})</div>
+  <div><strong>Location:</strong> {station.name or 'N/A'}</div>
+  <div><strong>Freeway:</strong> Route {station.fwy} {station.dir} · Dist {station.district}</div>
+  <div><strong>Postmile:</strong> State PM {station.state_pm}{abs_str}</div>
+  <div><strong>Lanes:</strong> {lanes_str} &nbsp;|&nbsp; <strong>Length:</strong> {len_str}</div>
+  <div style="margin-top: 4px; padding-top: 3px; border-top: 1px dotted #888;">
+    <strong>In Master Sheet:</strong> {sheet_badge}
+  </div>
+</div>"""
+
+
+def make_station_popup_html(
+    station: VDSStationRecord,
+    project: Optional[ProjectRecord] = None,
+    is_in_bounds: bool = True,
+    bounds_note: str = "",
+    is_in_sheet: bool = False,
+    delta_mi: Optional[float] = None
+) -> str:
+    """Build detailed serif click popup HTML with PeMS links and ground-truth corridor context."""
+    type_name = STATION_TYPE_NAMES.get(station.type, station.type)
+    summary_url = build_station_summary_url(station.id)
+
+    curr_year = datetime.datetime.now().year
+    s_yr = curr_year - 5
+    if project and project.construction_begin_date:
+        try:
+            s_yr = int(project.construction_begin_date.split("-")[0])
+        except (ValueError, IndexError):
+            pass
+    e_yr = curr_year
+    if project and project.open_to_traffic_date:
+        try:
+            e_yr = min(curr_year, int(project.open_to_traffic_date.split("-")[0]) + 3)
+        except (ValueError, IndexError):
+            pass
+    if s_yr > e_yr:
+        s_yr, e_yr = e_yr - 3, e_yr
+
+    aadt_url = build_station_aadt_url(station.id, s_yr, e_yr)
+    flow_url = build_station_flow_url(station.id, s_yr, e_yr)
+
+    if is_in_bounds:
+        bound_html = f'<div style="color: #15803d; font-weight: bold;">✓ In Project Bounds ({bounds_note})</div>'
+    else:
+        bound_html = f'<div style="color: #b91c1c; font-weight: bold;">⚠ Outside Project Bounds: {bounds_note}</div>'
+
+    if is_in_sheet:
+        if is_in_bounds:
+            sheet_html = '<div style="color: #15803d;">✓ Included in Master Spreadsheet (Verified)</div>'
+        else:
+            sheet_html = '<div style="color: #b91c1c; font-weight: bold;">⚠ Included in Master Spreadsheet (Corridor Discrepancy)</div>'
+    else:
+        sheet_html = '<div style="color: #555;">Not currently listed in Master Spreadsheet</div>'
+
+    proj_html = ""
+    if project:
+        proj_html = f"""
+  <div style="margin-top: 5px; padding: 4px; border: 1px solid #ccc; background: #fdfdfd; font-size: 11.5px;">
+    <strong>Corridor Context (PID {project.project_id}):</strong><br>
+    Route {project.route} {project.direction} · PM {project.begin_pm} &rarr; {project.end_pm}<br>
+    {bound_html}
+    {sheet_html}
+  </div>
+"""
+
+    return f"""<div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 12px; line-height: 1.4; padding: 6px; min-width: 280px; max-width: 370px; color: #000;">
+  <div style="font-weight: bold; font-size: 13.5px; border-bottom: 1px solid #000; padding-bottom: 4px; margin-bottom: 6px;">
+    Station {station.id} · {station.type} ({type_name})
+  </div>
+  <div><strong>Location:</strong> {station.name or 'N/A'}</div>
+  <div><strong>Freeway & Dir:</strong> Route {station.fwy} {station.dir} · District {station.district}</div>
+  <div><strong>County / City:</strong> {station.county or 'N/A'}, {station.city or 'N/A'}</div>
+  <div><strong>State Postmile:</strong> {station.state_pm}</div>
+  {f'<div><strong>Absolute Postmile:</strong> {station.abs_pm:.3f}</div>' if station.abs_pm is not None else ''}
+  <div><strong>Lanes:</strong> {station.lanes or 'N/A'} &nbsp;|&nbsp; <strong>Detector Length:</strong> {f'{station.length:.3f} mi' if station.length else 'N/A'}</div>
+  {proj_html}
+  <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #000; font-size: 11.5px;">
+    <a href="{summary_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">[PeMS Station Summary]</a>
+    &nbsp;&nbsp;
+    <a href="{aadt_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">[AADT Export ({s_yr}-{e_yr})]</a>
+    &nbsp;&nbsp;
+    <a href="{flow_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">[Flow Export ({s_yr}-{e_yr})]</a>
+  </div>
+</div>"""
+
+
+def add_ground_truth_control(
+    m: folium.Map,
+    project: ProjectRecord,
+    in_bounds_count: int,
+    oob_count: int,
+    sheet_sensors_total: int,
+    sheet_sensors_verified: int,
+    discrepancies_count: int = 0
+) -> None:
+    """Add a bare-bones serif Ground-Truth Checker toolbar and styling to the Folium map."""
+    discrepancy_str = f" · <span style='color: #dc2626; font-weight: bold;'>{discrepancies_count} out-of-range</span>" if discrepancies_count > 0 else ""
+    gt_box_html = f"""
+<div id="pems-ground-truth-control" style="
+  position: absolute;
+  top: 12px;
+  left: 60px;
+  z-index: 1000;
+  background: #ffffff;
+  border: 1px solid #000000;
+  padding: 8px 12px;
+  font-family: Georgia, 'Times New Roman', Times, serif;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #000000;
+  max-width: 340px;
+  box-shadow: none;
+">
+  <div style="font-weight: bold; font-size: 13px; border-bottom: 1px solid #000; padding-bottom: 3px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+    <span>PeMS Ground-Truth Checker</span>
+    <button onclick="toggleGroundTruthPanel(this)" style="font-family: Georgia, serif; font-size: 11px; background: transparent; border: 1px solid #000; padding: 1px 5px; cursor: pointer;">[–]</button>
+  </div>
+  <div id="pems-gt-content">
+    <div style="margin-bottom: 6px; font-size: 11.5px; color: #222;">
+      <strong>Project {project.project_id}:</strong> Route {project.route} {project.direction} (PM {project.begin_pm} &rarr; {project.end_pm})<br>
+      <strong>Corridor Detectors:</strong> <b>{in_bounds_count}</b> in bounds · {oob_count} buffer<br>
+      <strong>Master Sheet:</strong> <b>{sheet_sensors_verified}/{sheet_sensors_total}</b> verified in corridor{discrepancy_str}
+    </div>
+    <div style="margin-bottom: 6px; padding-top: 4px; border-top: 1px dotted #888;">
+      <button id="pems-oob-btn" onclick="toggleInBoundsOnly(this)" style="font-family: Georgia, serif; background: #f4f4f4; border: 1px solid #000; font-size: 11px; padding: 2px 7px; cursor: pointer; margin-right: 5px;">
+        In-Bounds Only: OFF
+      </button>
+      <button onclick="toggleAllStationLayers(this)" style="font-family: Georgia, serif; background: #f4f4f4; border: 1px solid #000; font-size: 11px; padding: 2px 7px; cursor: pointer;">
+        Toggle All Stations
+      </button>
+    </div>
+    <div style="font-size: 11px; border-top: 1px dotted #888; padding-top: 4px; color: #333;">
+      <strong>Type Filter / Legend:</strong><br>
+      <span style="display: inline-block; width: 9px; height: 9px; background: #1d4ed8; border: 1px solid #000; margin-right: 2px; vertical-align: middle;"></span>ML (Mainline)
+      &nbsp;
+      <span style="display: inline-block; width: 9px; height: 9px; background: #7e22ce; border: 1px solid #000; margin-right: 2px; vertical-align: middle;"></span>HV (HOV)
+      &nbsp;
+      <span style="display: inline-block; width: 9px; height: 9px; background: #15803d; border: 1px solid #000; margin-right: 2px; vertical-align: middle;"></span>OR (Ramp)
+      <br>
+      <span style="display: inline-block; width: 9px; height: 9px; background: #b45309; border: 1px solid #000; margin-right: 2px; vertical-align: middle;"></span>FR (Off-Ramp)
+      &nbsp;
+      <span style="display: inline-block; width: 9px; height: 9px; background: #475569; border: 1px solid #000; margin-right: 2px; vertical-align: middle;"></span>Other
+      &nbsp;
+      <span style="display: inline-block; width: 9px; height: 9px; border: 2.5px solid #d97706; background: #fff; margin-right: 2px; vertical-align: middle;"></span>In Master Sheet
+    </div>
+  </div>
+</div>
+"""
+    gt_script_html = """
+<script>
+var inBoundsOnlyActive = false;
+function toggleInBoundsOnly(btn) {
+  inBoundsOnlyActive = !inBoundsOnlyActive;
+  btn.innerText = "In-Bounds Only: " + (inBoundsOnlyActive ? "ON" : "OFF");
+  btn.style.background = inBoundsOnlyActive ? "#e2e8f0" : "#f4f4f4";
+  btn.style.fontWeight = inBoundsOnlyActive ? "bold" : "normal";
+  if (inBoundsOnlyActive) {
+    document.body.classList.add("hide-oob-stations");
+  } else {
+    document.body.classList.remove("hide-oob-stations");
+  }
+}
+
+function toggleAllStationLayers(btn) {
+  var inputs = document.querySelectorAll(".leaflet-control-layers-overlays input[type='checkbox']");
+  var stationInputs = [];
+  var anyChecked = false;
+  inputs.forEach(function(inp) {
+    var label = inp.closest("label");
+    if (label && label.textContent.indexOf("Stations:") !== -1) {
+      stationInputs.push(inp);
+      if (inp.checked) anyChecked = true;
+    }
+  });
+  var target = !anyChecked;
+  stationInputs.forEach(function(inp) {
+    if (inp.checked !== target) {
+      inp.click();
+    }
+  });
+}
+
+function toggleGroundTruthPanel(btn) {
+  var content = document.getElementById("pems-gt-content");
+  if (!content) return;
+  if (content.style.display === "none") {
+    content.style.display = "block";
+    btn.innerText = "[–]";
+  } else {
+    content.style.display = "none";
+    btn.innerText = "[+]";
+  }
+}
+</script>
+"""
+    m.get_root().html.add_child(folium.Element(gt_box_html + gt_script_html))
+
+
 def build_single_project_map(
     target_pid: str,
     projects: Optional[List[ProjectRecord]] = None,
     output_path: Optional[str] = None,
     open_browser: bool = False,
-    tiles: str = "cartodbpositron"
+    tiles: str = "cartodbpositron",
+    include_stations: bool = True,
+    station_buffer_mi: float = 3.0,
+    station_types: Optional[Tuple[str, ...]] = None,
+    vds_metadata: Optional[IndexedVDSMetadata] = None,
 ) -> Optional[folium.Map]:
     """
-    Build a folium map for a single project (or both directions if split).
+    Build a folium map for a single project (or both directions if split) with
+    highway path, start/end markers, corridor station detector layers partitioned by type,
+    rich hover tooltips, and an interactive ground-truth checker toolbar.
     """
     projs = projects or load_master_csv()
     matched = [p for p in projs if p.project_id == str(target_pid).strip()]
@@ -1917,6 +2233,148 @@ def build_single_project_map(
             tooltip=f"End: Route {p.route} {p.direction} PM {p.end_pm}"
         ).add_to(m)
 
+    if include_stations:
+        vds = vds_metadata
+        if vds is None:
+            try:
+                vds = get_indexed_vds_metadata()
+            except Exception as exc:
+                LOGGER.warning(f"Could not load PeMS VDS metadata for mapping: {exc}")
+                vds = None
+
+        if vds is not None:
+            proj_by_dir = {p.pems_direction: p for p in matched}
+            all_st_records: List[VDSStationRecord] = []
+            seen_ids = set()
+
+            for p in matched:
+                st_list = vds.find_corridor_stations(
+                    district=p.dist,
+                    route=p.route,
+                    direction=p.direction,
+                    begin_pm=p.begin_pm,
+                    end_pm=p.end_pm,
+                    abs_begin_pm=p.abs_begin_pm,
+                    abs_end_pm=p.abs_end_pm,
+                    buffer_mi=station_buffer_mi,
+                    station_types=station_types or ("ALL",)
+                )
+                for s in st_list:
+                    if s.id not in seen_ids:
+                        seen_ids.add(s.id)
+                        all_st_records.append(s)
+
+            # Ensure all sensors listed in spreadsheet are included
+            sheet_sensor_ids = set()
+            for p in matched:
+                for sid in p.sensor_stations:
+                    sheet_sensor_ids.add(sid)
+                    if sid not in seen_ids and sid in vds.by_id:
+                        seen_ids.add(sid)
+                        all_st_records.append(vds.by_id[sid])
+
+            type_groups: Dict[str, List[Tuple[VDSStationRecord, bool, str, bool, Optional[ProjectRecord]]]] = {
+                "ML": [],
+                "HV": [],
+                "OR": [],
+                "FR": [],
+                "Other": []
+            }
+            in_bounds_cnt = 0
+            oob_cnt = 0
+            sheet_verified_cnt = 0
+            sheet_discrepancy_cnt = 0
+
+            for st in all_st_records:
+                target_p = proj_by_dir.get(st.dir) or matched[0]
+                is_in_bounds, bounds_note, delta_mi = classify_station_relative_to_project(st, target_p)
+                is_in_sheet = (st.id in sheet_sensor_ids)
+
+                if is_in_bounds:
+                    in_bounds_cnt += 1
+                    if is_in_sheet:
+                        sheet_verified_cnt += 1
+                else:
+                    oob_cnt += 1
+                    if is_in_sheet:
+                        sheet_discrepancy_cnt += 1
+
+                grp_key = st.type if st.type in ("ML", "HV", "OR", "FR") else "Other"
+                type_groups[grp_key].append((st, is_in_bounds, bounds_note, is_in_sheet, target_p))
+
+            type_labels = {
+                "ML": "Mainline (ML)",
+                "HV": "Carpool/HOV (HV)",
+                "OR": "On-Ramp (OR)",
+                "FR": "Off-Ramp (FR)",
+                "Other": "Other (FF/CD/CH)"
+            }
+            default_show = {"ML", "HV"}
+
+            for grp_key in ("ML", "HV", "OR", "FR", "Other"):
+                st_tuple_list = type_groups[grp_key]
+                if not st_tuple_list:
+                    continue
+
+                fg_name = f"Stations: {type_labels[grp_key]} ({len(st_tuple_list)})"
+                fg = folium.FeatureGroup(name=fg_name, show=(grp_key in default_show))
+
+                for st, in_bounds, b_note, in_sheet, target_p in st_tuple_list:
+                    lat, lng = st.latitude, st.longitude
+                    if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
+                        _, st_num = st.ca_pm_prefix_and_num
+                        if not np.isnan(st_num):
+                            coords = pm_to_coordinates(st.fwy, st.dir, st_num, ref_df=idx_ref)
+                            if coords:
+                                lat, lng = coords
+                    if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
+                        continue
+
+                    fill_color = STATION_TYPE_COLORS.get(st.type, "#2563eb")
+                    if in_bounds:
+                        radius = 6.5
+                        border_color = "#d97706" if in_sheet else "#000000"
+                        border_weight = 3.5 if in_sheet else 2.0
+                        fill_opacity = 0.95
+                        dash_arr = None
+                        cls_name = f"pems-station-marker pems-inbounds{' pems-in-sheet' if in_sheet else ''}"
+                    else:
+                        radius = 4.5
+                        border_color = "#dc2626" if in_sheet else "#555555"
+                        border_weight = 3.0 if in_sheet else 1.5
+                        fill_opacity = 0.50
+                        dash_arr = None if in_sheet else "2, 3"
+                        cls_name = f"pems-station-marker pems-oob{' pems-in-sheet' if in_sheet else ''}"
+
+                    tt_html = make_station_tooltip_html(st, in_bounds, b_note, in_sheet)
+                    pop_html = make_station_popup_html(st, target_p, in_bounds, b_note, in_sheet)
+
+                    folium.CircleMarker(
+                        location=[lat, lng],
+                        radius=radius,
+                        color=border_color,
+                        weight=border_weight,
+                        fill=True,
+                        fill_color=fill_color,
+                        fill_opacity=fill_opacity,
+                        dash_array=dash_arr,
+                        className=cls_name,
+                        tooltip=folium.Tooltip(tt_html, sticky=True),
+                        popup=folium.Popup(pop_html, max_width=370)
+                    ).add_to(fg)
+
+                fg.add_to(m)
+
+            add_ground_truth_control(
+                m=m,
+                project=matched[0],
+                in_bounds_count=in_bounds_cnt,
+                oob_count=oob_cnt,
+                sheet_sensors_total=len(sheet_sensor_ids),
+                sheet_sensors_verified=sheet_verified_cnt,
+                discrepancies_count=sheet_discrepancy_cnt
+            )
+
     if all_coords:
         lats = [c[0] for c in all_coords]
         lngs = [c[1] for c in all_coords]
@@ -1926,7 +2384,7 @@ def build_single_project_map(
         m.zoom_start = 6
 
     folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
-    folium.LayerControl(position='topright').add_to(m)
+    folium.LayerControl(position='topright', collapsed=False).add_to(m)
 
     m.get_root().header.add_child(folium.Element("""
 <style>
@@ -1944,6 +2402,12 @@ def build_single_project_map(
   .leaflet-tooltip {
     border-radius: 0px !important;
     box-shadow: none !important;
+  }
+  .pems-station-marker {
+    cursor: pointer;
+  }
+  .hide-oob-stations .pems-oob {
+    display: none !important;
   }
 </style>
 """))
@@ -1963,12 +2427,16 @@ def build_multi_project_map(
     dist: Optional[str] = None,
     output_path: Optional[str] = None,
     open_browser: bool = False,
-    tiles: str = "cartodbpositron"
+    tiles: str = "cartodbpositron",
+    include_stations: bool = False,
+    station_buffer_mi: float = 1.0,
+    station_types: Optional[Tuple[str, ...]] = None,
+    vds_metadata: Optional[IndexedVDSMetadata] = None,
 ) -> folium.Map:
     """
     Build a multi-project interactive folium map across California.
     Projects are mapped as highway road paths with hover tooltips and click popups,
-    organized into toggleable District feature groups.
+    organized into toggleable District feature groups with optional station detector layers.
     """
     projs = projects or load_master_csv()
     if dist:
@@ -2041,6 +2509,112 @@ def build_multi_project_map(
 
         fg.add_to(m)
 
+    if include_stations:
+        vds = vds_metadata
+        if vds is None:
+            try:
+                vds = get_indexed_vds_metadata()
+            except Exception as exc:
+                LOGGER.warning(f"Could not load PeMS VDS metadata for multi-project map: {exc}")
+                vds = None
+
+        if vds is not None:
+            seen_sids: Dict[str, Tuple[VDSStationRecord, List[str]]] = {}
+
+            for p in projs:
+                st_list = vds.find_corridor_stations(
+                    district=p.dist,
+                    route=p.route,
+                    direction=p.direction,
+                    begin_pm=p.begin_pm,
+                    end_pm=p.end_pm,
+                    abs_begin_pm=p.abs_begin_pm,
+                    abs_end_pm=p.abs_end_pm,
+                    buffer_mi=station_buffer_mi,
+                    station_types=station_types or ("ALL",)
+                )
+                for s in st_list:
+                    if s.id not in seen_sids:
+                        seen_sids[s.id] = (s, [p.project_id])
+                    else:
+                        if p.project_id not in seen_sids[s.id][1]:
+                            seen_sids[s.id][1].append(p.project_id)
+
+                for sid in p.sensor_stations:
+                    if sid in vds.by_id:
+                        s = vds.by_id[sid]
+                        if sid not in seen_sids:
+                            seen_sids[sid] = (s, [p.project_id])
+                        else:
+                            if p.project_id not in seen_sids[sid][1]:
+                                seen_sids[sid][1].append(p.project_id)
+
+            type_groups: Dict[str, List[Tuple[VDSStationRecord, List[str]]]] = {
+                "ML": [],
+                "HV": [],
+                "OR": [],
+                "FR": [],
+                "Other": []
+            }
+            for sid, (st, pids) in seen_sids.items():
+                grp_key = st.type if st.type in ("ML", "HV", "OR", "FR") else "Other"
+                type_groups[grp_key].append((st, pids))
+
+            type_labels = {
+                "ML": "Mainline (ML)",
+                "HV": "Carpool/HOV (HV)",
+                "OR": "On-Ramp (OR)",
+                "FR": "Off-Ramp (FR)",
+                "Other": "Other (FF/CD/CH)"
+            }
+
+            for grp_key in ("ML", "HV", "OR", "FR", "Other"):
+                st_list = type_groups[grp_key]
+                if not st_list:
+                    continue
+
+                fg_name = f"Stations: {type_labels[grp_key]} ({len(st_list)})"
+                fg = folium.FeatureGroup(name=fg_name, show=False)
+
+                for st, pids in st_list:
+                    lat, lng = st.latitude, st.longitude
+                    if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
+                        _, st_num = st.ca_pm_prefix_and_num
+                        if not np.isnan(st_num):
+                            coords = pm_to_coordinates(st.fwy, st.dir, st_num, ref_df=idx_ref)
+                            if coords:
+                                lat, lng = coords
+                    if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
+                        continue
+
+                    fill_color = STATION_TYPE_COLORS.get(st.type, "#2563eb")
+                    pid_str = ", ".join(pids) if pids else "Corridor"
+                    type_name = STATION_TYPE_NAMES.get(st.type, st.type)
+                    tt_html = f"""<div style="font-family: Georgia, serif; font-size: 12px; line-height: 1.35; padding: 3px; min-width: 200px; color: #000; background: #fff;">
+  <div style="font-weight: bold; border-bottom: 1px solid #000; padding-bottom: 2px; margin-bottom: 3px;">Station {st.id} ({st.type} - {type_name})</div>
+  <div><strong>Name:</strong> {st.name or 'N/A'}</div>
+  <div><strong>Route:</strong> Route {st.fwy} {st.dir} · PM {st.state_pm}</div>
+  <div><strong>Lanes:</strong> {st.lanes or 'N/A'}</div>
+  <div><strong>Project(s):</strong> PID {pid_str}</div>
+</div>"""
+
+                    pop_html = make_station_popup_html(st, None, True, f"Project(s): PID {pid_str}")
+
+                    folium.CircleMarker(
+                        location=[lat, lng],
+                        radius=4.5,
+                        color="#000000",
+                        weight=1.5,
+                        fill=True,
+                        fill_color=fill_color,
+                        fill_opacity=0.85,
+                        className="pems-station-marker",
+                        tooltip=folium.Tooltip(tt_html, sticky=True),
+                        popup=folium.Popup(pop_html, max_width=350)
+                    ).add_to(fg)
+
+                fg.add_to(m)
+
     if all_coords:
         lats = [c[0] for c in all_coords]
         lngs = [c[1] for c in all_coords]
@@ -2096,6 +2670,10 @@ def main():
     parser.add_argument("--output-map", "-o", help="Custom output path for generated HTML map.")
     parser.add_argument("--no-open", action="store_true", help="Do not automatically open map in browser.")
     parser.add_argument("--dist", help="Filter --map-all to a specific Caltrans District (e.g. '4').")
+    parser.add_argument("--no-stations", action="store_true", help="Do not include PeMS VDS station detector layers on single-project map.")
+    parser.add_argument("--include-stations", action="store_true", help="Include PeMS VDS station detector layers on multi-project map (--map-all).")
+    parser.add_argument("--station-buffer", type=float, default=3.0, help="Corridor postmile buffer in miles for nearby stations on the map (default: 3.0 mi).")
+    parser.add_argument("--map-station-types", default=None, help="Comma-separated station types to include on the map (default: all types partitioned by layer).")
     parser.add_argument("--list-urls", action="store_true", help="List generated PeMS URLs for projects.")
     parser.add_argument("--test-login", action="store_true", help="Test PeMS login credentials.")
     parser.add_argument("--census", action="store_true", help="Search closest Census stations.")
@@ -2104,7 +2682,7 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Apply updates to master CSV (disables dry-run; creates automated backup).")
     parser.add_argument("--output-report", help="Save comparison report to CSV or Markdown file.")
     parser.add_argument("--output-csv", help="Custom output path for updated master CSV when using --apply.")
-    parser.add_argument("--station-types", default="ML,HV", help="Comma-separated station types to include (default: 'ML,HV'). Use 'ALL' for all types.")
+    parser.add_argument("--station-types", default="ML,HV", help="Comma-separated station types to include for matching (default: 'ML,HV'). Use 'ALL' for all types.")
     parser.add_argument("--buffer", type=float, default=0.1, help="Postmile buffer tolerance in miles (default: 0.1).")
     parser.add_argument("--metadata-dir", help="Custom directory containing PeMS metadata text files.")
     parser.add_argument("--route", "-r", help="Freeway route number for ad-hoc query.")
@@ -2177,7 +2755,16 @@ def main():
         target_pid = str(args.map).strip()
         out_file = args.output_map or f"route_map_{target_pid}.html"
         open_b = not args.no_open
-        m = build_single_project_map(target_pid, projects=projects, output_path=out_file, open_browser=open_b)
+        st_types = tuple(s.strip() for s in args.map_station_types.split(",")) if args.map_station_types else None
+        m = build_single_project_map(
+            target_pid,
+            projects=projects,
+            output_path=out_file,
+            open_browser=open_b,
+            include_stations=not args.no_stations,
+            station_buffer_mi=args.station_buffer,
+            station_types=st_types,
+        )
         if m is None:
             sys.exit(1)
         print(f"\n✓ Generated interactive map for Project {target_pid} -> {out_file}")
@@ -2186,7 +2773,16 @@ def main():
     if args.map_all:
         out_file = args.output_map or ("all_ca_projects_map.html" if not args.dist else f"district_{args.dist}_projects_map.html")
         open_b = not args.no_open
-        m = build_multi_project_map(projects=projects, dist=args.dist, output_path=out_file, open_browser=open_b)
+        st_types = tuple(s.strip() for s in args.map_station_types.split(",")) if args.map_station_types else None
+        m = build_multi_project_map(
+            projects=projects,
+            dist=args.dist,
+            output_path=out_file,
+            open_browser=open_b,
+            include_stations=args.include_stations,
+            station_buffer_mi=args.station_buffer,
+            station_types=st_types,
+        )
         print(f"\n✓ Generated interactive multi-project map -> {out_file}")
         return
 
