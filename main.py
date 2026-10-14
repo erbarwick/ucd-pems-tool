@@ -186,12 +186,22 @@ def coord_centroid(arr):
 
 # https://github.com/GIScience/openrouteservice-py/blob/master/examples/basic_example.ipynb
 def draw_route(start_coord: list[float], end_coord: list[float], anchor: list[float],
-               tiles='cartodbpositron') -> folium.Map:
+               tiles=None) -> folium.Map:
     if not start_coord or not end_coord or not anchor:
         raise ValueError(
             f"Need [lat, lon] for start/end/anchor; got start={start_coord}, end={end_coord}, anchor={anchor}"
         )
-    m = folium.Map(location=anchor, tiles=tiles, zoom_start=13)
+    if tiles is None or tiles in ('cartodbpositron', 'cartodb_positron'):
+        m = folium.Map(location=anchor, tiles=None, zoom_start=13)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+            attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
+            name="Esri Light Gray",
+            control=True,
+            max_zoom=16
+        ).add_to(m)
+    else:
+        m = folium.Map(location=anchor, tiles=tiles, zoom_start=13)
     start_coord = list(reversed(start_coord))
     end_coord = list(reversed(end_coord))
     route = ors_client.directions(

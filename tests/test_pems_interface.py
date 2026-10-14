@@ -17,6 +17,7 @@ import os
 import glob
 import pandas as pd
 import numpy as np
+import folium
 
 import pems_interface
 
@@ -455,6 +456,26 @@ class TestProjectMapping(unittest.TestCase):
             self.assertIn("Georgia", html)
             self.assertIn("Stations: Mainline (ML)", html)
             self.assertIn("Stations: Carpool/HOV (HV)", html)
+
+    def test_add_standard_basemaps_to_map(self):
+        m = folium.Map(tiles=None)
+        pems_interface.add_standard_basemaps_to_map(m)
+        folium.LayerControl().add_to(m)
+        html = m.get_root().render()
+        self.assertIn("Esri Light Gray (Default)", html)
+        self.assertIn("Esri Street Map", html)
+        self.assertIn("USGS Topo", html)
+        self.assertIn("server.arcgisonline.com", html)
+        self.assertNotIn("basemaps.cartocdn.com", html)
+
+    def test_add_standard_basemaps_with_carto_key(self):
+        with patch.dict(os.environ, {"CARTO_API_KEY": "test_carto_key_12345"}):
+            m = folium.Map(tiles=None)
+            pems_interface.add_standard_basemaps_to_map(m)
+            folium.LayerControl().add_to(m)
+            html = m.get_root().render()
+            self.assertIn("CartoDB Positron (Authenticated)", html)
+            self.assertIn("test_carto_key_12345", html)
 
 
 class TestFormattingAndSensors(unittest.TestCase):

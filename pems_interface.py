@@ -2158,12 +2158,85 @@ function toggleGroundTruthPanel(btn) {
     m.get_root().html.add_child(folium.Element(gt_box_html + gt_script_html))
 
 
+def add_standard_basemaps_to_map(
+    m: folium.Map,
+    default_tiles: Optional[str] = None
+) -> None:
+    """
+    Add reliable, unwatermarked basemaps to a Folium map.
+    Eliminates 403 Access Blocked (OpenStreetMap missing Referer on file:// URLs)
+    and CARTO 'API Key Required' watermarks.
+    """
+    carto_key = os.getenv("CARTO_API_KEY", "").strip()
+
+    # 1. Primary Default: Esri Light Gray Canvas (clean, muted, no API key, works over file://)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
+        name="Esri Light Gray (Default)",
+        overlay=False,
+        control=True,
+        max_zoom=16
+    ).add_to(m)
+
+    # 2. Esri World Street Map (high-detail roads, freeways, street names)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri &mdash; Source: Esri, DeLorme, NAVTEQ, USGS",
+        name="Esri Street Map",
+        overlay=False,
+        control=True,
+        max_zoom=19
+    ).add_to(m)
+
+    # 3. USGS Topographic (terrain contours, elevation)
+    folium.TileLayer(
+        tiles="https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles courtesy of the U.S. Geological Survey",
+        name="USGS Topo",
+        overlay=False,
+        control=True,
+        max_zoom=16
+    ).add_to(m)
+
+    # 4. Optional: CARTO Positron if user has provided an API key in .env
+    if carto_key:
+        folium.TileLayer(
+            tiles=f"https://a.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}.png?key={carto_key}",
+            attr="&copy; OpenStreetMap contributors &copy; CARTO",
+            name="CartoDB Positron (Authenticated)",
+            overlay=False,
+            control=True,
+            max_zoom=20
+        ).add_to(m)
+
+    # 5. OpenStreetMap (works when served via HTTP localhost; blocked over file:// without referer)
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="&copy; OpenStreetMap contributors (Note: tile.openstreetmap.org blocks local file:// URLs)",
+        name="OpenStreetMap (HTTP Only)",
+        overlay=False,
+        control=True,
+        max_zoom=19
+    ).add_to(m)
+
+    # 6. Custom user tiles if explicitly specified and not one of the legacy keywords
+    if default_tiles and default_tiles not in ("cartodbpositron", "cartodb_positron", "openstreetmap", "esri_gray"):
+        folium.TileLayer(
+            tiles=default_tiles,
+            attr="Custom Tile Provider",
+            name="Custom Base Layer",
+            overlay=False,
+            control=True
+        ).add_to(m)
+
+
 def build_single_project_map(
     target_pid: str,
     projects: Optional[List[ProjectRecord]] = None,
     output_path: Optional[str] = None,
     open_browser: bool = False,
-    tiles: str = "cartodbpositron",
+    tiles: Optional[str] = None,
     include_stations: bool = True,
     station_buffer_mi: float = 3.0,
     station_types: Optional[Tuple[str, ...]] = None,
@@ -2181,7 +2254,8 @@ def build_single_project_map(
         return None
 
     idx_ref = get_indexed_geo_ref()
-    m = folium.Map(tiles=tiles)
+    m = folium.Map(tiles=None)
+    add_standard_basemaps_to_map(m, default_tiles=tiles)
     all_coords: List[Tuple[float, float]] = []
 
     for p in matched:
@@ -2383,7 +2457,6 @@ def build_single_project_map(
         m.location = [36.7783, -119.4179]
         m.zoom_start = 6
 
-    folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
     folium.LayerControl(position='topright', collapsed=False).add_to(m)
 
     m.get_root().header.add_child(folium.Element("""
@@ -2427,7 +2500,7 @@ def build_multi_project_map(
     dist: Optional[str] = None,
     output_path: Optional[str] = None,
     open_browser: bool = False,
-    tiles: str = "cartodbpositron",
+    tiles: Optional[str] = None,
     include_stations: bool = False,
     station_buffer_mi: float = 1.0,
     station_types: Optional[Tuple[str, ...]] = None,
@@ -2445,7 +2518,8 @@ def build_multi_project_map(
         LOGGER.info(f"Filtered to District {dist_clean} ({len(projs)} projects)")
 
     idx_ref = get_indexed_geo_ref()
-    m = folium.Map(tiles=tiles)
+    m = folium.Map(tiles=None)
+    add_standard_basemaps_to_map(m, default_tiles=tiles)
     all_coords: List[Tuple[float, float]] = []
 
     dist_groups: Dict[str, List[ProjectRecord]] = {}
@@ -2623,7 +2697,6 @@ def build_multi_project_map(
         m.location = [36.7783, -119.4179]
         m.zoom_start = 6
 
-    folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
     folium.LayerControl(position='topright', collapsed=False).add_to(m)
 
     m.get_root().header.add_child(folium.Element("""
