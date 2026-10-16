@@ -45,13 +45,13 @@ def parse_num(val):
     return 0.0
 
 def run_verification():
-    import main
+    from pems_interface import load_geo_reference, split_ca_pm
     
     df = pd.read_csv(RAW_CSV, dtype=str).fillna("")
     print(f"Loaded {len(df)} rows from {RAW_CSV}")
     
     # Load reference table once
-    ref_df = main._load_merged_geo_pm(REF_PATH)
+    ref_df = load_geo_reference(REF_PATH)
     print(f"Loaded {len(ref_df)} reference rows from {REF_PATH}")
     
     # Results collectors
@@ -99,7 +99,7 @@ def run_verification():
                     # Lookup begin
                     try:
                         # CA mode
-                        prefix, num = main._split_ca_pm(begin_pm)
+                        prefix, num = split_ca_pm(begin_pm)
                         if pd.isna(num):
                             begin_pm_err = f"Cannot parse Begin PM: {begin_pm}"
                         else:
@@ -108,7 +108,7 @@ def run_verification():
                             if c_sub.empty:
                                 begin_pm_err = f"County '{county}' not found on Route {route} {d_1char}"
                             else:
-                                pm_series = c_sub['CA PM'].apply(lambda x: main._split_ca_pm(x)[1])
+                                pm_series = c_sub['CA PM'].apply(lambda x: split_ca_pm(x)[1])
                                 delta = (pm_series - num).abs()
                                 min_delta = delta.min()
                                 if min_delta <= 1.0: # within 1 mile
@@ -125,11 +125,11 @@ def run_verification():
                     # Lookup end
                     if end_pm:
                         try:
-                            prefix, num = main._split_ca_pm(end_pm)
+                            prefix, num = split_ca_pm(end_pm)
                             if not pd.isna(num):
                                 c_sub = rd_sub[rd_sub['County'].str.lower() == county.lower()]
                                 if not c_sub.empty:
-                                    pm_series = c_sub['CA PM'].apply(lambda x: main._split_ca_pm(x)[1])
+                                    pm_series = c_sub['CA PM'].apply(lambda x: split_ca_pm(x)[1])
                                     delta = (pm_series - num).abs()
                                     min_delta = delta.min()
                                     if min_delta <= 1.0:

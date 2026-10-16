@@ -124,9 +124,9 @@ import calendar
 import datetime
 import logging
 import argparse
+import html
 import urllib.parse
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
@@ -146,7 +146,6 @@ BASE_URL = "https://pems.dot.ca.gov"
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_REF_PATH = os.path.join(WORKSPACE_DIR, "downloads", "merged_geo_pm.csv")
-DEFAULT_ROUTES_DIRS = os.path.join(WORKSPACE_DIR, "ca_routes_dirs.csv")
 DEFAULT_MASTER_CSV = os.path.join(WORKSPACE_DIR, "staging", "Master_CA_Project_List_Cleaned.csv")
 DEFAULT_METADATA_DIR = os.path.join(WORKSPACE_DIR, "downloads", "metadata")
 
@@ -156,8 +155,10 @@ CENSUS_PATHS = [
     os.path.abspath(os.path.join(WORKSPACE_DIR, "..", "..", "..", "notes", "AADT Comparisons", "data", "ALL_CENSUS_STATIONS.tsv"))
 ]
 
-TABLE_MARKERS = ("Starting Month", "Month", "Day", "Time", "Station", "VDS", "Hour")
-VALID_CARDINAL_DIRS = {"N", "S", "E", "W"}
+TABLE_MARKERS = (
+    "Starting Month", "Month", "Day", "Time", "Station", "VDS", "Hour",
+    "ID\t", "ID,", "Latitude\t", "Latitude,", "Fwy\t", "Fwy,", "Abs_PM\t", "State_PM\t"
+)
 
 LOGGER = logging.getLogger("pems_interface")
 logging.basicConfig(
@@ -190,31 +191,42 @@ def normalize_direction(d: Any) -> str:
 
 
 def normalize_route(r: Any) -> str:
-    """Normalize route string to digits: 'SR-80' -> '80', 'I-5' -> '5'."""
+    """Normalize route string to digits: 'SR-80' -> '80', 'I-5' -> '5', '5.0' -> '5'."""
     if not r or pd.isna(r):
         return ""
-    return re.sub(r"[^0-9]", "", str(r))
+    s = str(r).strip()
+    s = re.sub(r"\.0+$", "", s)
+    return re.sub(r"[^0-9]", "", s)
 
 
 def format_pm(val: Any) -> str:
     """
     Format a postmile cleanly, eliminating floating-point artifacts (e.g. 8.6999999999999993 -> 8.7).
-    Preserves letter prefixes (e.g. R, M, L), suffixes (e.g. L, R), and strips route prefixes.
+    Preserves letter prefixes (e.g. R, M, L), suffixes (e.g. L, R), and strips route/county prefixes.
     """
-    if val is None or pd.isna(val) or val == "":
+    if val is None or pd.isna(val) or str(val).strip().lower() in ("", "nan", "none"):
         return ""
     s = str(val).strip()
-    s = re.sub(r"^(?:I|SR|US|RTE|ROUTE|HWY)\s*[-]?\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    # Strip Caltrans standard prefix like '04-ALA-80-', 'ALA-', 'I-5 PM', etc.
+    s = re.sub(r"^(?:\d{1,2}\s*[-–]\s*)?[A-Za-z]{3,4}\s*[-–]\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"^(?:I|SR|US|RTE|ROUTE|HWY)\s*[-–]?\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"^[A-Za-z]{3,4}\s+(?:PM\s*)?", "", s, flags=re.IGNORECASE).strip()
+
+    sign = ""
+    if s.startswith("-"):
+        sign = "-"
+        s = s[1:].strip()
+
     m = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s)
     if m:
         pfx = m.group(1).strip()
-        num = float(m.group(2))
+        num = float(sign + m.group(2))
         sfx = m.group(3).strip()
         rounded = round(num, 3)
         num_str = f"{rounded:.3f}".rstrip("0").rstrip(".")
         return f"{pfx}{num_str}{sfx}"
     try:
-        num = float(s)
+        num = float(sign + s)
         rounded = round(num, 3)
         return f"{rounded:.3f}".rstrip("0").rstrip(".")
     except (ValueError, TypeError):
@@ -225,24 +237,32 @@ def split_ca_pm(ca_pm: Any) -> Tuple[str, float]:
     """
     Split a California postmile string into prefix and float number.
     Handles letter prefixes (R, L, M) and suffix letters (L, R, A),
-    as well as embedded route markers (e.g. 'I-10 30.3').
+    as well as embedded route markers (e.g. 'I-10 30.3', '04-ALA-80 R11.4').
     e.g. 'R3.80' -> ('R', 3.8), '12.4L' -> ('', 12.4), 'R12.4A' -> ('R', 12.4)
     """
-    if ca_pm is None or (isinstance(ca_pm, float) and np.isnan(ca_pm)):
+    if ca_pm is None or (isinstance(ca_pm, float) and np.isnan(ca_pm)) or str(ca_pm).strip().lower() in ("", "nan", "none"):
         return "", np.nan
     s = str(ca_pm).strip()
     if not s:
         return "", np.nan
 
-    s_clean = re.sub(r"^(?:I|SR|US|RTE|ROUTE|HWY)\s*[-]?\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    s_clean = re.sub(r"^(?:\d{1,2}\s*[-–]\s*)?[A-Za-z]{3,4}\s*[-–]\s*\d+\s*(?:PM)?\s*", "", s, flags=re.IGNORECASE).strip()
+    s_clean = re.sub(r"^(?:I|SR|US|RTE|ROUTE|HWY)\s*[-–]?\s*\d+\s*(?:PM)?\s*", "", s_clean, flags=re.IGNORECASE).strip()
+    s_clean = re.sub(r"^[A-Za-z]{3,4}\s+(?:PM\s*)?", "", s_clean, flags=re.IGNORECASE).strip()
+
+    sign = ""
+    if s_clean.startswith("-"):
+        sign = "-"
+        s_clean = s_clean[1:].strip()
+
     match = re.match(r"^([A-Za-z\s\-]*?)([0-9]+(?:\.[0-9]+)?)([A-Za-z\s\-]*)$", s_clean)
     if match:
         pfx = match.group(1).strip()
-        num = round(float(match.group(2)), 4)
+        num = round(float(sign + match.group(2)), 4)
         return pfx, num
 
     try:
-        return "", round(float(s_clean), 4)
+        return "", round(float(sign + s_clean), 4)
     except (TypeError, ValueError):
         return s, np.nan
 
@@ -328,7 +348,7 @@ class PeMSClient:
         resp = self.session.get(full_url, stream=stream)
         resp.raise_for_status()
 
-        if self._is_login_page(resp):
+        if not stream and self._is_login_page(resp):
             LOGGER.warning("PeMS session appears expired; re-authenticating...")
             self.login()
             resp = self.session.get(full_url, stream=stream)
@@ -372,7 +392,16 @@ class PeMSClient:
     def file_has_data_table(path_or_content: Any) -> bool:
         """Validate whether a file or string contains an actual PeMS data table rather than an HTML error."""
         try:
-            if os.path.isfile(str(path_or_content)):
+            if isinstance(path_or_content, bytes):
+                if path_or_content.startswith(b"\xd0\xcf\x11\xe0") or path_or_content.startswith(b"PK\x03\x04"):
+                    return True
+                text = path_or_content.decode("utf-8", errors="replace")
+                lines = text.splitlines()[:50]
+            elif os.path.isfile(str(path_or_content)):
+                with open(str(path_or_content), "rb") as bfh:
+                    magic = bfh.read(8)
+                    if magic.startswith(b"\xd0\xcf\x11\xe0") or magic.startswith(b"PK\x03\x04"):
+                        return True
                 with open(str(path_or_content), "r", encoding="utf-8", errors="replace") as fh:
                     lines = [fh.readline() for _ in range(50)]
             else:
@@ -381,6 +410,8 @@ class PeMSClient:
             for line in lines:
                 s = line.strip()
                 if any(s.startswith(m) for m in TABLE_MARKERS) and ("\t" in line or "," in line):
+                    return True
+                if ("<table" in s.lower() or "<tr" in s.lower() or "<th" in s.lower() or "<td" in s.lower()) and any(m.strip() in line for m in TABLE_MARKERS):
                     return True
         except Exception:
             pass
@@ -439,17 +470,19 @@ def build_lane_config_url(
     direction: str,
     start_date: str,
     end_date: str,
-    station_type: str = ""
+    station_type: str = "",
+    export_format: str = "text"
 ) -> str:
     """Construct PeMS Freeway configuration time series URL."""
     route_num = normalize_route(route)
     dir_clean = normalize_direction(direction)
     s_fmt = _format_date_param(start_date)
     e_fmt = _format_date_param(end_date)
+    exp = "xls" if str(export_format).strip().lower() in ("xls", "xlsx") else "text"
 
     return (
         f"{BASE_URL}/?report_form=1&dnode=Freeway&content=elv&tab=config_timeseries"
-        f"&export=text&fwy={route_num}&dir={dir_clean}"
+        f"&export={exp}&fwy={route_num}&dir={dir_clean}"
         f"&s_time_id_f={s_fmt}&e_time_id_f={e_fmt}&q=lanes&gn=day&station_type={station_type}"
     )
 
@@ -457,7 +490,8 @@ def build_lane_config_url(
 def build_station_aadt_url(
     station_id: str,
     start_year: int,
-    end_year: Optional[int] = None
+    end_year: Optional[int] = None,
+    export_format: str = "text"
 ) -> str:
     """Construct PeMS VDS annual AADT export URL."""
     st_id = str(station_id).strip()
@@ -467,21 +501,28 @@ def build_station_aadt_url(
     dec_31 = datetime.datetime(end_year, 12, 31, 23, 59, 59)
     s_time_id = int(calendar.timegm(jan_1.timetuple()))
     e_time_id = int(calendar.timegm(dec_31.timetuple()))
+    exp = "xls" if str(export_format).strip().lower() in ("xls", "xlsx") else "text"
 
     return (
-        f"{BASE_URL}/?report_form=1&dnode=VDS&content=analysis&tab=aadt&export=text"
+        f"{BASE_URL}/?report_form=1&dnode=VDS&content=analysis&tab=aadt&export={exp}"
         f"&station_id={st_id}&s_time_id={s_time_id}&s_time_id_f=01%2F{start_year}"
         f"&e_time_id={e_time_id}&e_time_id_f=12%2F{end_year}"
     )
 
 
-def build_station_flow_url(
+def build_station_timeseries_url(
     station_id: str,
     start_year: int,
     end_year: Optional[int] = None,
-    granularity: str = "month"
+    quantity: str = "flow",
+    granularity: str = "month",
+    export_format: str = "text"
 ) -> str:
-    """Construct PeMS VDS detector time series (Flow) export URL."""
+    """
+    Construct PeMS VDS detector time series export URL for any quantity and granularity.
+    Quantities: 'flow' (Vehicles), 'occ' (Occupancy %), 'speed' (Speed mph), 'vmt' (VMT), 'vht' (VHT), 'delay' (Delay).
+    Granularities: 'month', 'day', 'hour', 'week', 'year', '5min'.
+    """
     st_id = str(station_id).strip()
     end_year = end_year or start_year
 
@@ -492,22 +533,44 @@ def build_station_flow_url(
 
     s_fmt = urllib.parse.quote(f"01/01/{start_year} 00:00")
     e_fmt = urllib.parse.quote(f"12/31/{end_year} 23:59")
+    q_norm = str(quantity).strip().lower()
+    gn_norm = str(granularity).strip().lower()
+    exp = "xls" if str(export_format).strip().lower() in ("xls", "xlsx") else "text"
 
     return (
-        f"{BASE_URL}/?report_form=1&dnode=VDS&content=loops&tab=det_timeseries&export=text"
+        f"{BASE_URL}/?report_form=1&dnode=VDS&content=loops&tab=det_timeseries&export={exp}"
         f"&station_id={st_id}&s_time_id={s_time_id}&s_time_id_f={s_fmt}"
         f"&e_time_id={e_time_id}&e_time_id_f={e_fmt}"
         f"&tod=all&tod_from=0&tod_to=0"
         f"&dow_0=on&dow_1=on&dow_2=on&dow_3=on&dow_4=on&dow_5=on&dow_6=on"
-        f"&holidays=on&q=flow&q2=&gn={granularity}"
+        f"&holidays=on&q={q_norm}&q2=&gn={gn_norm}"
     )
 
 
-def build_fwy_latlng_url(route: str, direction: str) -> str:
+def build_station_flow_url(
+    station_id: str,
+    start_year: int,
+    end_year: Optional[int] = None,
+    granularity: str = "month",
+    export_format: str = "text"
+) -> str:
+    """Construct PeMS VDS detector time series (Flow) export URL."""
+    return build_station_timeseries_url(
+        station_id=station_id,
+        start_year=start_year,
+        end_year=end_year,
+        quantity="flow",
+        granularity=granularity,
+        export_format=export_format
+    )
+
+
+def build_fwy_latlng_url(route: str, direction: str, export_format: str = "text") -> str:
     """Construct PeMS Freeway coordinate geometry URL."""
     route_num = normalize_route(route)
     dir_clean = normalize_direction(direction)
-    return f"{BASE_URL}/?report_form=1&dnode=Freeway&content=fwy_latlngXY&export=text&fwy={route_num}&dir={dir_clean}"
+    exp = "xls" if str(export_format).strip().lower() in ("xls", "xlsx") else "text"
+    return f"{BASE_URL}/?report_form=1&dnode=Freeway&content=fwy_latlngXY&export={exp}&fwy={route_num}&dir={dir_clean}"
 
 
 def build_station_summary_url(station_id: str) -> str:
@@ -520,6 +583,300 @@ def build_clearinghouse_url(district: Any, year: int, file_type: str = "station_
     """Construct PeMS Clearinghouse bulk download URL."""
     dist_clean = str(district).replace(".0", "").strip()
     return f"{BASE_URL}/?srq=clearinghouse&district_id={dist_clean}&yy={year}&type={file_type}&returnformat=text"
+
+
+# ---------------------------------------------------------------------------
+# BATCH DOWNLOAD ENGINE
+# ---------------------------------------------------------------------------
+def download_station_data(
+    station_id: str,
+    data_type: str = "flow",
+    granularity: str = "month",
+    start_year: int = 1999,
+    end_year: Optional[int] = None,
+    output_dir: str = ".",
+    client: Optional[PeMSClient] = None,
+    combine: bool = True,
+    overwrite: bool = False,
+    pause_sec: float = 0.5,
+    verbose: bool = True,
+    export_format: str = "text"
+) -> Dict[str, Any]:
+    """
+    Download detector data from Caltrans PeMS for a specific station across all requested years.
+
+    Downloads year-by-year into output_dir to prevent PeMS server timeouts and silent truncation,
+    validates every response against HTML errors, and optionally consolidates all active years
+    into a single clean master dataset.
+
+    Parameters:
+      station_id: Caltrans PeMS VDS detector ID (e.g. '400001').
+      data_type: 'flow', 'occ', 'speed', 'vmt', 'vht', 'delay', or 'aadt'.
+      granularity: 'month', 'day', 'hour', 'week', 'year', '5min' (for time-series data).
+      start_year: Earliest calendar year to query (default: 1999).
+      end_year: Latest calendar year to query (default: current year).
+      output_dir: Local directory to save files (default: '.' current working directory).
+      client: Optional authenticated PeMSClient instance.
+      combine: If True, creates a unified '<station>_<type>_<granularity>_all_years.csv' master file.
+      overwrite: If True, re-downloads even if valid data is already cached on disk.
+      pause_sec: Polite delay in seconds between HTTP requests (default: 0.5s).
+      verbose: Print real-time progress to stdout.
+      export_format: 'text' (default, tab-delimited text/txt) or 'xls' (PeMS Excel export).
+    """
+    st_id = re.sub(r"[^0-9]", "", str(station_id).strip())
+    if not st_id:
+        raise ValueError(f"Invalid station ID: {station_id}")
+
+    data_type_clean = str(data_type).strip().lower()
+    granularity_clean = str(granularity).strip().lower()
+
+    valid_quantities = {"flow", "occ", "speed", "vmt", "vht", "delay", "aadt"}
+    if data_type_clean not in valid_quantities:
+        raise ValueError(f"Unknown data type '{data_type}'. Allowed: {sorted(valid_quantities)}")
+
+    valid_granularities = {"month", "day", "hour", "week", "year", "5min"}
+    if data_type_clean != "aadt" and granularity_clean not in valid_granularities:
+        raise ValueError(f"Unknown granularity '{granularity}'. Allowed: {sorted(valid_granularities)}")
+
+    fmt_norm = str(export_format).strip().lower()
+    is_xls = fmt_norm in ("xls", "xlsx")
+    ext = "xls" if is_xls else "txt"
+    url_export = "xls" if is_xls else "text"
+
+    curr_year = datetime.datetime.now().year
+    e_year = end_year or curr_year
+    if start_year > e_year:
+        raise ValueError(f"start_year ({start_year}) cannot be greater than end_year ({e_year})")
+
+    pems_client = client or PeMSClient()
+    if not pems_client.logged_in:
+        pems_client.login()
+
+    target_dir = os.path.abspath(output_dir)
+    os.makedirs(target_dir, exist_ok=True)
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("PEMS DETECTOR DATA DOWNLOAD")
+        print(f"Station ID:        {st_id}")
+        print(f"Data Type:         {data_type_clean} ({'Annual AADT' if data_type_clean == 'aadt' else granularity_clean})")
+        print(f"Export Format:     {fmt_norm.upper()}")
+        print(f"Year Span:         {start_year} - {e_year}")
+        print(f"Target Directory:  {target_dir}")
+        print("=" * 70)
+
+    years_downloaded = []
+    years_no_data = []
+    all_dfs: List[pd.DataFrame] = []
+
+    import io
+    for year in range(start_year, e_year + 1):
+        if data_type_clean == "aadt":
+            url = build_station_aadt_url(st_id, year, year, export_format=url_export)
+            fn = f"station_{st_id}_{year}_aadt.{ext}"
+        else:
+            url = build_station_timeseries_url(st_id, year, year, quantity=data_type_clean, granularity=granularity_clean, export_format=url_export)
+            fn = f"station_{st_id}_{year}_{data_type_clean}_{granularity_clean}.{ext}"
+
+        filepath = os.path.join(target_dir, fn)
+        content: Optional[str] = None
+
+        if os.path.exists(filepath) and not overwrite:
+            if pems_client.file_has_data_table(filepath):
+                with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+
+        if content is None:
+            time.sleep(pause_sec)
+            content = pems_client.get_text_content(url)
+            if content is None or not pems_client.file_has_data_table(content):
+                years_no_data.append(year)
+                if verbose:
+                    print(f"  • {year}: No data available")
+                continue
+
+            lines = [l.strip() for l in content.strip().splitlines() if l.strip()]
+            if len(lines) <= 1 and not ("<table" in content.lower()):
+                years_no_data.append(year)
+                if verbose:
+                    print(f"  • {year}: Inactive / 0 records")
+                continue
+
+            with open(filepath, "w", encoding="utf-8") as fh:
+                fh.write(content)
+
+        # Parse into DataFrame for consolidation
+        try:
+            df_year = None
+            if is_xls and ("<table" in content.lower() or "<html" in content.lower()):
+                try:
+                    html_dfs = pd.read_html(io.StringIO(content))
+                    if html_dfs:
+                        df_year = html_dfs[0]
+                except Exception:
+                    pass
+            if df_year is None and is_xls:
+                try:
+                    df_year = pd.read_excel(filepath)
+                except Exception:
+                    pass
+            if df_year is None:
+                sep = "\t" if "\t" in content else ","
+                df_year = pd.read_csv(io.StringIO(content), sep=sep)
+
+            if df_year is not None and not df_year.empty:
+                if "Station_ID" not in df_year.columns and "VDS" not in df_year.columns:
+                    df_year.insert(0, "Station_ID", st_id)
+                all_dfs.append(df_year)
+                years_downloaded.append(year)
+                if verbose:
+                    print(f"  ✓ {year}: {len(df_year):4d} records -> {fn}")
+            else:
+                years_no_data.append(year)
+        except Exception as exc:
+            LOGGER.warning(f"Could not parse data for year {year}: {exc}")
+
+    combined_file = None
+    total_records = 0
+    if combine and all_dfs:
+        merged_df = pd.concat(all_dfs, ignore_index=True)
+        total_records = len(merged_df)
+        if data_type_clean == "aadt":
+            comb_fn = f"station_{st_id}_aadt_all_years.csv"
+        else:
+            comb_fn = f"station_{st_id}_{data_type_clean}_{granularity_clean}_all_years.csv"
+        combined_file = os.path.join(target_dir, comb_fn)
+        merged_df.to_csv(combined_file, index=False)
+        if verbose:
+            print("-" * 70)
+            print(f"✓ Consolidated {total_records} total records across {len(years_downloaded)} active years into:")
+            print(f"  -> {combined_file}")
+            print("=" * 70 + "\n")
+    elif verbose:
+        if not years_downloaded:
+            print("-" * 70)
+            print(f"⚠ No active data found for Station {st_id} in years {start_year} - {e_year}.")
+            print("=" * 70 + "\n")
+        else:
+            print("-" * 70)
+            print(f"✓ Downloaded {len(years_downloaded)} raw annual files to {target_dir}")
+            print("=" * 70 + "\n")
+
+    return {
+        "station_id": st_id,
+        "data_type": data_type_clean,
+        "granularity": granularity_clean,
+        "export_format": fmt_norm,
+        "start_year": start_year,
+        "end_year": e_year,
+        "years_downloaded": years_downloaded,
+        "years_no_data": years_no_data,
+        "total_records": total_records,
+        "combined_file": combined_file,
+        "output_dir": target_dir
+    }
+
+
+def download_project_data(
+    project_id: str,
+    data_type: str = "flow",
+    granularity: str = "month",
+    start_year: int = 1999,
+    end_year: Optional[int] = None,
+    output_dir: str = ".",
+    master_csv_path: Optional[str] = None,
+    combine: bool = True,
+    overwrite: bool = False,
+    pause_sec: float = 0.5,
+    verbose: bool = True,
+    export_format: str = "text"
+) -> Dict[str, Any]:
+    """
+    Locate all detector stations associated with a project in the master CSV
+    and download PeMS data for each detector station into output_dir.
+    """
+    projs = load_master_csv(master_csv_path or DEFAULT_MASTER_CSV)
+    target_pid = str(project_id).strip()
+    matched = [p for p in projs if p.project_id == target_pid]
+    if not matched:
+        raise ValueError(f"Project ID '{target_pid}' not found in master project dataset.")
+
+    st_ids = []
+    seen = set()
+    for p in matched:
+        for sid in p.sensor_stations:
+            clean_id = re.sub(r"[^0-9]", "", str(sid).strip())
+            if clean_id and clean_id not in seen:
+                seen.add(clean_id)
+                st_ids.append(clean_id)
+
+    # If no stations listed in sheet, fall back to active corridor sensors
+    if not st_ids:
+        try:
+            vds = get_indexed_vds_metadata()
+            for p in matched:
+                c_st = vds.find_corridor_stations(
+                    district=p.dist, route=p.route, direction=p.direction,
+                    begin_pm=p.begin_pm, end_pm=p.end_pm,
+                    abs_begin_pm=p.abs_begin_pm, abs_end_pm=p.abs_end_pm,
+                    county=p.county, station_types=("ML", "HV")
+                )
+                for s in c_st:
+                    if s.id not in seen:
+                        seen.add(s.id)
+                        st_ids.append(s.id)
+        except Exception:
+            pass
+
+    if not st_ids:
+        if verbose:
+            print(f"⚠ Project {target_pid} has no detector stations listed or identified in corridor.")
+        return {
+            "project_id": target_pid,
+            "station_results": {},
+            "total_stations": 0,
+            "output_dir": os.path.abspath(output_dir)
+        }
+
+    proj_dir = os.path.join(os.path.abspath(output_dir), f"project_{target_pid}")
+    os.makedirs(proj_dir, exist_ok=True)
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print(f"PEMS PROJECT DETECTOR DOWNLOAD: Project {target_pid}")
+        print(f"Associated Stations ({len(st_ids)}): {', '.join(st_ids)}")
+        print(f"Export Format: {export_format.upper()}")
+        print(f"Target Directory: {proj_dir}")
+        print("=" * 70)
+
+    client = PeMSClient()
+    client.login()
+
+    station_results = {}
+    for sid in st_ids:
+        st_out = os.path.join(proj_dir, sid)
+        res = download_station_data(
+            station_id=sid,
+            data_type=data_type,
+            granularity=granularity,
+            start_year=start_year,
+            end_year=end_year,
+            output_dir=st_out,
+            client=client,
+            combine=combine,
+            overwrite=overwrite,
+            pause_sec=pause_sec,
+            verbose=verbose,
+            export_format=export_format
+        )
+        station_results[sid] = res
+
+    return {
+        "project_id": target_pid,
+        "station_results": station_results,
+        "total_stations": len(st_ids),
+        "output_dir": proj_dir
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -675,8 +1032,8 @@ def pm_to_coordinates(
 def get_corridor_stations(
     route: str,
     direction: str,
-    begin_pm: float,
-    end_pm: float,
+    begin_pm: Any,
+    end_pm: Any,
     is_absolute: bool = True,
     county: Optional[str] = None,
     ref_df: Optional[Any] = None
@@ -697,7 +1054,19 @@ def get_corridor_stations(
     if sub is None or sub.empty:
         return pd.DataFrame()
 
-    min_pm, max_pm = min(float(begin_pm), float(end_pm)), max(float(begin_pm), float(end_pm))
+    def _parse_pm_val(val: Any) -> float:
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            _, num = split_ca_pm(val)
+            return num
+
+    b_val = _parse_pm_val(begin_pm)
+    e_val = _parse_pm_val(end_pm)
+    if np.isnan(b_val) or np.isnan(e_val):
+        return pd.DataFrame()
+
+    min_pm, max_pm = min(b_val, e_val), max(b_val, e_val)
 
     if is_absolute or county is None:
         matched = sub[(sub["_abs_pm"] >= min_pm - 0.05) & (sub["_abs_pm"] <= max_pm + 0.05)]
@@ -718,6 +1087,7 @@ def find_closest_census_stations(
     route: str,
     district: Any,
     ca_pm: float,
+    county: Optional[str] = None,
     top_n: int = 5
 ) -> pd.DataFrame:
     """Find closest Caltrans Census stations to a corridor postmile."""
@@ -726,13 +1096,22 @@ def find_closest_census_stations(
         return pd.DataFrame()
 
     r_num = normalize_route(route)
-    d_clean = str(district).replace(".0", "").strip()
+    dist_str = str(district).replace(".0", "").strip()
+    d_clean = str(int(dist_str)) if dist_str.isdigit() else dist_str
 
     df = cdf.copy()
     fwy_num = df["Fwy"].astype(str).str.replace(r"[^0-9]", "", regex=True)
     dist_num = pd.to_numeric(df["District"], errors="coerce").fillna(0).astype(int).astype(str)
 
-    matched = df[(fwy_num == r_num) & ((dist_num == d_clean) | (dist_num == "0"))].copy()
+    cond = (fwy_num == r_num) & ((dist_num == d_clean) | (dist_num == "0"))
+    if county and "County" in df.columns:
+        c_clean = str(county).strip().lower()
+        c_cond = cond & (df["County"].astype(str).str.strip().str.lower() == c_clean)
+        matched = df[c_cond].copy()
+        if matched.empty:
+            matched = df[cond].copy()
+    else:
+        matched = df[cond].copy()
     if matched.empty:
         return pd.DataFrame()
 
@@ -799,10 +1178,14 @@ def parse_master_row(row: Dict[str, Any], row_index: int = -1) -> ProjectRecord:
     """Convert a dictionary row from the master CSV into a clean ProjectRecord."""
     pid = str(row.get("Project ID", "")).strip()
     dist = str(row.get("Dist", "")).replace(".0", "").strip()
-    county = str(row.get("County", "")).strip()
-    state = str(row.get("State", "CA")).strip()
-    route = str(row.get("Route", "")).strip()
-    direction = str(row.get("Direction", "")).strip().upper()
+    county_raw = str(row.get("County", "")).strip()
+    county = "" if county_raw.lower() in ("nan", "none") else county_raw
+    state_raw = str(row.get("State", "CA")).strip()
+    state = "CA" if state_raw.lower() in ("nan", "none", "") else state_raw
+    route_raw = str(row.get("Route", "")).strip()
+    route = "" if route_raw.lower() in ("nan", "none") else route_raw
+    dir_raw = str(row.get("Direction", "")).strip().upper()
+    direction = "" if dir_raw.lower() in ("nan", "none") else dir_raw
     begin_pm = format_pm(str(row.get("Begin PM", "")).strip())
     end_pm = format_pm(str(row.get("End PM", "")).strip())
 
@@ -812,17 +1195,21 @@ def parse_master_row(row: Dict[str, Any], row_index: int = -1) -> ProjectRecord:
     for k in ("temp_abs_begin", "Absolute Begin PM", "Abs Begin PM"):
         if k in row and pd.notna(row[k]):
             try:
-                abs_beg = round(float(row[k]), 3)
-                break
-            except ValueError:
+                v = float(row[k])
+                if not np.isnan(v):
+                    abs_beg = round(v, 3)
+                    break
+            except (ValueError, TypeError):
                 pass
 
     for k in ("temp_abs_end", "Absolute End PM", "Abs End PM"):
         if k in row and pd.notna(row[k]):
             try:
-                abs_end = round(float(row[k]), 3)
-                break
-            except ValueError:
+                v = float(row[k])
+                if not np.isnan(v):
+                    abs_end = round(v, 3)
+                    break
+            except (ValueError, TypeError):
                 pass
 
     # Coordinates
@@ -850,7 +1237,7 @@ def parse_master_row(row: Dict[str, Any], row_index: int = -1) -> ProjectRecord:
     c_begin = None
     for k in ("Begin Date (formatted YYYY-MM-DD)", "Construction Begin Date"):
         v = str(row.get(k, "")).strip()
-        if v and v.lower() not in ("nan", "none", "") and not v.isdigit():
+        if v and v.lower() not in ("nan", "none", "") and not (v.isdigit() and len(v) > 4):
             c_begin = v
             break
 
@@ -933,7 +1320,12 @@ class ProjectPeMSQueryBuilder:
         start = self.project.start_coords
         end = self.project.end_coords
 
-        is_abs = self.project.abs_begin_pm is not None and self.project.abs_end_pm is not None
+        is_abs = (
+            self.project.abs_begin_pm is not None
+            and not np.isnan(self.project.abs_begin_pm)
+            and self.project.abs_end_pm is not None
+            and not np.isnan(self.project.abs_end_pm)
+        )
         b_pm = self.project.abs_begin_pm if is_abs else self.project.begin_pm
         e_pm = self.project.abs_end_pm if is_abs else self.project.end_pm
 
@@ -951,16 +1343,20 @@ class ProjectPeMSQueryBuilder:
 
     def get_corridor_stations_from_reference(self) -> List[Dict[str, Any]]:
         """Find stations and segments along the project corridor from the reference dataset."""
-        b_pm = self.project.abs_begin_pm
-        e_pm = self.project.abs_end_pm
-        is_abs = True
-
-        if b_pm is None or e_pm is None:
+        is_abs = (
+            self.project.abs_begin_pm is not None
+            and not np.isnan(self.project.abs_begin_pm)
+            and self.project.abs_end_pm is not None
+            and not np.isnan(self.project.abs_end_pm)
+        )
+        if is_abs:
+            b_pm = float(self.project.abs_begin_pm)
+            e_pm = float(self.project.abs_end_pm)
+        else:
             _, b_num = split_ca_pm(self.project.begin_pm)
             _, e_num = split_ca_pm(self.project.end_pm)
             b_pm = b_num
             e_pm = e_num
-            is_abs = False
 
         if b_pm is None or e_pm is None or np.isnan(b_pm) or np.isnan(e_pm):
             return []
@@ -993,6 +1389,8 @@ class ProjectPeMSQueryBuilder:
         """Construct all PeMS URLs relevant to this project."""
         s_yr = start_year or self.project.start_year
         e_yr = end_year or self.project.end_year
+        if s_yr > e_yr:
+            s_yr, e_yr = e_yr, s_yr
 
         start_date_str = f"01/01/{s_yr}"
         end_date_str = f"12/31/{e_yr}"
@@ -1079,6 +1477,7 @@ class IndexedVDSMetadata:
         ca_splits = clean["State_PM"].astype(str).map(split_ca_pm)
         clean["_ca_num"] = ca_splits.map(lambda x: x[1])
         clean["_ca_pfx"] = ca_splits.map(lambda x: x[0].upper())
+        clean["_county"] = clean["County"].astype(str).str.strip().str.lower()
         clean["_lat"] = pd.to_numeric(clean["Latitude"], errors="coerce")
         clean["_lng"] = pd.to_numeric(clean["Longitude"], errors="coerce")
         clean["_lanes"] = pd.to_numeric(clean["Lanes"], errors="coerce")
@@ -1123,7 +1522,8 @@ class IndexedVDSMetadata:
         abs_begin_pm: Optional[float] = None,
         abs_end_pm: Optional[float] = None,
         buffer_mi: float = 0.1,
-        station_types: Tuple[str, ...] = ("ML", "HV")
+        station_types: Tuple[str, ...] = ("ML", "HV"),
+        county: Optional[str] = None
     ) -> List[VDSStationRecord]:
         """
         Locate all active PeMS VDS stations along a freeway corridor within the given postmile range.
@@ -1160,6 +1560,11 @@ class IndexedVDSMetadata:
                 return []
             min_pm = min(b_num, e_num) - buffer_mi
             max_pm = max(b_num, e_num) + buffer_mi
+            if county:
+                county_clean = str(county).strip().lower()
+                c_sub = sub[sub["_county"] == county_clean]
+                if not c_sub.empty:
+                    sub = c_sub
             matched = sub[(sub["_ca_num"] >= min_pm) & (sub["_ca_num"] <= max_pm)].sort_values(by="_ca_num")
 
         results = []
@@ -1184,6 +1589,9 @@ def download_all_district_metadata(
         client.login()
 
     downloaded = {}
+    curr_yr = datetime.datetime.now().year
+    probe_years = tuple(range(curr_yr, 2019, -1))
+
     for d in districts:
         cache_file = os.path.join(target_dir, f"d{int(d):02d}_meta.txt")
         if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
@@ -1191,7 +1599,7 @@ def download_all_district_metadata(
             continue
 
         found = False
-        for y in (2024, 2023, 2022, 2021, 2020):
+        for y in probe_years:
             url = f"{BASE_URL}/?srq=clearinghouse&district_id={d}&yy={y}&type=metadata&returnformat=text"
             try:
                 resp = client.get_url(url)
@@ -1297,7 +1705,8 @@ def compare_project_stations(
         abs_begin_pm=project.abs_begin_pm,
         abs_end_pm=project.abs_end_pm,
         buffer_mi=buffer_mi,
-        station_types=station_types
+        station_types=station_types,
+        county=project.county
     )
     found_ids = [s.id for s in found]
     existing_ids = list(project.sensor_stations)
@@ -1322,13 +1731,23 @@ def compare_project_stations(
                 reasons.append(f"Different Route (station is Route {st.fwy}, project is Route {p_route_norm})")
             if st.dir != p_dir_norm:
                 reasons.append(f"Opposite/Different Direction (station is {st.dir}, project is {p_dir_norm})")
+            if project.county and st.county and st.county.lower() != project.county.lower():
+                reasons.append(f"Different County (station is {st.county}, project is {project.county})")
             if station_types and "ALL" not in [t.upper().strip() for t in station_types]:
                 if st.type not in {t.upper().strip() for t in station_types}:
                     reasons.append(f"Filtered Station Type: {st.type} (filter: {','.join(station_types)})")
 
-            if project.abs_begin_pm is not None and project.abs_end_pm is not None and st.abs_pm is not None:
-                min_abs = min(project.abs_begin_pm, project.abs_end_pm)
-                max_abs = max(project.abs_begin_pm, project.abs_end_pm)
+            use_abs_comp = (
+                project.abs_begin_pm is not None
+                and not np.isnan(project.abs_begin_pm)
+                and project.abs_end_pm is not None
+                and not np.isnan(project.abs_end_pm)
+                and st.abs_pm is not None
+                and not np.isnan(st.abs_pm)
+            )
+            if use_abs_comp:
+                min_abs = min(float(project.abs_begin_pm), float(project.abs_end_pm))
+                max_abs = max(float(project.abs_begin_pm), float(project.abs_end_pm))
                 if st.abs_pm < min_abs:
                     reasons.append(f"Out of range: Abs PM {st.abs_pm:.3f} is {min_abs - st.abs_pm:.2f} mi before corridor start ({min_abs:.3f})")
                 elif st.abs_pm > max_abs:
@@ -1410,7 +1829,10 @@ def apply_station_updates_to_dataframe(
     df: pd.DataFrame,
     comparison_results: List[StationComparisonResult]
 ) -> pd.DataFrame:
-    """Apply identified corridor stations to master dataframe columns."""
+    """
+    Apply identified corridor stations to master dataframe columns.
+    Properly pairs mainline and HOV detectors and cleanly clears unused columns.
+    """
     updated = df.copy()
 
     col_sensor_count = _find_column(updated, "Number of Active Non-Ramp Sensors")
@@ -1433,9 +1855,6 @@ def apply_station_updates_to_dataframe(
     col_dir = _find_column(updated, "Direction")
 
     for res in comparison_results:
-        if not res.found_stations:
-            continue
-
         # Match row by PID and Direction
         mask = (updated[col_pid].astype(str).str.strip() == str(res.project_id).strip())
         if col_dir and res.direction:
@@ -1445,49 +1864,58 @@ def apply_station_updates_to_dataframe(
         if matching_indices.empty:
             continue
 
+        # Partition found stations into Mainline/General (ML, etc.) and HOV (HV)
+        ml_stations = [s for s in res.found_stations if s.type != "HV"]
+        hov_stations = [s for s in res.found_stations if s.type == "HV"]
+        primary_stations = ml_stations if ml_stations else hov_stations
+
         for idx in matching_indices:
             if col_sensor_count:
                 updated.at[idx, col_sensor_count] = str(len(res.found_stations))
 
-            # Station 1 (first found detector)
-            st1 = res.found_stations[0]
-            if col_s1_id:
-                updated.at[idx, col_s1_id] = str(st1.id)
-            if col_s1_type:
-                updated.at[idx, col_s1_type] = str(st1.type)
-            if col_s1_name:
-                updated.at[idx, col_s1_name] = str(st1.name)
-            if col_s1_lanes_after and st1.lanes is not None:
-                updated.at[idx, col_s1_lanes_after] = str(st1.lanes)
+            # Station 1
+            if primary_stations:
+                st1 = primary_stations[0]
+                if col_s1_id: updated.at[idx, col_s1_id] = str(st1.id)
+                if col_s1_type: updated.at[idx, col_s1_type] = str(st1.type)
+                if col_s1_name: updated.at[idx, col_s1_name] = str(st1.name)
+                if col_s1_lanes_after: updated.at[idx, col_s1_lanes_after] = str(st1.lanes) if st1.lanes is not None else ""
+            else:
+                if col_s1_id: updated.at[idx, col_s1_id] = ""
+                if col_s1_type: updated.at[idx, col_s1_type] = ""
+                if col_s1_name: updated.at[idx, col_s1_name] = ""
+                if col_s1_lanes_after: updated.at[idx, col_s1_lanes_after] = ""
 
-            # Station 1 HOV ID (first HV detector if present)
-            hov_stations = [s for s in res.found_stations if s.type == "HV"]
+            # Station 1 HOV ID (first HV detector if present, otherwise clear)
             if col_s1_hov:
                 updated.at[idx, col_s1_hov] = str(hov_stations[0].id) if hov_stations else ""
 
             # Station 2
-            if len(res.found_stations) >= 2:
-                st2 = res.found_stations[1]
-                if col_s2_id:
-                    updated.at[idx, col_s2_id] = str(st2.id)
-                if col_s2_lanes_after and st2.lanes is not None:
-                    updated.at[idx, col_s2_lanes_after] = str(st2.lanes)
+            if len(primary_stations) >= 2:
+                st2 = primary_stations[1]
+                if col_s2_id: updated.at[idx, col_s2_id] = str(st2.id)
+                if col_s2_lanes_after: updated.at[idx, col_s2_lanes_after] = str(st2.lanes) if st2.lanes is not None else ""
+            else:
+                if col_s2_id: updated.at[idx, col_s2_id] = ""
+                if col_s2_lanes_after: updated.at[idx, col_s2_lanes_after] = ""
 
             # Station 3
-            if len(res.found_stations) >= 3:
-                st3 = res.found_stations[2]
-                if col_s3_id:
-                    updated.at[idx, col_s3_id] = str(st3.id)
-                if col_s3_lanes_after and st3.lanes is not None:
-                    updated.at[idx, col_s3_lanes_after] = str(st3.lanes)
+            if len(primary_stations) >= 3:
+                st3 = primary_stations[2]
+                if col_s3_id: updated.at[idx, col_s3_id] = str(st3.id)
+                if col_s3_lanes_after: updated.at[idx, col_s3_lanes_after] = str(st3.lanes) if st3.lanes is not None else ""
+            else:
+                if col_s3_id: updated.at[idx, col_s3_id] = ""
+                if col_s3_lanes_after: updated.at[idx, col_s3_lanes_after] = ""
 
             # Station 4
-            if len(res.found_stations) >= 4:
-                st4 = res.found_stations[3]
-                if col_s4_id:
-                    updated.at[idx, col_s4_id] = str(st4.id)
-                if col_s4_lanes_after and st4.lanes is not None:
-                    updated.at[idx, col_s4_lanes_after] = str(st4.lanes)
+            if len(primary_stations) >= 4:
+                st4 = primary_stations[3]
+                if col_s4_id: updated.at[idx, col_s4_id] = str(st4.id)
+                if col_s4_lanes_after: updated.at[idx, col_s4_lanes_after] = str(st4.lanes) if st4.lanes is not None else ""
+            else:
+                if col_s4_id: updated.at[idx, col_s4_id] = ""
+                if col_s4_lanes_after: updated.at[idx, col_s4_lanes_after] = ""
 
     return updated
 
@@ -1674,7 +2102,17 @@ def run_station_comparison_pipeline(
                 fh.write(f"- **Discrepancies**: {status_counts.get('DISCREPANCY', 0)}\n")
                 fh.write(f"- **Sheet Empty**: {status_counts.get('SHEET_EMPTY', 0)}\n")
                 fh.write(f"- **Uninstrumented**: {status_counts.get('UNINSTRUMENTED', 0)}\n\n")
-                fh.write(df_report.to_markdown(index=False))
+                try:
+                    fh.write(df_report.to_markdown(index=False))
+                except (ImportError, Exception):
+                    cols = df_report.columns.tolist()
+                    header = "| " + " | ".join(cols) + " |\n"
+                    separator = "| " + " | ".join(["---"] * len(cols)) + " |\n"
+                    rows = []
+                    for _, row_vals in df_report.iterrows():
+                        row_str = "| " + " | ".join(str(row_vals[c]).replace("\n", " ").replace("|", "\\|") for c in cols) + " |\n"
+                        rows.append(row_str)
+                    fh.write(header + separator + "".join(rows))
         else:
             df_report.to_csv(output_report_path, index=False)
         print(f"\n✓ Comparison report successfully written to: {output_report_path}")
@@ -1731,16 +2169,20 @@ def get_project_corridor_geometry(
     coords: List[Tuple[float, float]] = []
 
     if sub is not None and not sub.empty:
-        b_pm = project.abs_begin_pm
-        e_pm = project.abs_end_pm
-        is_abs = True
-
-        if b_pm is None or e_pm is None:
+        is_abs = (
+            project.abs_begin_pm is not None
+            and not np.isnan(project.abs_begin_pm)
+            and project.abs_end_pm is not None
+            and not np.isnan(project.abs_end_pm)
+        )
+        if is_abs:
+            b_pm = float(project.abs_begin_pm)
+            e_pm = float(project.abs_end_pm)
+        else:
             _, b_num = split_ca_pm(project.begin_pm)
             _, e_num = split_ca_pm(project.end_pm)
             b_pm = b_num
             e_pm = e_num
-            is_abs = False
 
         if b_pm is not None and e_pm is not None and not np.isnan(b_pm) and not np.isnan(e_pm):
             min_pm, max_pm = min(float(b_pm), float(e_pm)), max(float(b_pm), float(e_pm))
@@ -1770,24 +2212,25 @@ def get_project_corridor_geometry(
 
 def make_project_tooltip_html(project: ProjectRecord, length_mi: float = 0.0) -> str:
     """Generate compact hover tooltip HTML for a road path with bare-bones serif aesthetic."""
-    sensors_str = ", ".join(project.sensor_stations) if project.sensor_stations else "None listed"
-    b_lanes = project.raw_row.get("dir_lanes_before", "?")
-    a_lanes = project.raw_row.get("dir_lanes_after", "?")
+    sensors_str = ", ".join(html.escape(s) for s in project.sensor_stations) if project.sensor_stations else "None listed"
+    b_lanes = html.escape(str(project.raw_row.get("dir_lanes_before", "?")))
+    a_lanes = html.escape(str(project.raw_row.get("dir_lanes_after", "?")))
     b_pm = format_pm(project.begin_pm)
     e_pm = format_pm(project.end_pm)
-    desc = str(project.raw_row.get("Project Description", "")).strip()
-    if len(desc) > 85:
-        desc = desc[:82] + "..."
+    raw_desc = str(project.raw_row.get("Project Description", "")).strip()
+    if len(raw_desc) > 85:
+        raw_desc = raw_desc[:82] + "..."
+    desc = html.escape(raw_desc)
 
     return f"""
     <div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 13px; line-height: 1.4; min-width: 210px; color: #000; background: #fff; padding: 6px 8px; border: 1px solid #000;">
       <div style="font-weight: bold; font-size: 13px; color: #000; margin-bottom: 2px;">
-        PID {project.project_id} &middot; Route {project.route} {project.direction}
+        PID {html.escape(project.project_id)} &middot; Route {html.escape(project.route)} {html.escape(project.direction)}
       </div>
-      <div><b>Dist {project.dist}</b> &middot; {project.county} County</div>
+      <div><b>Dist {html.escape(project.dist)}</b> &middot; {html.escape(project.county)} County</div>
       <div><b>Postmiles:</b> PM {b_pm} &rarr; {e_pm} ({length_mi:.2f} mi)</div>
       <div><b>Directional Lanes:</b> {b_lanes} &rarr; {a_lanes}</div>
-      <div><b>Dates:</b> Const: {project.construction_begin_date or 'N/A'} | Open: {project.open_to_traffic_date or 'N/A'}</div>
+      <div><b>Dates:</b> Const: {html.escape(project.construction_begin_date or 'N/A')} | Open: {html.escape(project.open_to_traffic_date or 'N/A')}</div>
       <div><b>Sensors:</b> {sensors_str}</div>
       {f'<div style="color: #333; font-size: 12px; margin-top: 4px; border-top: 1px solid #666; padding-top: 3px;">{desc}</div>' if desc else ''}
     </div>
@@ -1798,14 +2241,14 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
     """Generate detailed click popup card HTML with bare-bones serif aesthetic and live links."""
     urls = builder.generate_all_urls()
     raw = project.raw_row
-    tot_b = raw.get("Total Lanes Before", raw.get("total_lanes_before", "?"))
-    tot_a = raw.get("Total Lanes After", raw.get("total_lanes_after", "?"))
-    dir_b = raw.get("dir_lanes_before", "?")
-    dir_a = raw.get("dir_lanes_after", "?")
-    added_lm = raw.get("Total Added Lanes (Lane Miles)", raw.get("New GP Lanes (Lane Miles)", "?"))
-    facility = str(raw.get("Facility Class checked by Lu") or raw.get("Facility Class") or raw.get("facility_class") or "Freeway").strip()
-    area_type = str(raw.get("area_type") or raw.get("Area Type") or raw.get('Area Type ("Urban", "Suburban", "Exurban", "Rural", or "Unknown")') or "Unknown").strip().capitalize()
-    desc = str(raw.get("Project Description", "")).strip()
+    tot_b = html.escape(str(raw.get("Total Lanes Before", raw.get("total_lanes_before", "?"))))
+    tot_a = html.escape(str(raw.get("Total Lanes After", raw.get("total_lanes_after", "?"))))
+    dir_b = html.escape(str(raw.get("dir_lanes_before", "?")))
+    dir_a = html.escape(str(raw.get("dir_lanes_after", "?")))
+    added_lm = html.escape(str(raw.get("Total Added Lanes (Lane Miles)", raw.get("New GP Lanes (Lane Miles)", "?"))))
+    facility = html.escape(str(raw.get("Facility Class checked by Lu") or raw.get("Facility Class") or raw.get("facility_class") or "Freeway").strip())
+    area_type = html.escape(str(raw.get("area_type") or raw.get("Area Type") or raw.get('Area Type ("Urban", "Suburban", "Exurban", "Rural", or "Unknown")') or "Unknown").strip().capitalize())
+    desc = html.escape(str(raw.get("Project Description", "")).strip())
 
     b_pm = format_pm(project.begin_pm)
     e_pm = format_pm(project.end_pm)
@@ -1815,15 +2258,15 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
     sensor_links = []
     for s_id in project.sensor_stations:
         s_url = urls["station_summary_urls"].get(s_id, f"https://pems.dot.ca.gov/?dnode=VDS&station_id={s_id}")
-        sensor_links.append(f'<a href="{s_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">{s_id}</a>')
+        sensor_links.append(f'<a href="{s_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">{html.escape(s_id)}</a>')
     sensor_html = ", ".join(sensor_links) if sensor_links else "None listed"
 
     return f"""
     <div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 13px; line-height: 1.45; width: 330px; padding: 6px; color: #000; background: #fff;">
       <div style="border-bottom: 1px solid #000; padding-bottom: 4px; margin-bottom: 6px;">
-        <div style="font-size: 12px; font-weight: bold; text-transform: uppercase;">District {project.dist} &middot; {facility}</div>
-        <h3 style="margin: 4px 0 2px; font-size: 15px; font-weight: bold; color: #000;">PID {project.project_id} &middot; Route {project.route} {project.direction}</h3>
-        <div style="font-size: 12px; color: #333;">{project.county} County &middot; Area: {area_type}</div>
+        <div style="font-size: 12px; font-weight: bold; text-transform: uppercase;">District {html.escape(project.dist)} &middot; {facility}</div>
+        <h3 style="margin: 4px 0 2px; font-size: 15px; font-weight: bold; color: #000;">PID {html.escape(project.project_id)} &middot; Route {html.escape(project.route)} {html.escape(project.direction)}</h3>
+        <div style="font-size: 12px; color: #333;">{html.escape(project.county)} County &middot; Area: {area_type}</div>
       </div>
 
       <table style="width: 100%; font-size: 12px; margin-bottom: 8px; border-collapse: collapse; border: 1px solid #666;">
@@ -1832,8 +2275,8 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
         <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Directional Lanes:</td><td style="padding: 2px 4px; font-weight: bold;">{dir_b} &rarr; {dir_a}</td></tr>
         <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Total Roadway Lanes:</td><td style="padding: 2px 4px;">{tot_b} &rarr; {tot_a}</td></tr>
         <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Lane Miles Added:</td><td style="padding: 2px 4px;">{added_lm}</td></tr>
-        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Construction Date:</td><td style="padding: 2px 4px;">{project.construction_begin_date or 'N/A'}</td></tr>
-        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Open to Traffic:</td><td style="padding: 2px 4px;">{project.open_to_traffic_date or 'N/A'}</td></tr>
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Construction Date:</td><td style="padding: 2px 4px;">{html.escape(project.construction_begin_date or 'N/A')}</td></tr>
+        <tr style="border-bottom: 1px solid #ccc;"><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Open to Traffic:</td><td style="padding: 2px 4px;">{html.escape(project.open_to_traffic_date or 'N/A')}</td></tr>
         <tr><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Sensors:</td><td style="padding: 2px 4px;">{sensor_html}</td></tr>
       </table>
 
@@ -1879,9 +2322,12 @@ def classify_station_relative_to_project(
 ) -> Tuple[bool, str, Optional[float]]:
     """
     Determine if a station falls within project corridor bounds.
+    Direction-aware: accurately accounts for traffic flow direction on Southbound and Westbound routes.
     Returns:
         (is_in_bounds, bounds_note, delta_mi)
     """
+    is_descending = project.pems_direction in ("S", "W")
+
     # 1. Use absolute postmiles if both project and station have them
     use_abs = (
         project.abs_begin_pm is not None
@@ -1902,10 +2348,12 @@ def classify_station_relative_to_project(
             return True, f"Boundary tolerance (±{tolerance_mi:.2f} mi)", 0.0
         elif st_p < min_p:
             delta = min_p - st_p
-            return False, f"{delta:.2f} mi upstream / before start", delta
+            pos_label = "downstream / after end" if is_descending else "upstream / before start"
+            return False, f"{delta:.2f} mi {pos_label}", delta
         else:
             delta = st_p - max_p
-            return False, f"{delta:.2f} mi downstream / after end", delta
+            pos_label = "upstream / before start" if is_descending else "downstream / after end"
+            return False, f"{delta:.2f} mi {pos_label}", delta
 
     # 2. Fall back to state postmiles
     _, b_num = split_ca_pm(project.begin_pm)
@@ -1921,10 +2369,12 @@ def classify_station_relative_to_project(
             return True, f"Boundary tolerance (±{tolerance_mi:.2f} mi)", 0.0
         elif st_num < min_p:
             delta = min_p - st_num
-            return False, f"{delta:.2f} mi upstream / before start", delta
+            pos_label = "downstream / after end" if is_descending else "upstream / before start"
+            return False, f"{delta:.2f} mi {pos_label}", delta
         else:
             delta = st_num - max_p
-            return False, f"{delta:.2f} mi downstream / after end", delta
+            pos_label = "upstream / before start" if is_descending else "downstream / after end"
+            return False, f"{delta:.2f} mi {pos_label}", delta
 
     return False, "Unable to determine postmile bounds", None
 
@@ -2331,7 +2781,8 @@ def build_single_project_map(
                     abs_begin_pm=p.abs_begin_pm,
                     abs_end_pm=p.abs_end_pm,
                     buffer_mi=station_buffer_mi,
-                    station_types=station_types or ("ALL",)
+                    station_types=station_types or ("ALL",),
+                    county=p.county
                 )
                 for s in st_list:
                     if s.id not in seen_ids:
@@ -2398,7 +2849,7 @@ def build_single_project_map(
                     if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
                         _, st_num = st.ca_pm_prefix_and_num
                         if not np.isnan(st_num):
-                            coords = pm_to_coordinates(st.fwy, st.dir, st_num, ref_df=idx_ref)
+                            coords = pm_to_coordinates(st.fwy, st.dir, st_num, county=st.county, ref_df=idx_ref)
                             if coords:
                                 lat, lng = coords
                     if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
@@ -2605,7 +3056,8 @@ def build_multi_project_map(
                     abs_begin_pm=p.abs_begin_pm,
                     abs_end_pm=p.abs_end_pm,
                     buffer_mi=station_buffer_mi,
-                    station_types=station_types or ("ALL",)
+                    station_types=station_types or ("ALL",),
+                    county=p.county
                 )
                 for s in st_list:
                     if s.id not in seen_sids:
@@ -2655,7 +3107,7 @@ def build_multi_project_map(
                     if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
                         _, st_num = st.ca_pm_prefix_and_num
                         if not np.isnan(st_num):
-                            coords = pm_to_coordinates(st.fwy, st.dir, st_num, ref_df=idx_ref)
+                            coords = pm_to_coordinates(st.fwy, st.dir, st_num, county=st.county, ref_df=idx_ref)
                             if coords:
                                 lat, lng = coords
                     if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
@@ -2755,6 +3207,16 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Apply updates to master CSV (disables dry-run; creates automated backup).")
     parser.add_argument("--output-report", help="Save comparison report to CSV or Markdown file.")
     parser.add_argument("--output-csv", help="Custom output path for updated master CSV when using --apply.")
+    parser.add_argument("--download-station", "-s", metavar="STATION_ID", help="Download detector data from PeMS for a specific station ID across all available years into the working directory.")
+    parser.add_argument("--download-project", metavar="PID", help="Download detector data from PeMS for all stations associated with a project ID.")
+    parser.add_argument("--data-type", default="flow", choices=["flow", "occ", "speed", "vmt", "vht", "delay", "aadt"], help="Data quantity to download from PeMS (default: 'flow').")
+    parser.add_argument("--granularity", default="month", choices=["month", "day", "hour", "week", "year", "5min"], help="Time granularity for detector time-series data (default: 'month').")
+    parser.add_argument("--export-format", "--format", "-f", dest="export_format", default="text", choices=["text", "xls", "xlsx"], help="Export format for downloaded PeMS files: 'text' (default) or 'xls'/'xlsx' (queries PeMS with native export=xls).")
+    parser.add_argument("--start-year", type=int, default=1999, help="Earliest year to query (default: 1999).")
+    parser.add_argument("--end-year", type=int, default=None, help="Latest year to query (default: current calendar year).")
+    parser.add_argument("--output-dir", default=".", help="Directory to save downloaded files (default: current working directory '.').")
+    parser.add_argument("--no-combine", action="store_true", help="Do not create a consolidated master CSV file across all years.")
+    parser.add_argument("--overwrite", action="store_true", help="Re-download and overwrite existing files even if already on disk.")
     parser.add_argument("--station-types", default="ML,HV", help="Comma-separated station types to include for matching (default: 'ML,HV'). Use 'ALL' for all types.")
     parser.add_argument("--buffer", type=float, default=0.1, help="Postmile buffer tolerance in miles (default: 0.1).")
     parser.add_argument("--metadata-dir", help="Custom directory containing PeMS metadata text files.")
@@ -2775,6 +3237,37 @@ def main():
         except Exception as exc:
             print(f"✗ Login failed: {exc}")
             sys.exit(1)
+        return
+
+    if args.download_station:
+        download_station_data(
+            station_id=args.download_station,
+            data_type=args.data_type,
+            granularity=args.granularity,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            output_dir=args.output_dir,
+            combine=not args.no_combine,
+            overwrite=args.overwrite,
+            verbose=True,
+            export_format=args.export_format
+        )
+        return
+
+    if args.download_project:
+        download_project_data(
+            project_id=args.download_project,
+            data_type=args.data_type,
+            granularity=args.granularity,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            output_dir=args.output_dir,
+            master_csv_path=args.input if os.path.exists(args.input) else None,
+            combine=not args.no_combine,
+            overwrite=args.overwrite,
+            verbose=True,
+            export_format=args.export_format
+        )
         return
 
     if args.route and args.dir and args.begin_pm is not None and args.end_pm is not None:

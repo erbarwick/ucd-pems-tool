@@ -147,6 +147,34 @@ class TestURLBuilders(unittest.TestCase):
         self.assertEqual(qs.get("fwy"), ["80"])
         self.assertEqual(qs.get("dir"), ["E"])
         self.assertEqual(qs.get("content"), ["fwy_latlngXY"])
+        self.assertEqual(qs.get("export"), ["text"])
+
+    def test_build_urls_with_xls_export_format(self):
+        """Proof: setting export_format='xls' or 'xlsx' generates export=xls query parameter."""
+        # Timeseries / Flow
+        url_flow = pems_interface.build_station_flow_url("400001", 2022, export_format="xls")
+        qs_flow = urllib.parse.parse_qs(urllib.parse.urlparse(url_flow).query)
+        self.assertEqual(qs_flow.get("export"), ["xls"])
+
+        url_flow_xlsx = pems_interface.build_station_flow_url("400001", 2022, export_format="xlsx")
+        qs_flow_xlsx = urllib.parse.parse_qs(urllib.parse.urlparse(url_flow_xlsx).query)
+        self.assertEqual(qs_flow_xlsx.get("export"), ["xls"])
+
+        # AADT
+        url_aadt = pems_interface.build_station_aadt_url("400001", 2022, export_format="xls")
+        qs_aadt = urllib.parse.parse_qs(urllib.parse.urlparse(url_aadt).query)
+        self.assertEqual(qs_aadt.get("export"), ["xls"])
+
+        # Lane config
+        url_lane = pems_interface.build_lane_config_url("80", "E", "2020-01-01", "2020-12-31", export_format="xls")
+        qs_lane = urllib.parse.parse_qs(urllib.parse.urlparse(url_lane).query)
+        self.assertEqual(qs_lane.get("export"), ["xls"])
+
+        # Freeway geometry
+        url_fwy = pems_interface.build_fwy_latlng_url("80", "EB", export_format="xls")
+        qs_fwy = urllib.parse.parse_qs(urllib.parse.urlparse(url_fwy).query)
+        self.assertEqual(qs_fwy.get("export"), ["xls"])
+
 
 
 class TestDataValidationAndParsing(unittest.TestCase):
@@ -159,6 +187,16 @@ class TestDataValidationAndParsing(unittest.TestCase):
     def test_file_has_data_table_negative_html_error(self):
         html_error = "<html><head><title>500 Internal Server Error</title></head><body>Error</body></html>"
         self.assertFalse(pems_interface.PeMSClient.file_has_data_table(html_error))
+
+    def test_file_has_data_table_html_excel_table(self):
+        html_table = "<table><tr><th>Month</th><th>Flow</th></tr><tr><td>01/2022</td><td>5000</td></tr></table>"
+        self.assertTrue(pems_interface.PeMSClient.file_has_data_table(html_table))
+
+    def test_file_has_data_table_binary_excel_magic(self):
+        biff8_magic = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 20
+        self.assertTrue(pems_interface.PeMSClient.file_has_data_table(biff8_magic))
+        zip_magic = b"PK\x03\x04\x14\x00\x06\x00" + b"\x00" * 20
+        self.assertTrue(pems_interface.PeMSClient.file_has_data_table(zip_magic))
 
     def test_parse_table_content_skips_preamble(self):
         content_with_preamble = (
@@ -900,7 +938,8 @@ class TestVDSStationMatcherAndComparison(unittest.TestCase):
             self.assertEqual(df_updated.at[0, "Sensor Station 1 Type"], "ML")
             self.assertEqual(df_updated.at[0, "Sensor Station 1 Name"], "Colfax East ML")
             self.assertEqual(df_updated.at[0, "Sensor Station 1 HOV ID"], "301003")
-            self.assertEqual(df_updated.at[0, "Sensor Station 2 ID "], "301003")
+            # Station 2 ID should NOT be populated with the HOV station (proper ML/HOV separation)
+            self.assertTrue(pd.isna(df_updated.at[0, "Sensor Station 2 ID "]) or df_updated.at[0, "Sensor Station 2 ID "] == "")
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -908,6 +947,339 @@ class TestVDSStationMatcherAndComparison(unittest.TestCase):
                 os.remove(b)
 
 
+class TestRefactoringAndIntegrityFixes(unittest.TestCase):
+    """Specific unit tests verifying the data integrity and architectural refactorings."""
+
+    def test_county_isolation_in_vds_matching(self):
+        """Proof: Passing county isolates stations when State Postmiles reset across county lines."""
+        meta_df = pd.DataFrame([
+            {
+                "ID": "400101",
+                "Fwy": "101",
+                "Dir": "N",
+                "District": "4",
+                "County": "San Mateo",
+                "City": "San Mateo",
+                "State_PM": "10.0",
+                "Abs_PM": None,
+                "Latitude": "37.56",
+                "Longitude": "-122.32",
+                "Length": "1.0",
+                "Type": "ML",
+                "Lanes": "4",
+                "Name": "US-101 SM 10.0"
+            },
+            {
+                "ID": "400102",
+                "Fwy": "101",
+                "Dir": "N",
+                "District": "4",
+                "County": "Santa Clara",
+                "City": "San Jose",
+                "State_PM": "10.0",
+                "Abs_PM": None,
+                "Latitude": "37.33",
+                "Longitude": "-121.88",
+                "Length": "1.0",
+                "Type": "ML",
+                "Lanes": "4",
+                "Name": "US-101 SCL 10.0"
+            }
+        ])
+        vds_meta = pems_interface.IndexedVDSMetadata(meta_df)
+
+        # Match with county="San Mateo"
+        found_sm = vds_meta.find_corridor_stations(
+            district="4",
+            route="101",
+            direction="N",
+            begin_pm="9.0",
+            end_pm="11.0",
+            abs_begin_pm=None,
+            abs_end_pm=None,
+            county="San Mateo"
+        )
+        self.assertEqual([s.id for s in found_sm], ["400101"])
+
+        # Match with county="Santa Clara"
+        found_scl = vds_meta.find_corridor_stations(
+            district="4",
+            route="101",
+            direction="N",
+            begin_pm="9.0",
+            end_pm="11.0",
+            abs_begin_pm=None,
+            abs_end_pm=None,
+            county="Santa Clara"
+        )
+        self.assertEqual([s.id for s in found_scl], ["400102"])
+
+    def test_normalize_route_float_values(self):
+        """Proof: Float string routes like '5.0' are normalized to '5' without losing digits."""
+        self.assertEqual(pems_interface.normalize_route("5.0"), "5")
+        self.assertEqual(pems_interface.normalize_route("80.00"), "80")
+        self.assertEqual(pems_interface.normalize_route("SR-101"), "101")
+
+    def test_format_pm_prefixes_and_negatives(self):
+        """Proof: format_pm strips county/route prefixes while preserving letters and negatives."""
+        self.assertEqual(pems_interface.format_pm("04-ALA-80 R11.4"), "R11.4")
+        self.assertEqual(pems_interface.format_pm("ALA 11.4"), "11.4")
+        self.assertEqual(pems_interface.format_pm("-0.500"), "-0.5")
+        self.assertEqual(pems_interface.format_pm("nan"), "")
+        self.assertEqual(pems_interface.format_pm(None), "")
+
+    def test_get_corridor_stations_with_string_prefixed_pms(self):
+        """Proof: get_corridor_stations parses string-prefixed postmiles without raising ValueError."""
+        raw_df = pd.DataFrame([
+            {
+                "Route": "80",
+                "Direction": "E",
+                "Abs PM": "10.0",
+                "CA PM": "R5.0",
+                "County": "Solano",
+                "Latitude": "38.25",
+                "Longitude": "-122.05"
+            }
+        ])
+        idx_ref = pems_interface.IndexedGeoReference(raw_df)
+        res = pems_interface.get_corridor_stations(
+            route="80",
+            direction="E",
+            begin_pm="R4.0",
+            end_pm="R6.0",
+            is_absolute=False,
+            county="Solano",
+            ref_df=idx_ref
+        )
+        self.assertEqual(len(res), 1)
+
+    def test_apply_station_updates_clears_stale_when_zero_stations(self):
+        """Proof: When a project corridor has 0 detectors, existing stale sensors are cleared."""
+        df = pd.DataFrame([
+            {
+                "Project ID": "P999",
+                "Direction": "NB",
+                "Number of Active Non-Ramp Sensors": "2",
+                "Sensor Station 1 ID ": "OLD_1",
+                "Sensor Station 1 HOV ID": "OLD_HOV",
+                "Sensor Station 1 Name": "Old Station",
+                "Sensor Station 1 Type": "ML",
+                "Sensor Station 1: number of lanes after": "3",
+                "Sensor Station 2 ID ": "OLD_2",
+                "Sensor Station 2: number of lanes after": "3"
+            }
+        ])
+        proj = pems_interface.ProjectRecord(
+            project_id="P999", dist="4", county="Marin", state="CA", route="101", direction="NB",
+            begin_pm="1.0", end_pm="2.0", abs_begin_pm=10.0, abs_end_pm=11.0, sensor_stations=["OLD_1", "OLD_2"]
+        )
+        comp = pems_interface.StationComparisonResult(
+            project_id="P999",
+            route="101",
+            direction="NB",
+            district="4",
+            county="Marin",
+            begin_pm="1.0",
+            end_pm="2.0",
+            abs_begin_pm=10.0,
+            abs_end_pm=11.0,
+            existing_stations=["OLD_1", "OLD_2"],
+            found_stations=[],
+            matched_stations=[],
+            missing_in_sheet=[],
+            discrepancies=[],
+            status="UNINSTRUMENTED",
+            sheet_sensor_count=2,
+            found_sensor_count=0
+        )
+        updated = pems_interface.apply_station_updates_to_dataframe(df, [comp])
+        self.assertEqual(updated.at[0, "Number of Active Non-Ramp Sensors"], "0")
+        self.assertEqual(updated.at[0, "Sensor Station 1 ID "], "")
+        self.assertEqual(updated.at[0, "Sensor Station 1 HOV ID"], "")
+        self.assertEqual(updated.at[0, "Sensor Station 2 ID "], "")
+
+    def test_markdown_export_without_tabulate(self):
+        """Proof: Markdown report export succeeds even when the tabulate library is not installed."""
+        proj = pems_interface.ProjectRecord(
+            project_id="P_MD", dist="3", county="Placer", state="CA", route="80", direction="EB",
+            begin_pm="35.0", end_pm="39.0", abs_begin_pm=136.0, abs_end_pm=139.0, sensor_stations=[]
+        )
+        comp = pems_interface.StationComparisonResult(
+            project_id="P_MD",
+            route="80",
+            direction="EB",
+            district="3",
+            county="Placer",
+            begin_pm="35.0",
+            end_pm="39.0",
+            abs_begin_pm=136.0,
+            abs_end_pm=139.0,
+            existing_stations=[],
+            found_stations=[],
+            matched_stations=[],
+            missing_in_sheet=[],
+            discrepancies=[],
+            status="SHEET_EMPTY",
+            sheet_sensor_count=0,
+            found_sensor_count=0
+        )
+        import tempfile
+        with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False) as tf:
+            md_path = tf.name
+
+        try:
+            with patch.dict("sys.modules", {"tabulate": None}):
+                pems_interface.run_station_comparison_pipeline(
+                    projects=[proj],
+                    output_report_path=md_path,
+                    dry_run=True,
+                    verbose=False
+                )
+            self.assertTrue(os.path.exists(md_path))
+            with open(md_path, "r") as f:
+                content = f.read()
+            self.assertIn("# Caltrans PeMS Station Comparison Report", content)
+            self.assertIn("P_MD", content)
+        finally:
+            if os.path.exists(md_path):
+                os.remove(md_path)
+
+
+class TestBatchDownloadEngine(unittest.TestCase):
+    """Tests proving the PeMS detector batch download functionality."""
+
+    def test_build_station_timeseries_url_quantities_and_granularities(self):
+        """Proof: build_station_timeseries_url correctly encodes quantity and granularity."""
+        url = pems_interface.build_station_timeseries_url("400001", 2022, 2023, quantity="speed", granularity="hour")
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        self.assertEqual(qs.get("station_id"), ["400001"])
+        self.assertEqual(qs.get("q"), ["speed"])
+        self.assertEqual(qs.get("gn"), ["hour"])
+        self.assertEqual(qs.get("content"), ["loops"])
+        self.assertEqual(qs.get("tab"), ["det_timeseries"])
+
+    def test_download_station_data_validates_inputs(self):
+        """Proof: download_station_data raises ValueError on invalid inputs."""
+        with self.assertRaises(ValueError):
+            pems_interface.download_station_data("", data_type="flow")
+        with self.assertRaises(ValueError):
+            pems_interface.download_station_data("400001", data_type="invalid_type")
+        with self.assertRaises(ValueError):
+            pems_interface.download_station_data("400001", data_type="flow", granularity="invalid_gran")
+        with self.assertRaises(ValueError):
+            pems_interface.download_station_data("400001", start_year=2025, end_year=2020)
+
+    def test_download_station_data_skips_empty_years_and_consolidates(self):
+        """Proof: download_station_data downloads active years and combines them into one master file."""
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp(prefix="pems_test_dl_")
+
+        # Mock PeMSClient
+        mock_client = MagicMock()
+        mock_client.logged_in = True
+        mock_client.file_has_data_table.side_effect = lambda c: bool(c and "Month" in str(c))
+
+        # Year 2021: No data (header only)
+        # Year 2022: 2 records
+        # Year 2023: 2 records
+        def mock_get_content(url):
+            if "2021" in url:
+                return "Month\tFlow (Veh/Month)\t# Lane Points\t% Observed\n"
+            elif "2022" in url:
+                return "Month\tFlow (Veh/Month)\t# Lane Points\t% Observed\n01/01/2022\t1000\t1440\t95.0\n02/01/2022\t1100\t1440\t96.0\n"
+            elif "2023" in url:
+                return "Month\tFlow (Veh/Month)\t# Lane Points\t% Observed\n01/01/2023\t1200\t1440\t97.0\n02/01/2023\t1300\t1440\t98.0\n"
+            return None
+
+        mock_client.get_text_content.side_effect = mock_get_content
+
+        try:
+            res = pems_interface.download_station_data(
+                station_id="400001",
+                data_type="flow",
+                granularity="month",
+                start_year=2021,
+                end_year=2023,
+                output_dir=temp_dir,
+                client=mock_client,
+                combine=True,
+                pause_sec=0.0,
+                verbose=False
+            )
+
+            self.assertEqual(res["station_id"], "400001")
+            self.assertEqual(res["years_downloaded"], [2022, 2023])
+            self.assertEqual(res["years_no_data"], [2021])
+            self.assertEqual(res["total_records"], 4)
+
+            # Check raw year files exist
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, "station_400001_2022_flow_month.txt")))
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, "station_400001_2023_flow_month.txt")))
+            self.assertFalse(os.path.exists(os.path.join(temp_dir, "station_400001_2021_flow_month.txt")))
+
+            # Check consolidated CSV exists and has 4 rows + header
+            comb_file = res["combined_file"]
+            self.assertIsNotNone(comb_file)
+            self.assertTrue(os.path.exists(comb_file))
+            df_comb = pd.read_csv(comb_file)
+            self.assertEqual(len(df_comb), 4)
+            self.assertIn("Station_ID", df_comb.columns)
+            self.assertIn("Month", df_comb.columns)
+        finally:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+    def test_download_station_data_with_xls_export_format(self):
+        """Proof: download_station_data with export_format='xls' queries export=xls and saves .xls files."""
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp(prefix="pems_test_dl_xls_")
+
+        mock_client = MagicMock()
+        mock_client.logged_in = True
+        mock_client.file_has_data_table.side_effect = lambda c: bool(c and "Month" in str(c))
+
+        called_urls = []
+
+        def mock_get_content(url):
+            called_urls.append(url)
+            return "Month\tFlow (Veh/Month)\t# Lane Points\t% Observed\n01/01/2022\t1000\t1440\t95.0\n"
+
+        mock_client.get_text_content.side_effect = mock_get_content
+
+        try:
+            res = pems_interface.download_station_data(
+                station_id="400001",
+                data_type="flow",
+                granularity="month",
+                start_year=2022,
+                end_year=2022,
+                output_dir=temp_dir,
+                client=mock_client,
+                combine=True,
+                pause_sec=0.0,
+                verbose=False,
+                export_format="xls"
+            )
+
+            self.assertEqual(res["export_format"], "xls")
+            self.assertEqual(res["years_downloaded"], [2022])
+            self.assertTrue(any("export=xls" in u for u in called_urls))
+
+            raw_file = os.path.join(temp_dir, "station_400001_2022_flow_month.xls")
+            self.assertTrue(os.path.exists(raw_file), f"Expected {raw_file} to exist")
+        finally:
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
 

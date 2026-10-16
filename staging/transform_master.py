@@ -5,7 +5,7 @@ import datetime
 import pandas as pd
 import numpy as np
 
-WORKSPACE_PATH = "/Users/erb/VAULT_PHONE/Research/CERCET/California/python/ag.workspace"
+WORKSPACE_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_CSV = os.path.join(WORKSPACE_PATH, "staging/master_sheet3_raw.csv")
 CLEAN_CSV = os.path.join(WORKSPACE_PATH, "staging/Master_CA_Project_List_Cleaned.csv")
 CLEAN_XLSX = os.path.join(WORKSPACE_PATH, "staging/Master_CA_Project_List_Cleaned.xlsx")
@@ -225,15 +225,20 @@ def clean_dataset():
         hov_a = parse_num(r.get('Number of HOV Lanes After Expansion', '0'))
         hot_a = parse_num(r.get('Number of HOT Lanes After Expansion', '0'))
         oth_a = parse_num(r.get('Number of other lane after (specific)', '0'))
+        # Reconcile project-specific lane entry anomalies
+        if pid == '414000032':
+            # Project description explicitly states 6 lanes total (3 in each direction, 0 HOV).
+            # The raw '1(for 2 miles)' in WB was a qualitative study note, not an operational HOV lane.
+            hov_a = 0.0
+            r['Number of HOV Lanes After Expansion'] = '0'
+
         dir_a = int(round(gp_a + hov_a + hot_a + oth_a))
-        
+
         if dir_b > 0:
             r['dir_lanes_before'] = str(dir_b)
-            r['total_lanes_before'] = str(dir_b * 2)
             
         if dir_a > 0:
             r['dir_lanes_after'] = str(dir_a)
-            r['total_lanes_after'] = str(dir_a * 2)
         elif dir_b > 0:
             # Derive after lanes if lane additions are present
             added_lanes = parse_num(r.get('Total Added Lanes (Lane Miles)', '0'))
@@ -241,7 +246,6 @@ def clean_dataset():
                 # Typically 1 lane added per direction
                 derived_a = dir_b + 1
                 r['dir_lanes_after'] = str(derived_a)
-                r['total_lanes_after'] = str(derived_a * 2)
 
         # Clean PM prefixes & float precision
         def clean_pm_str(val):
@@ -323,10 +327,40 @@ def clean_dataset():
             ge_text = str(r.get('Lane expansion shown in Google Earth?', '')).lower()
             ge = '1' if 'yes' in ge_text else ('0' if 'no' in ge_text else '')
         r['expansion_shown_google_earth'] = ge
-        
         final_rows.append(r)
         
     clean_df = pd.DataFrame(final_rows)
+
+    # --- RECONCILE TOTAL ROADWAY LANES ---
+    # Sum paired directions (e.g. NB + SB), or double single-direction divided corridors
+    grouped = clean_df.groupby('Project ID')
+    for pid, grp in grouped:
+        indices = grp.index.tolist()
+        if len(indices) == 2:
+            idx1, idx2 = indices[0], indices[1]
+            b1 = parse_num(clean_df.at[idx1, 'dir_lanes_before'])
+            b2 = parse_num(clean_df.at[idx2, 'dir_lanes_before'])
+            tot_b = b1 + b2
+
+            a1 = parse_num(clean_df.at[idx1, 'dir_lanes_after'])
+            a2 = parse_num(clean_df.at[idx2, 'dir_lanes_after'])
+            tot_a = a1 + a2
+
+            if tot_b > 0:
+                clean_df.at[idx1, 'total_lanes_before'] = str(int(tot_b))
+                clean_df.at[idx2, 'total_lanes_before'] = str(int(tot_b))
+            if tot_a > 0:
+                clean_df.at[idx1, 'total_lanes_after'] = str(int(tot_a))
+                clean_df.at[idx2, 'total_lanes_after'] = str(int(tot_a))
+        elif len(indices) == 1:
+            idx = indices[0]
+            b = parse_num(clean_df.at[idx, 'dir_lanes_before'])
+            a = parse_num(clean_df.at[idx, 'dir_lanes_after'])
+            if b > 0:
+                clean_df.at[idx, 'total_lanes_before'] = str(int(b * 2))
+            if a > 0:
+                clean_df.at[idx, 'total_lanes_after'] = str(int(a * 2))
+
     clean_df.to_csv(CLEAN_CSV, index=False)
     print(f"Saved cleaned CSV to {CLEAN_CSV} with {len(clean_df)} rows and {len(clean_df.columns)} columns")
     

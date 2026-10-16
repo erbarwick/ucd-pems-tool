@@ -1,77 +1,208 @@
 """
-Flask front-end for main.py — the PeMS postmile verification tool.
+Flask front-end for PeMS postmile verification and Caltrans project mapping.
 
-This module sits ON TOP of main.py and does not modify it. It imports main and
-re-uses its functions and module-level config.
+Directly integrated with pems_interface.py. Self-contained, robust, and free of
+external proprietary routing API dependencies.
 """
 
 import functools
+import html
 import io
+import logging
 import os
 import sys
 import traceback
+import urllib.parse
+from typing import Any, Dict, List, Optional, Tuple
 
-# --- make `import main` work no matter where this is launched from -----------
+import folium
+import numpy as np
+import pandas as pd
+from flask import Flask, Response, jsonify, render_template_string, request
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 os.chdir(_HERE)
 
-import folium  # noqa: E402
-import pandas as pd  # noqa: E402
-from flask import Flask, Response, jsonify, render_template_string, request  # noqa: E402
+import pems_interface
+from pems_interface import (
+    DEFAULT_MASTER_CSV,
+    DEFAULT_REF_PATH,
+    IndexedGeoReference,
+    add_standard_basemaps_to_map,
+    build_multi_project_map,
+    build_single_project_map,
+    format_pm,
+    get_corridor_stations,
+    get_indexed_geo_ref,
+    load_geo_reference,
+    load_master_csv,
+    normalize_direction,
+    normalize_route,
+    pm_to_coordinates,
+    split_ca_pm,
+)
 
-try:
-    import main  # noqa: E402  (runs load_dotenv, builds ors_client, inits PeMSHandler)
-except ValueError as _exc:
-    if "API key" in str(_exc):
-        raise SystemExit(
-            "Cannot import main.py: ORS_API_KEY is not set.\n"
-            f"  Put ORS_API_KEY=... in {os.path.join(_HERE, '.env')} "
-            "(main.py calls load_dotenv() at import), or export it in your shell."
-        ) from _exc
-    raise
-except ModuleNotFoundError as _exc:
-    raise SystemExit(
-        f"Cannot import main.py: {_exc}\n"
-        f"  app.py must live next to main.py (looked in {_HERE}) and share its venv.\n"
-        "  Deps: flask pandas numpy folium openrouteservice python-dotenv plotly"
-    ) from _exc
-
-
-# --- speed: cache the reference CSV ------------------------------------------
-_original_loader = main._load_merged_geo_pm
-
-
-@functools.lru_cache(maxsize=4)
-def _cached_loader(ref_df_path=main.MERGED_GEO_PM):
-    return _original_loader(ref_df_path)
-
-
-if not os.getenv("POSTMILE_NO_CACHE"):
-    main._load_merged_geo_pm = _cached_loader
-
-
-def reference_df():
-    """The merged reference table, or None if it isn't on disk yet."""
-    try:
-        return main._load_merged_geo_pm(main.MERGED_GEO_PM)
-    except Exception:
-        return None
-
-
-def _route_dir_cols(df):
-    try:
-        return main._route_dir_columns(df)
-    except Exception:
-        return "Route", "Direction"
-
+LOGGER = logging.getLogger("pems_app")
 
 app = Flask(__name__)
 
 
 # ----------------------------------------------------------------------------
-# templates
+# Reference Data Access
+# ----------------------------------------------------------------------------
+def reference_df() -> Optional[pd.DataFrame]:
+    """Retrieve the 331K-row reference table, or None if unavailable."""
+    try:
+        idx_ref = get_indexed_geo_ref()
+        return idx_ref.raw_df
+    except Exception as exc:
+        LOGGER.warning(f"Reference table not loaded: {exc}")
+        return None
+
+
+def get_route_dir_columns(df: pd.DataFrame) -> Tuple[str, str]:
+    route_col = "Route" if "Route" in df.columns else ("Fwy" if "Fwy" in df.columns else "Route")
+    dir_col = "Direction" if "Direction" in df.columns else ("Dir" if "Dir" in df.columns else "Direction")
+    return route_col, dir_col
+
+
+# ----------------------------------------------------------------------------
+# Map Builders
+# ----------------------------------------------------------------------------
+def _points_map(start: Tuple[float, float], end: Tuple[float, float]) -> folium.Map:
+    """Map the two postmile locations with a straight dashed connection."""
+    centroid = [(start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0]
+    m = folium.Map(location=centroid, tiles=None, zoom_start=12)
+    add_standard_basemaps_to_map(m)
+    folium.PolyLine(
+        [start, end],
+        weight=4,
+        dash_array="6,8",
+        color="#b42318",
+        tooltip="Straight-line distance (endpoints only)"
+    ).add_to(m)
+    folium.CircleMarker(
+        start,
+        radius=6,
+        color="#16a34a",
+        fill=True,
+        fill_color="#16a34a",
+        fill_opacity=1.0,
+        tooltip=f"Begin PM ({start[0]:.5f}, {start[1]:.5f})"
+    ).add_to(m)
+    folium.CircleMarker(
+        end,
+        radius=6,
+        color="#dc2626",
+        fill=True,
+        fill_color="#dc2626",
+        fill_opacity=1.0,
+        tooltip=f"End PM ({end[0]:.5f}, {end[1]:.5f})"
+    ).add_to(m)
+    folium.LayerControl(position="topright", collapsed=True).add_to(m)
+    m.fit_bounds([start, end], padding=(40, 40))
+    return m
+
+
+def _route_corridor_map(
+    route: str,
+    direction: str,
+    begin_pm: str,
+    end_pm: str,
+    is_abs: bool,
+    county: Optional[str],
+    start: Tuple[float, float],
+    end: Tuple[float, float]
+) -> folium.Map:
+    """Map the actual highway corridor path using high-resolution reference segments."""
+    centroid = [(start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0]
+    m = folium.Map(location=centroid, tiles=None, zoom_start=12)
+    add_standard_basemaps_to_map(m)
+
+    corr_df = get_corridor_stations(
+        route=route,
+        direction=direction,
+        begin_pm=begin_pm,
+        end_pm=end_pm,
+        is_absolute=is_abs,
+        county=county
+    )
+
+    coords: List[Tuple[float, float]] = []
+    if corr_df is not None and not corr_df.empty:
+        lat_col = "Latitude" if "Latitude" in corr_df.columns else "Lat"
+        lng_col = "Longitude" if "Longitude" in corr_df.columns else "Lng"
+
+        if lat_col in corr_df.columns and lng_col in corr_df.columns:
+            pts_df = corr_df.dropna(subset=[lat_col, lng_col]).copy()
+            pts_df[lat_col] = pd.to_numeric(pts_df[lat_col], errors="coerce")
+            pts_df[lng_col] = pd.to_numeric(pts_df[lng_col], errors="coerce")
+            pts_df = pts_df.dropna(subset=[lat_col, lng_col])
+
+            try:
+                b_num = float(begin_pm) if is_abs else split_ca_pm(begin_pm)[1]
+                e_num = float(end_pm) if is_abs else split_ca_pm(end_pm)[1]
+                ascending = float(b_num) <= float(e_num)
+            except Exception:
+                ascending = True
+
+            sort_col = "_abs_pm" if is_abs and "_abs_pm" in pts_df.columns else "_ca_num"
+            if sort_col in pts_df.columns:
+                pts_df = pts_df.sort_values(by=sort_col, ascending=ascending)
+
+            for _, row in pts_df.iterrows():
+                coords.append((float(row[lat_col]), float(row[lng_col])))
+
+    if len(coords) < 2:
+        coords = [start, end]
+    else:
+        if coords[0] != start:
+            coords.insert(0, start)
+        if coords[-1] != end:
+            coords.append(end)
+
+    safe_route = html.escape(str(route))
+    safe_dir = html.escape(str(direction))
+    safe_begin_pm = html.escape(str(begin_pm))
+    safe_end_pm = html.escape(str(end_pm))
+
+    folium.PolyLine(
+        coords,
+        weight=6,
+        color="#2563eb",
+        opacity=0.85,
+        tooltip=f"Route {safe_route} {safe_dir} (PM {safe_begin_pm} - {safe_end_pm})"
+    ).add_to(m)
+
+    folium.CircleMarker(
+        start,
+        radius=5,
+        color="#16a34a",
+        fill=True,
+        fill_color="#16a34a",
+        fill_opacity=1.0,
+        tooltip=f"Begin PM {safe_begin_pm}"
+    ).add_to(m)
+
+    folium.CircleMarker(
+        end,
+        radius=5,
+        color="#dc2626",
+        fill=True,
+        fill_color="#dc2626",
+        fill_opacity=1.0,
+        tooltip=f"End PM {safe_end_pm}"
+    ).add_to(m)
+
+    folium.LayerControl(position="topright", collapsed=True).add_to(m)
+    m.fit_bounds(coords, padding=(30, 30))
+    return m
+
+
+# ----------------------------------------------------------------------------
+# HTML Templates
 # ----------------------------------------------------------------------------
 PAGE = """<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -140,9 +271,8 @@ PAGE = """<!doctype html>
 
   {% if not ref_ok %}
   <div class="banner">
-    <b>{{ merged_path }}</b> not loaded. Run <code>merged_df(write=True)</code> in main.py
-    (after the PeMS downloads exist) and then <code>POST /api/reload</code>.
-    Route suggestions below fall back to <code>main.ALL_ROUTES</code>.
+    <b>{{ merged_path }}</b> not loaded. Ensure <code>merged_geo_pm.csv</code> exists in <code>downloads/</code>
+    and run <code>POST /api/reload</code>.
   </div>
   {% endif %}
 
@@ -222,60 +352,53 @@ ERROR_PAGE = """<!doctype html><meta charset="utf-8">
 """
 
 
-def _err(title, detail=None, suggestion=None, code=400):
+def _err(title: str, detail: Optional[str] = None, suggestion: Optional[str] = None, code: int = 400):
     return render_template_string(
         ERROR_PAGE, title=title, detail=detail, suggestion=suggestion
     ), code
 
 
 # ----------------------------------------------------------------------------
-# request parsing
+# Request Parameter Parsing
 # ----------------------------------------------------------------------------
-def _params(src):
+def _params(src) -> Dict[str, Any]:
     return {
         "route": (src.get("route") or "").strip(),
         "direction": (src.get("direction") or "").strip().upper(),
         "begin_pm": (src.get("begin_pm") or "").strip(),
         "end_pm": (src.get("end_pm") or "").strip(),
         "county": (src.get("county") or "").strip(),
-        "absolute": (src.get("absolute") or "") .lower() in ("1", "true", "on", "yes"),
+        "absolute": (src.get("absolute") or "").lower() in ("1", "true", "on", "yes"),
         "mode": (src.get("mode") or "route").strip().lower(),
         "download": (src.get("download") or "").lower() in ("1", "true", "on", "yes"),
     }
 
 
-def _points_map(start, end, tiles=r"https://basemaps.cartocdn.com/rastertiles/voyager/%7Bz%7D/%7Bx%7D/%7By%7D.png?key=cb1_32r8_1_97041a40e86fa5f20f73e0c3"):
-    """ORS-free fallback: the two postmile locations + a straight line."""
-    m = folium.Map(location=main.coord_centroid((start, end)), tiles=tiles, zoom_start=12)
-    folium.PolyLine([start, end], weight=4, dash_array="6,8", color="#b42318").add_to(m)
-    folium.Marker(start, tooltip=f"begin PM  {start[0]:.5f}, {start[1]:.5f}",
-                  icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker(end, tooltip=f"end PM  {end[0]:.5f}, {end[1]:.5f}",
-                  icon=folium.Icon(color="red")).add_to(m)
-    m.fit_bounds([start, end], padding=(40, 40))
-    return m
-
-
 # ----------------------------------------------------------------------------
-# views
+# Views
 # ----------------------------------------------------------------------------
 @app.get("/")
 def index():
     v = _params(request.args)
     if not request.args:
-        v["absolute"] = True  # main.py's default
+        v["absolute"] = True
 
     df = reference_df()
     if df is not None:
-        route_col, _ = _route_dir_cols(df)
-        routes = sorted(df[route_col].astype(str).str.strip().unique(),
-                        key=lambda r: (len(r), r))
+        route_col, _ = get_route_dir_columns(df)
+        routes = sorted(
+            df[route_col].astype(str).str.strip().unique(),
+            key=lambda r: (len(r), r)
+        )
     else:
-        routes = main.ALL_ROUTES
+        routes = [
+            "5", "10", "15", "80", "101", "205", "210", "280", "405", "505",
+            "580", "605", "680", "710", "805", "880", "980"
+        ]
 
     return render_template_string(
         PAGE, v=v, routes=routes, ref_ok=df is not None,
-        merged_path=main.MERGED_GEO_PM,
+        merged_path=DEFAULT_REF_PATH,
     )
 
 
@@ -287,86 +410,130 @@ def map_view():
     missing = [k for k in ("route", "direction", "begin_pm", "end_pm") if not v[k]]
     if missing:
         return _err("Missing input", detail="Required: " + ", ".join(missing))
-    if not v["absolute"] and not v["county"]:
-        return _err("Missing input",
-                    detail="County is required when matching California postmiles.")
 
-    # Custom postmile input validations
+    import re
+    if not re.match(r"^[A-Za-z0-9\-\.\s]+$", v["route"]):
+        return _err("Bad input", detail="Route contains invalid characters.")
+    if not re.match(r"^[A-Za-z]+$", v["direction"]):
+        return _err("Bad input", detail="Direction contains invalid characters.")
+    if v["county"] and not re.match(r"^[A-Za-z0-9\s\-]+$", v["county"]):
+        return _err("Bad input", detail="County contains invalid characters.")
+
+    if not v["absolute"] and not v["county"]:
+        return _err(
+            "Missing input",
+            detail="County is required when matching California State Postmiles (PM resets at county lines)."
+        )
+
+    # Validate postmile numeric inputs
     for k in ("begin_pm", "end_pm"):
         val = v[k]
         if v["absolute"]:
-            # Absolute postmiles must be strict floats
             try:
                 float(val)
             except ValueError:
                 return _err("Bad input", detail=f"{k}={val!r} is not a valid Absolute Postmile number.")
         else:
-            # California postmiles can be strings like 'R3.8' or '3.80'
-            _, num = main._split_ca_pm(val)
-            if pd.isna(num):
-                return _err("Bad input", detail=f"{k}={val!r} is not a valid California Postmile format (e.g. '3.8' or 'R3.8').")
+            _, num = split_ca_pm(val)
+            if np.isnan(num):
+                return _err(
+                    "Bad input",
+                    detail=f"{k}={val!r} is not a valid California Postmile format (e.g. '3.8' or 'R3.8')."
+                )
 
     county = None if v["absolute"] else v["county"]
 
-    # 1) postmiles -> coordinates
+    # 1) Convert postmiles -> coordinates
     try:
-        start = main.pm_to_coord(v["begin_pm"], v["route"], v["direction"], county=county)
-        end = main.pm_to_coord(v["end_pm"], v["route"], v["direction"], county=county)
+        start = pm_to_coordinates(
+            v["route"], v["direction"], v["begin_pm"],
+            county=county, is_absolute=v["absolute"]
+        )
+        end = pm_to_coordinates(
+            v["route"], v["direction"], v["end_pm"],
+            county=county, is_absolute=v["absolute"]
+        )
     except FileNotFoundError as exc:
-        return _err("Reference data missing", detail=str(exc),
-                    suggestion="Run <code>merged_df(write=True)</code> in main.py, then "
-                               "<code>POST /api/reload</code>.", code=503)
-    except ValueError as exc:
-        return _err("No matching postmile", detail=str(exc),
-                    suggestion=f'Check the Abs PM range for this route: '
-                               f'<a href="/api/route/{v["route"]}">/api/route/{v["route"]}</a>',
-                    code=404)
+        return _err(
+            "Reference data missing",
+            detail=str(exc),
+            suggestion="Ensure <code>merged_geo_pm.csv</code> exists in <code>downloads/</code>, then <code>POST /api/reload</code>.",
+            code=503
+        )
     except Exception as exc:
         return _err(f"{type(exc).__name__}: {exc}", detail=traceback.format_exc(), code=500)
 
-    # 2) coordinates -> folium map
+    # Sanitize route input for safe reflection in suggestions
+    safe_route = html.escape(v["route"])
+    url_route = urllib.parse.quote(v["route"])
+
+    if not start or not end:
+        failed_pts = []
+        if not start:
+            failed_pts.append(f"Begin PM {v['begin_pm']}")
+        if not end:
+            failed_pts.append(f"End PM {v['end_pm']}")
+        err_detail = f"Could not locate coordinates for Route {v['route']} {v['direction']} ({', '.join(failed_pts)})."
+        return _err(
+            "No matching postmile",
+            detail=err_detail,
+            suggestion=f'Check the Abs PM range for this route: <a href="/api/route/{url_route}">/api/route/{safe_route}</a>',
+            code=404
+        )
+
+    # 2) Build Folium map
     if v["mode"] == "points":
         m = _points_map(start, end)
     else:
         try:
-            m = main.draw_route(start, end, anchor=main.coord_centroid((start, end)))
+            m = _route_corridor_map(
+                route=v["route"],
+                direction=v["direction"],
+                begin_pm=v["begin_pm"],
+                end_pm=v["end_pm"],
+                is_abs=v["absolute"],
+                county=county,
+                start=start,
+                end=end
+            )
         except Exception as exc:
-            qsargs = request.query_string.decode()
+            qsargs = request.query_string.decode("utf-8", errors="replace")
+            qsargs_safe = html.escape(qsargs)
             sep = "&" if qsargs else ""
             return _err(
                 f"Routing failed — {type(exc).__name__}: {exc}",
                 detail=traceback.format_exc(),
-                suggestion="The postmile lookups succeeded; only the ORS directions call "
-                           f'failed. <a href="/map?{qsargs}{sep}mode=points">Plot the two '
-                           "endpoints without routing</a> — that's enough to tell absolute "
-                           "from California postmiles.",
-                code=502,
+                suggestion=f'The postmile lookups succeeded; <a href="/map?{qsargs_safe}{sep}mode=points">plot the two endpoints without routing</a>.',
+                code=502
             )
 
-    html = m.get_root().render()
+    html_content = m.get_root().render()
 
-    # 3) same document either way: streamed to browser or offered as file download
     if v["download"]:
-        name = (f"route_map_{v['route']}{v['direction']}_"
-                f"{v['begin_pm']}_{v['end_pm']}.html")
+        name = f"route_map_{v['route']}{v['direction']}_{v['begin_pm']}_{v['end_pm']}.html"
         return Response(
-            html, mimetype="text/html",
-            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+            html_content,
+            mimetype="text/html",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'}
         )
-    return Response(html, mimetype="text/html")
+    return Response(html_content, mimetype="text/html")
 
 
 # ----------------------------------------------------------------------------
-# small JSON API the form uses
+# JSON APIs
 # ----------------------------------------------------------------------------
 @app.get("/api/routes")
 def api_routes():
     df = reference_df()
     if df is None:
-        return jsonify({"source": "main.ALL_ROUTES", "routes": main.ALL_ROUTES})
-    route_col, _ = _route_dir_cols(df)
+        fallback = [
+            "5", "10", "15", "80", "101", "205", "210", "280", "405", "505",
+            "580", "605", "680", "710", "805", "880", "980"
+        ]
+        return jsonify({"source": "fallback", "routes": fallback})
+    route_col, _ = get_route_dir_columns(df)
     routes = sorted(df[route_col].astype(str).str.strip().unique(), key=lambda r: (len(r), r))
-    return jsonify({"source": main.MERGED_GEO_PM, "routes": routes})
+    return jsonify({"source": DEFAULT_REF_PATH, "routes": routes})
 
 
 @app.get("/api/route/<route>")
@@ -375,8 +542,9 @@ def api_route(route):
     if df is None:
         return jsonify({"found": False, "reason": "reference file not loaded"}), 503
 
-    route_col, dir_col = _route_dir_cols(df)
-    sub = df.loc[df[route_col].astype(str).str.strip() == str(route).strip()]
+    route_norm = normalize_route(route)
+    route_col, dir_col = get_route_dir_columns(df)
+    sub = df.loc[df[route_col].astype(str).str.strip() == route_norm]
     if sub.empty:
         return jsonify({"found": False, "route": route, "directions": [], "counties": []})
 
@@ -395,39 +563,84 @@ def api_route(route):
         counties = sorted(sub["County"].astype(str).str.strip().replace("nan", "").unique())
         counties = [c for c in counties if c]
 
-    return jsonify({"found": True, "route": str(route),
-                    "directions": sorted(out, key=lambda x: x["direction"]),
-                    "counties": counties})
+    return jsonify({
+        "found": True,
+        "route": str(route),
+        "directions": sorted(out, key=lambda x: x["direction"]),
+        "counties": counties
+    })
 
 
 @app.post("/api/reload")
 def api_reload():
-    _cached_loader.cache_clear()
-    df = reference_df()
-    return jsonify({"reloaded": True, "rows": None if df is None else int(len(df)),
-                    "columns": [] if df is None else list(df.columns)})
+    pems_interface._INDEXED_GEO_REF = None
+    pems_interface._RAW_GEO_DF = None
+    try:
+        idx_ref = get_indexed_geo_ref()
+        rows = len(idx_ref.raw_df) if idx_ref.raw_df is not None else 0
+        cols = list(idx_ref.raw_df.columns) if idx_ref.raw_df is not None else []
+    except Exception:
+        rows = None
+        cols = []
+    return jsonify({"reloaded": True, "rows": rows, "columns": cols})
 
 
 # ----------------------------------------------------------------------------
-# project maps (multi-project and single-project)
+# Project Maps
 # ----------------------------------------------------------------------------
 @app.get("/projects/map")
 def projects_map_view():
-    import pems_interface
     dist = request.args.get("dist")
-    m = pems_interface.build_multi_project_map(dist=dist)
-    html = m.get_root().render()
-    return Response(html, mimetype="text/html")
+    m = build_multi_project_map(dist=dist)
+    html_content = m.get_root().render()
+    return Response(html_content, mimetype="text/html")
 
 
 @app.get("/projects/map/<pid>")
 def project_single_map_view(pid):
-    import pems_interface
-    m = pems_interface.build_single_project_map(pid)
+    m = build_single_project_map(pid)
     if m is None:
-        return _err("Project not found", detail=f"No project with ID {pid}", code=404)
-    html = m.get_root().render()
-    return Response(html, mimetype="text/html")
+        return _err("Project not found", detail=f"No project found matching ID: {pid}", code=404)
+    html_content = m.get_root().render()
+    return Response(html_content, mimetype="text/html")
+
+
+@app.get("/api/download/station/<sid>")
+def api_download_station_view(sid):
+    try:
+        import datetime
+        data_type = request.args.get("type", "flow").strip().lower()
+        granularity = request.args.get("granularity", "month").strip().lower()
+        start_year = int(request.args.get("start_year", 1999))
+        end_year = int(request.args.get("end_year", datetime.datetime.now().year))
+        combine = request.args.get("combine", "1").lower() in ("1", "true", "yes")
+        export_fmt = request.args.get("export_format", "text").strip().lower()
+
+        out_dir = os.path.join(_HERE, "downloads", "stations", str(sid).strip())
+        res = pems_interface.download_station_data(
+            station_id=sid,
+            data_type=data_type,
+            granularity=granularity,
+            start_year=start_year,
+            end_year=end_year,
+            output_dir=out_dir,
+            combine=combine,
+            verbose=False,
+            export_format=export_fmt
+        )
+
+        if request.args.get("format") == "file" and res.get("combined_file") and os.path.exists(res["combined_file"]):
+            with open(res["combined_file"], "r", encoding="utf-8") as f:
+                content = f.read()
+            return Response(
+                content,
+                mimetype="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{os.path.basename(res["combined_file"])}"'}
+            )
+
+        return jsonify({"ok": True, "download": res})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.get("/healthz")
@@ -435,23 +648,19 @@ def healthz():
     df = reference_df()
     return jsonify({
         "ok": True,
-        "main_file": getattr(main, "__file__", None),
         "cwd": os.getcwd(),
-        "save_path": main.SAVE_PATH,
-        "merged_geo_pm": main.MERGED_GEO_PM,
+        "default_ref_path": DEFAULT_REF_PATH,
         "reference_rows": None if df is None else int(len(df)),
-        "ors_key_set": bool(main.ORS_API_KEY),
-        "pems_handler": hasattr(main, "pems"),
-        "cache": "off" if os.getenv("POSTMILE_NO_CACHE") else "on",
+        "master_csv": DEFAULT_MASTER_CSV,
+        "pems_module": getattr(pems_interface, "__file__", None),
     })
 
 
 if __name__ == "__main__":
-    print(f"main.py      : {getattr(main, '__file__', '?')}")
-    print(f"reference    : {main.MERGED_GEO_PM}")
+    print(f"pems_interface : {getattr(pems_interface, '__file__', '?')}")
+    print(f"reference      : {DEFAULT_REF_PATH}")
     df0 = reference_df()
-    print(f"               {'not found' if df0 is None else str(len(df0)) + ' rows'}")
-    print(f"ORS key set  : {bool(main.ORS_API_KEY)}")
+    print(f"                 {'not found' if df0 is None else str(len(df0)) + ' rows'}")
     app.run(
         host=os.getenv("FLASK_HOST", "127.0.0.1"),
         port=int(os.getenv("FLASK_PORT", "5000")),

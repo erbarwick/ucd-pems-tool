@@ -1,6 +1,7 @@
 # Environment and credentials
 .env
 .env.*
+!.env.example
 *.env
 
 # Python artifacts
@@ -38,3 +39,6 @@ route_map_*.html
 all_ca_projects_map.html
 district_*_projects_map.html
 *.log
+
+# Backups
+backup_legacy/

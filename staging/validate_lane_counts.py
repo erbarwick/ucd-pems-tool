@@ -3,7 +3,7 @@ import re
 import pandas as pd
 import numpy as np
 
-WORKSPACE_PATH = "/Users/erb/VAULT_PHONE/Research/CERCET/California/python/ag.workspace"
+WORKSPACE_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLEAN_CSV = os.path.join(WORKSPACE_PATH, "staging/Master_CA_Project_List_Cleaned.csv")
 RAW_CSV = os.path.join(WORKSPACE_PATH, "staging/master_sheet3_raw.csv")
 

@@ -1,238 +1,325 @@
-# CERCET California Highway Expansion & PeMS Interface
+# PeMS Tools for UCD CERCET Project Team
 
-This repository provides tools for auditing, verifying, and querying Caltrans Performance Measurement System (PeMS) traffic sensor data, geometric alignments, and Caltrans Census stations for highway capacity expansion projects across California.
+This repository contains tools for auditing, verifying, mapping, and downloading traffic data from the Caltrans
+Performance Measurement System (PeMS). It was developed for a study on the accuracy of highway capacity expansion
+forecasting.
 
-It supports the **CERCET** (Center for Research on Connected and Emerging Transportation) study on induced Vehicle Miles Traveled (VMT) and historical forecast accuracy.
+## Setting it up:
 
----
+Make sure you have Python 3.9 or later installed. On Mac, open the **Terminal** application and run `python3 --version`.
+On **Windows**, open **PowerShell** and run `python --version`.
 
-## Architecture & File Structure
+If Python is not installed, download the latest installer for your OS at https://www.python.org/downloads. If you are
+installing on Windows, make sure you check the box that says "Add python.exe to PATH"
 
-```
-ag.workspace/
-├── pems_interface.py            # Consolidated PeMS interface & batch query engine
-├── app.py                       # Flask web app for visual route/postmile verification
-├── main.py                      # Original postmile verification and Folium map generator
-├── ca_routes_dirs.csv           # Official Caltrans PeMS route direction conventions
-├── downloads/
-│   ├── merged_geo_pm.csv        # 331,888-row reference database (Route, Dir, CA PM, Abs PM, Lat, Lng)
-│   └── metadata/                # Cached PeMS VDS detector metadata (19,672 stations across 9 districts)
-├── staging/
-│   ├── Master_CA_Project_List_Cleaned.csv   # Cleaned master project dataset (118 rows)
-│   ├── Master_CA_Project_List_Cleaned.xlsx  # Excel formatted cleaned dataset
-│   ├── transform_master.py                 # Pipeline that produced cleaned dataset
-│   └── validate_lane_counts.py             # Lane count consistency validator
-├── tests/
-│   └── test_pems_interface.py  # Branch-proven automated test suite (55 unit tests)
-└── README.md
-```
+Once everything is installed, execute the following commands one at a time based on your OS:
 
----
-
-## Getting Started
-
-### 1. Environment & Credentials
-
-Activate the Python virtual environment and configure your `.env` file with Caltrans PeMS credentials:
+### Mac (Terminal)
 
 ```bash
-# In `.env` at the repo root 
-PEMS_USERNAME="your_email@domain.edu"
-PEMS_PASSWORD="your_pems_password"
+# Open the directory where you want to copy the repository
+cd /path/to/folder
+
+# Create the venv folder and activate your python virtual environment (typically required)
+# When activated, your terminal prompt should show `(.venv)` on the left
+python3 -m venv .venv
+source .venv/bin/activate
+
+# With .venv active:
+pip install -r requirements.txt
+
+# Copy .env template
+cp .env.example .env
+
+# This should work, but if not, just open .env from this folder in the TextEdit app. 
+# If you can't see it in the folder, hit <Cmd+Shift+.> to show hidden files. 
+open .env
 ```
 
-Verify your credentials against PeMS:
+In TextEdit you should see:
 
-```bash
-python pems_interface.py --test-login
+   ```env
+   PEMS_USERNAME="your_email@university.edu"
+   PEMS_PASSWORD="your_actual_password"
+   ```
+
+Replace the values with your own login. If you use this password on other sites, I highly recommend changing it on the
+PeMS site, as PeMS does not always use encrypted HTTP.
+
+To test that your credentials work, run `python3 pems_interface.py --test-login` (with the venv activated)
+
+### Windows (PowerShell)
+
+```shell
+# Open the directory where you want to copy the repository
+cd C:\path\to\folder
+
+# Create the venv folder and activate your python virtual environment (typically required)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# With .venv active:
+pip install -r requirements.txt 
+
+# Copy .env template
+copy .env.example .env
+
+# This should work but if not, just open .env from this folder in the Notepad app 
+notepad .env
 ```
+
+> NOTE: If you get an error saying running scripts is disabled, run this command and try again:
+> ```shell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+In Notepad you should see:
+
+   ```env
+   PEMS_USERNAME="your_email@university.edu"
+   PEMS_PASSWORD="your_actual_password"
+   ```
+
+Replace the values with your own login. If you use this password on other sites, I highly recommend changing it on the
+PeMS site, as PeMS does not always use encrypted HTTP.
+
+To test that your credentials work, run `python pems_interface.py --test-login` (with the venv activated)
 
 ---
 
-## Usage Guide
+## Data sources explained
 
-### A. Command-Line Interface (CLI)
+### Source 1: Master Project Spreadsheet (`staging/Master_CA_Project_List_Cleaned.csv`)
 
-#### 1. Inspect by project ID
-Inspect all project details (**route, direction, postmile span, coordinates, dates, sensors**) and generate all PeMS export URLs:
+> To use a different or updated project spreadsheet, pass `--input path/to/your_file.csv` to any CLI command, or overwrite `staging/Master_CA_Project_List_Cleaned.csv` to make it the default. If you have a raw uncleaned spreadsheet, save it as `staging/master_sheet3_raw.csv` and run `python staging/transform_master.py` to clean and reformat it.
+
+Contains highway capacity expansion projects across CA. Each row is a continuous section of roadway where a capacity
+expansion took place (cannot have two highway directions in one row).
+
+Columns:
+
+- `Project ID`
+- `District` (Caltrans District 1 through 12)
+- `County` (e.g. San Mateo, Alameda, Los Angeles)
+- `Route` (e.g. 80, 101, 5)
+- `Direction` (NB, SB, EB, WB)
+- `Begin PM` and `End PM` (postmile boundaries)
+- `Sensor Station 1 ID`, `Sensor Station 1 HOV ID`, `Sensor Station 2 ID`, etc.
+
+### Source 2: PeMS Highway Reference CSV (`downloads/merged_geo_pm.csv`)
+
+Contains 331,888 rows, where each row is a 0.1-mile interval with physical alignment information (postmiles,
+coordinates) of every
+highway in California
+
+- **State Postmile (`CA PM`) vs. Absolute Postmile (`Abs PM`)**:
+    - **State Postmiles (`CA PM`)**: For state planning purposes; CA PM resets to 0 at every county boundary
+    - **Absolute Postmiles (`Abs PM`)**: More stable over time; 0 starts at the southern or western boundary of
+      California.
+
+### Source 3: PeMS Detector Metadata (`downloads/metadata/`)
+
+This folder contains sensor station metadata tables for Caltrans Districts 3-12 (one file for each)
+
+**Columns:**
+
+- Station ID
+- Freeway
+- Direction
+- District
+- County
+- State PM
+- Absolute PM
+- Detector Type: (Mainline `ML`, HOV `HV`, On-Ramp `OR`, Off-Ramp `FR`)
+- Number of Lanes
+- Station Name
+
+**`pems_interface.py` uses these files for finding a project's relevant sensors:**
+
+1. Filters all detectors matching the project's exact `District`, `Route`, `Direction`, and `County`.
+2. Selects detectors with PMs between `[Begin PM - buffer, End PM + buffer]`. Default buffer is `±0.1` miles.
+3. Sorts detectors along the corridor by PM
+4. Compares detectors in the postmile range with what we have in the spreadsheet, describes it as one of the
+   following:
+    - "Exact Match": The spreadsheet lists the exact same stations
+    - "Partial Match": The spreadsheet lists some of the in-range stations
+    - "Discrepancy": The spreadsheet lists a station that is not located on that highway section (might be the wrong
+      direction).
+    - "Sheet Empty": The spreadsheet has no station listed despite in-range stations existing
+    - "Uninstrumented": Likely rural corridor where no PeMS stations exist.
+
+### Source 4: Live PeMS queries
+
+When downloading data, the program logs into `https://pems.dot.ca.gov` using your credentials (see near the top of this
+document for a guide on setting up your environment). Due to the parameterized and consistent format of PeMS URLs, the
+script constructs URLs that point directly to the exact download link needed.
+See the "PEMS URL BUILDERS" section in `pems_interface.py`.
+
+When requesting several years of data at once, PeMS truncates data. The tool queries PeMS **one year at a time** and
+verifies that the returned text contains an actual data table.
+
+---
+
+## Downloading data from PeMS
+
+### With the command-line interface (CLI)
+
+The easiest way is via the CLI, either in macOS Terminal or Windows PowerShell. After following the setup steps at the
+top of the README, you can try some of the examples below. `pems_interface.py` also has a lot of good examples.
+
+This command downloads all monthly **flow** data for a station across all available years.  
+This is a lot of data take a while due to PeMS' slow servers, so 
+
+```bash
+python pems_interface.py --download-station 400001
+```
+
+This command will:
+
+- Log into PeMS using your `.env` credentials (see above)
+- Constructs the download links for station `400001`'s flow data year by year, and fetches the files at those links
+  (years where the station was not yet installed or had no data are automatically skipped)
+- Saves each raw annual file as `station_400001_2022_flow_month.txt`, `station_400001_2023_flow_month.txt`, etc.
+- Merges all active years into one CSV file, such as `station_400001_flow_month_all_years.csv`
+
+---
+
+### Choosing data type and time granularity (examples)
+
+```bash
+# Download DAILY flow data for all years
+python pems_interface.py --download-station 400001 --granularity day
+
+# Download HOURLY average speed data for all years
+python pems_interface.py --download-station 400001 --data-type speed --granularity hour
+
+# Download 5-MINUTE flow data for a specific year range
+python pems_interface.py --download-station 400001 --granularity 5min --start-year 2023 --end-year 2023
+
+# Download ANNUAL AADT reports
+python pems_interface.py --download-station 400001 --data-type aadt
+```
+
+### Supported options
+
+| Parameter       | Possible values                                       | Default           | Description                                                                |
+|:----------------|:------------------------------------------------------|:------------------|:---------------------------------------------------------------------------|
+| `--data-type`   | `flow`, `occ`, `speed`, `vmt`, `vht`, `delay`, `aadt` | `flow`            | Traffic volume, occupancy %, speed (mph), VMT, VHT, delay, or annual AADT. |
+| `--granularity` | `month`, `day`, `hour`, `week`, `year`, `5min`        | `month`           | Time aggregation interval (verify if supported for your `data-type`)       |
+| `--start-year`  | Any 4-digit year (e.g. `2015`)                        | `1999`            | Earliest year to query.                                                    |
+| `--end-year`    | Any 4-digit year (e.g. `2024`)                        | Current year      | Latest year to query.                                                      |
+| `--output-dir`  | Any folder path (e.g. `data/flow`)                    | `.` (current dir) | Local folder where files will be saved.                                    |
+| `--no-combine`  | Flag (no value)                                       | Disabled          | Saves raw annual `.txt` files but does not create the master `.csv`.       |
+| `--overwrite`   | Flag (no value)                                       | Disabled          | Re-downloads data even if valid files already exist locally.               |
+
+---
+
+### Downloading all stations for a project
+
+You can download data for every detector station associated with a specific project ID in the master spreadsheet:
+
+```bash
+python pems_interface.py --download-project 418000244 --output-dir my_project_data
+```
+
+This creates a project folder containing subfolders for each sensor station, with raw annual text exports and merged CSVs.
+---
+
+## 4. Auditing project data
+
+To inspect all project attributes (route, direction, postmiles, coordinates, dates, and sensors) and view PeMS URLs:
+
 ```bash
 python pems_interface.py --inspect 418000244
 ```
 
-#### 2. Inspect with Census Station Lookup
-Input a project ID and find the closest Caltrans Census count stations (to the project's begin postmile).
-```bash
-python pems_interface.py --inspect 300000061 --census
-```
-
-#### 3. Match Active PeMS VDS Stations & Compare Spreadsheet (Dry Run by Default)
-Compare existing sensor station columns across all 118 projects with active Caltrans PeMS corridor detectors (Mainline `ML` and HOV `HV`).
-Safe **dry-run mode is enabled permanently by default**, leaving the spreadsheet untouched:
+To run a check across all projects to identify which spreadsheet sensors match active PeMS sensors and flag
+discrepancies:
 
 ```bash
-# Run comparison across all projects (DRY RUN by default)
+# Dry run across all projects (CSV not modified)
 python pems_interface.py --match-stations
 
-# Run dry run and export detailed project-by-project comparison report (CSV or Markdown)
-python pems_interface.py --match-stations --dry-run --output-report reports/station_comparison_report.csv
-
-# Match stations filtered to a specific District or Project ID
+# Filter check to a single district or project ID
 python pems_interface.py --match-stations --dist 4
-python pems_interface.py --match-stations -p 300020420
+python pems_interface.py --match-stations -p 414000032
 
-# Adjust postmile buffer tolerance (default 0.1 mi) and station types
-python pems_interface.py --match-stations --buffer 0.2 --station-types ML,HV
+# Export audit report (CSV/Markdown)
+python pems_interface.py --match-stations --output-report reports/station_audit.csv
+```
 
-# When ready: apply updates to master CSV (creates an automated timestamped backup first)
+To update your local copy of the master spreadsheet with the verified corridor stations:
+
+```bash
 python pems_interface.py --match-stations --apply
-```
+``` 
 
-#### 4. Ad-Hoc Corridor Query
-Query coordinates, corridor reference segments, and generate a lane configuration URL for arbitrary freeway bounds:
+> Note: This command also automatically creates a timestamped backup of the master CSV before modifying.
+ 
+---
+
+## See the data on a map in your browser
+
+### Generate standalone web map using the CLI:
+
 ```bash
-python pems_interface.py --route 80 --dir E --begin-pm 11.4 --end-pm 12.8 --county Solano
-```
+# Map a single project with detectors and open in your default browser
+python pems_interface.py --map 418000244
 
-#### 5. Interactive Project Mapping & Ground-Truth Detector Checking
-Generate interactive Folium/Leaflet web maps showing road paths/corridors, postmile boundaries, and detector stations partitioned by type. Hover over any detector station to view rich metadata and ground-truth boundary status:
-```bash
-# Map a single project by PID with detector layers and ground-truth checker toolbar
-python pems_interface.py --map 1200020279
-
-# Filter corridor buffer width (default: 3.0 miles upstream/downstream)
-python pems_interface.py --map 1200020279 --station-buffer 5.0
-
-# Map road path only without detector stations
-python pems_interface.py --map 1200020279 --no-stations
-
-# Map all 118 projects across California simultaneously (with layer controls by District)
+# Map all projects across California with layer toggles by District
 python pems_interface.py --map-all
 
-# Map multi-project view including toggleable detector layers across project corridors
-python pems_interface.py --map-all --include-stations --dist 4
-
-# Save map to a custom path without automatically launching the browser
-python pems_interface.py --map 1200020279 --output-map maps/project_1200020279.html --no-open
+# Map all projects in District 4 with detectors
+python pems_interface.py --map-all --dist 4 --include-stations
 ```
 
-**Key Map Features for Ground-Truth Verification**:
-- **Layer Toggles by Station Type**: Detectors are organized into toggleable Leaflet feature groups: Mainline (`ML`), Carpool/HOV (`HV`), On-Ramp (`OR`), Off-Ramp (`FR`), and Connectors (`FF`/`CD`/`CH`).
-- **Ground-Truth Visual Distinction**: Detectors within project bounds are rendered as bold solid markers (`✓ IN PROJECT BOUNDS`). Nearby buffer detectors outside the corridor are rendered as dashed, semi-transparent markers (`⚠ OUTSIDE BOUNDS`).
-- **Master Spreadsheet Cross-Verification**: Stations currently listed in the master spreadsheet are highlighted with gold borders (if verified in-bounds) or red warning rings (if out-of-bounds discrepancies).
-- **Ground-Truth Toolbar**: Includes quick buttons for `In-Bounds Only` (hides all buffer detectors instantly) and `Toggle All Stations`.
-- **Rich Hover Tooltips & Click Popups**: Hovering over any detector displays its ID, Type, Name, Postmile, Lanes, Length, and Corridor Ground-Truth status. Clicking opens direct links to PeMS Station Summary, AADT, and Flow detector exports.
-
-#### 6. Batch URL Overview
-Generate and preview PeMS URLs across the master dataset:
-```bash
-python pems_interface.py --list-urls
-```
+In the web map interface you can toggle station types on/off, hover and click over elements to show an overview of their
+data and direct PeMS links.
 
 ---
 
-### B. Python API
-
-You can import `pems_interface` as a Python module in scripts or notebooks:
-
-```python
-from pems_interface import (
-    PeMSClient,
-    load_master_csv,
-    ProjectPeMSQueryBuilder,
-    pm_to_coordinates,
-    build_lane_config_url,
-    build_station_aadt_url,
-    build_station_flow_url,
-    find_closest_census_stations,
-)
-
-# 1. High-speed postmile-to-coordinate conversion (O(1) indexed lookup)
-coords = pm_to_coordinates(route="80", direction="E", pm="11.4", county="Solano")
-print(f"Latitude, Longitude: {coords}")
-# (38.201952, -122.156967)
-
-# 2. Build PeMS export URLs
-lane_url = build_lane_config_url(
-    route="80", direction="E", start_date="2021-01-01", end_date="2024-12-31"
-)
-aadt_url = build_station_aadt_url(station_id="410756", start_year=2021, end_year=2022)
-flow_url = build_station_flow_url(station_id="410756", start_year=2021, granularity="month")
-
-# 3. Process projects from the master CSV
-projects = load_master_csv("staging/Master_CA_Project_List_Cleaned.csv")
-for proj in projects[:5]:
-    builder = ProjectPeMSQueryBuilder(proj)
-    start_c, end_c = builder.resolve_geometry()
-    urls = builder.generate_all_urls()
-    print(f"[{proj.project_id}] {urls['corridor']} -> Sensors: {proj.sensor_stations}")
-
-# 4. Authenticate & stream downloads
-client = PeMSClient()
-client.login()
-client.download_file(lane_url, "downloads/lane_config_80E.txt")
-
-# 5. Closest Caltrans Census stations
-census_df = find_closest_census_stations(route="80", district="4", ca_pm=11.4, top_n=3)
-
-# 6. Interactive Folium Road Path Mapping
-from pems_interface import build_single_project_map, build_multi_project_map
-
-# Generate and view map for a single project (or split project pairs)
-single_map = build_single_project_map("418000244", output_path="route_map_418000244.html")
-
-# Generate and view map for all 118 projects with District layer controls
-all_map = build_multi_project_map(output_path="all_ca_projects_map.html")
-```
-
----
-
-### C. Web Interface (Flask)
-
-The local Flask application includes full interactive mapping:
+### Web app for mapping and postmile verification:
 
 ```bash
 python app.py
 ```
 
-- Open `http://127.0.0.1:5000/projects/map` to view all 118 highway projects statewide on an interactive Leaflet map with District toggle controls.
-- Filter by district: `http://127.0.0.1:5000/projects/map?dist=4`.
-- View an individual project corridor: `http://127.0.0.1:5000/projects/map/<pid>`.
-- Hovering over any corridor reveals the Project ID, Route, Direction, District, County, Postmile bounds, and directional lane counts. Clicking opens a comprehensive project card with direct external links to Caltrans PeMS and sensor stations.
+Then open your web browser to:
+
+- `http://127.0.0.1:5000`: postmile route calculator and map generator
+- `http://127.0.0.1:5000/projects/map`: full map of all CA projects
+- `http://127.0.0.1:5000/projects/map/<PID>`: map for a specific project ID (e.g. `/projects/map/414000032`).
 
 ---
 
-## PeMS Query Specifications
+## How to use this in your own Python scripts and notebooks
 
-`pems_interface.py` standardizes query parameters according to Caltrans PeMS web endpoints:
+You can import `pems_interface` as long as `pems_interface.py` is in the same directory
 
-| Endpoint | PeMS Node / Content | Tab | Format / Output |
-| :--- | :--- | :--- | :--- |
-| **Lane Config Time Series** | `dnode=Freeway&content=elv` | `config_timeseries` | `export=text&q=lanes&gn=day` |
-| **Station Annual AADT** | `dnode=VDS&content=analysis` | `aadt` | `export=text&station_id={id}` (epoch timestamps) |
-| **Station Detector Flow** | `dnode=VDS&content=loops` | `det_timeseries` | `export=text&station_id={id}&q=flow&gn=month` |
-| **Freeway Lat/Long Path** | `dnode=Freeway&content=fwy_latlngXY` | - | `export=text&fwy={rte}&dir={dir}` |
-| **Clearinghouse Raw** | `srq=clearinghouse` | - | `district_id={dist}&yy={year}&type={type}` |
+```python
+import pems_interface
 
----
+# PM to lat/long:
+coords = pems_interface.pm_to_coordinates(
+    route="80", direction="E", pm="11.4", county="Solano"
+)
+print("Latitude, Longitude:", coords)
+# (38.201952, -122.156967)
 
-## Running Automated Tests
+# Download monthly flow data for a station:
+summary = pems_interface.download_station_data(
+    station_id="400001",
+    data_type="flow",
+    granularity="month",
+    start_year=2020,
+    end_year=2024,
+    output_dir="./data"
+)
+print(f"Downloaded {summary['total_records']} records to {summary['combined_file']}")
 
-Run the full test suite using Python's standard `unittest` framework:
-
-```bash
-python -m unittest tests/test_pems_interface.py -v
-```
-
-The test suite covers:
-- Input normalization (`normalize_direction`, `normalize_route`, prefix/suffix `split_ca_pm`).
-- Query URL parameters and Unix epoch timestamp alignment.
-- Validation between valid PeMS text tables and HTML error pages.
-- Authentication state transitions, credential validation, and automatic re-login on expired sessions.
-- Geometric postmile bounds matching and coordinate interpolation.
-- Master CSV row parsing and ISO date resolution.
-
----
-
-## Safety & Data Integrity
-
-- **Box Folder Safeguard**: The external Box sync directory is strictly treated as read-only. All transformations, outputs, and downloads are restricted to the local working directory (`ag.workspace`).
+# Find the closest Census count stations:
+census_df = pems_interface.find_closest_census_stations(
+    route="80", district="4", ca_pm=11.4, top_n=3
+)
+print(census_df[["ID", "CA PM", "Name", "pm_diff"]])
+``` 
