@@ -20,6 +20,10 @@ Once everything is installed, execute the following commands one at a time based
 # Open the directory where you want to copy the repository
 cd /path/to/folder
 
+# Clone repository
+git clone https://github.com/erbarwick/ucd-pems-tool.git
+cd ucd-pems-tool
+
 # Create the venv folder and activate your python virtual environment (typically required)
 # When activated, your terminal prompt should show `(.venv)` on the left
 python3 -m venv .venv
@@ -53,6 +57,10 @@ To test that your credentials work, run `python3 pems_interface.py --test-login`
 ```shell
 # Open the directory where you want to copy the repository
 cd C:\path\to\folder
+
+# Clone repository
+git clone https://github.com/erbarwick/ucd-pems-tool.git
+cd ucd-pems-tool
 
 # Create the venv folder and activate your python virtual environment (typically required)
 python -m venv .venv
