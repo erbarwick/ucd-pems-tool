@@ -26,6 +26,7 @@ EXAMPLE USAGE
       build_station_aadt_url,
       build_station_flow_url,
       find_closest_census_stations,
+      get_project_imagery,
   )
 
   # A. Postmile to Coordinate Conversion (O(1) indexed lookup):
@@ -52,6 +53,11 @@ EXAMPLE USAGE
   client = PeMSClient()  # Reads PEMS_USERNAME and PEMS_PASSWORD from .env
   client.login()
   client.download_file(url=lane_url, out_path="downloads/lane_config_80E.txt")
+
+  # E. Download Historical Satellite Imagery (Before & After Construction):
+  imagery = get_project_imagery("218000125", period="both")
+  print("Before construction:", imagery["imagery"]["before"]["path"])
+  print("After completion:", imagery["imagery"]["after"]["path"])
 
   # E. Find Closest Caltrans Census Stations:
   census_stations = find_closest_census_stations(route="80", district="4", ca_pm=11.4, top_n=3)
@@ -123,9 +129,12 @@ import time
 import calendar
 import datetime
 import logging
+import math
+import json
 import argparse
 import html
 import urllib.parse
+import textwrap
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -844,6 +853,9 @@ def download_project_data(
     if verbose:
         print("\n" + "=" * 70)
         print(f"PEMS PROJECT DETECTOR DOWNLOAD: Project {target_pid}")
+        if matched and matched[0].project_description:
+            wrapped = textwrap.fill(matched[0].project_description, width=68, initial_indent="  Description:        ", subsequent_indent="                      ")
+            print(wrapped)
         print(f"Associated Stations ({len(st_ids)}): {', '.join(st_ids)}")
         print(f"Export Format: {export_format.upper()}")
         print(f"Target Directory: {proj_dir}")
@@ -873,6 +885,7 @@ def download_project_data(
 
     return {
         "project_id": target_pid,
+        "project_description": matched[0].project_description if matched else "",
         "station_results": station_results,
         "total_stations": len(st_ids),
         "output_dir": proj_dir
@@ -1144,6 +1157,7 @@ class ProjectRecord:
     sensor_stations: List[str] = field(default_factory=list)
     raw_row: Dict[str, Any] = field(default_factory=dict)
     row_index: int = -1
+    project_description: str = ""
 
     @property
     def pems_direction(self) -> str:
@@ -1188,6 +1202,9 @@ def parse_master_row(row: Dict[str, Any], row_index: int = -1) -> ProjectRecord:
     direction = "" if dir_raw.lower() in ("nan", "none") else dir_raw
     begin_pm = format_pm(str(row.get("Begin PM", "")).strip())
     end_pm = format_pm(str(row.get("End PM", "")).strip())
+
+    desc_raw = str(row.get("Project Description", row.get("description", row.get("project_description", "")))).strip()
+    project_description = "" if desc_raw.lower() in ("nan", "none") else desc_raw
 
     # Absolute PMs
     abs_beg = None
@@ -1280,7 +1297,8 @@ def parse_master_row(row: Dict[str, Any], row_index: int = -1) -> ProjectRecord:
         open_to_traffic_date=o_traffic,
         sensor_stations=sensor_stations,
         raw_row=row,
-        row_index=row_index
+        row_index=row_index,
+        project_description=project_description
     )
 
 
@@ -1686,6 +1704,7 @@ class StationComparisonResult:
     status: str  # EXACT_MATCH, PARTIAL_MATCH, DISCREPANCY, SHEET_EMPTY, UNINSTRUMENTED
     sheet_sensor_count: int
     found_sensor_count: int
+    project_description: str = ""
 
 
 def compare_project_stations(
@@ -1812,7 +1831,8 @@ def compare_project_stations(
         discrepancies=discrepancies,
         status=status,
         sheet_sensor_count=sheet_count,
-        found_sensor_count=len(found)
+        found_sensor_count=len(found),
+        project_description=project.project_description
     )
 
 
@@ -1832,6 +1852,7 @@ def apply_station_updates_to_dataframe(
     """
     Apply identified corridor stations to master dataframe columns.
     Properly pairs mainline and HOV detectors and cleanly clears unused columns.
+    Formats any unformatted Excel serial dates into ISO YYYY-MM-DD.
     """
     updated = df.copy()
 
@@ -1840,16 +1861,29 @@ def apply_station_updates_to_dataframe(
     col_s1_hov = _find_column(updated, "Sensor Station 1 HOV ID")
     col_s1_name = _find_column(updated, "Sensor Station 1 Name")
     col_s1_type = _find_column(updated, "Sensor Station 1 Type")
+    col_s1_lane_type = _find_column(updated, "Sensor Station 1: lane type")
     col_s1_lanes_after = _find_column(updated, "Sensor Station 1: number of lanes after")
 
     col_s2_id = _find_column(updated, "Sensor Station 2 ID")
     col_s2_lanes_after = _find_column(updated, "Sensor Station 2: number of lanes after")
+    col_s2_lanes_before = _find_column(updated, "Sensor Station 2: number of lanes before")
+    col_s2_lane_type = _find_column(updated, "Sensor Station 2: lane type")
+    col_s2_width = _find_column(updated, "Sensor Station 2: lane width (ft)")
+    col_s2_act = _find_column(updated, "Sensor 2 Activation Date for New Lane")
 
     col_s3_id = _find_column(updated, "Sensor Station 3 ID")
     col_s3_lanes_after = _find_column(updated, "Sensor Station 3: number of lanes after")
+    col_s3_lanes_before = _find_column(updated, "Sensor Station 3: number of lanes before")
+    col_s3_lane_type = _find_column(updated, "Sensor Station 3: lane type")
+    col_s3_width = _find_column(updated, "Sensor Station 3: lane width (ft)")
+    col_s3_act = _find_column(updated, "Sensor 3 Activation Date for New Lane")
 
     col_s4_id = _find_column(updated, "Sensor Station 4 ID")
     col_s4_lanes_after = _find_column(updated, "Sensor Station 4: number of lanes after")
+    col_s4_lanes_before = _find_column(updated, "Sensor Station 4: number of lanes before")
+    col_s4_lane_type = _find_column(updated, "Sensor Station 4: lane type")
+    col_s4_width = _find_column(updated, "Sensor Station 4: lane width (ft)")
+    col_s4_act = _find_column(updated, "Sensor 4 Activation Date for New Lane")
 
     col_pid = _find_column(updated, "Project ID")
     col_dir = _find_column(updated, "Direction")
@@ -1898,6 +1932,10 @@ def apply_station_updates_to_dataframe(
             else:
                 if col_s2_id: updated.at[idx, col_s2_id] = ""
                 if col_s2_lanes_after: updated.at[idx, col_s2_lanes_after] = ""
+                if col_s2_lanes_before: updated.at[idx, col_s2_lanes_before] = ""
+                if col_s2_lane_type: updated.at[idx, col_s2_lane_type] = ""
+                if col_s2_width: updated.at[idx, col_s2_width] = ""
+                if col_s2_act: updated.at[idx, col_s2_act] = ""
 
             # Station 3
             if len(primary_stations) >= 3:
@@ -1907,6 +1945,10 @@ def apply_station_updates_to_dataframe(
             else:
                 if col_s3_id: updated.at[idx, col_s3_id] = ""
                 if col_s3_lanes_after: updated.at[idx, col_s3_lanes_after] = ""
+                if col_s3_lanes_before: updated.at[idx, col_s3_lanes_before] = ""
+                if col_s3_lane_type: updated.at[idx, col_s3_lane_type] = ""
+                if col_s3_width: updated.at[idx, col_s3_width] = ""
+                if col_s3_act: updated.at[idx, col_s3_act] = ""
 
             # Station 4
             if len(primary_stations) >= 4:
@@ -1916,6 +1958,20 @@ def apply_station_updates_to_dataframe(
             else:
                 if col_s4_id: updated.at[idx, col_s4_id] = ""
                 if col_s4_lanes_after: updated.at[idx, col_s4_lanes_after] = ""
+                if col_s4_lanes_before: updated.at[idx, col_s4_lanes_before] = ""
+                if col_s4_lane_type: updated.at[idx, col_s4_lane_type] = ""
+                if col_s4_width: updated.at[idx, col_s4_width] = ""
+                if col_s4_act: updated.at[idx, col_s4_act] = ""
+
+    # Convert any raw 5-digit Excel date serials across Sensor Activation Date columns
+    for s_idx in range(1, 5):
+        col_act = _find_column(updated, f"Sensor {s_idx} Activation Date for New Lane")
+        if col_act:
+            for idx in updated.index:
+                val = str(updated.at[idx, col_act]).strip()
+                if val.isdigit() and len(val) == 5:
+                    d = datetime.date(1899, 12, 30) + datetime.timedelta(days=int(val))
+                    updated.at[idx, col_act] = d.strftime("%Y-%m-%d")
 
     return updated
 
@@ -1998,6 +2054,9 @@ def run_station_comparison_pipeline(
         print(f"District Filter: District {dist_filter}")
     if project_id_filter:
         print(f"Project ID Filter: {project_id_filter}")
+        if target_projects and target_projects[0].project_description:
+            wrapped = textwrap.fill(target_projects[0].project_description, width=76, initial_indent="Project Description: ", subsequent_indent="                     ")
+            print(wrapped)
     print("=" * 80)
     print(f"Evaluated Projects: {total_projs}")
     print(f"  • Exact Matches (sheet == corridor):         {status_counts.get('EXACT_MATCH', 0):3d} ({status_counts.get('EXACT_MATCH', 0)/total_projs*100:5.1f}%)")
@@ -2049,7 +2108,11 @@ def run_station_comparison_pipeline(
         if discrepancies_list:
             print(f"\nDETAILED DISCREPANCY AUDIT ({len(discrepancies_list)} projects):")
             for r in discrepancies_list:
+                p_match = next((p for p in target_projects if p.project_id == r.project_id), None)
                 print(f"\n  Project {r.project_id} (Dist {r.district}, Route {r.route} {r.direction}, PM {r.begin_pm}-{r.end_pm}):")
+                if p_match and p_match.project_description:
+                    wrapped = textwrap.fill(p_match.project_description, width=74, initial_indent="    Description: ", subsequent_indent="                 ")
+                    print(wrapped)
                 print(f"    Sheet Stations: {r.existing_stations}")
                 print(f"    Corridor Stations Found ({len(r.found_stations)}): {[s.id for s in r.found_stations]}")
                 for d in r.discrepancies:
@@ -2080,6 +2143,7 @@ def run_station_comparison_pipeline(
                 "End PM": r.end_pm,
                 "Abs Begin PM": r.abs_begin_pm,
                 "Abs End PM": r.abs_end_pm,
+                "Project Description": r.project_description,
                 "Status": r.status,
                 "Sheet Sensor Count": r.sheet_sensor_count,
                 "Found Sensor Count": r.found_sensor_count,
@@ -2217,7 +2281,7 @@ def make_project_tooltip_html(project: ProjectRecord, length_mi: float = 0.0) ->
     a_lanes = html.escape(str(project.raw_row.get("dir_lanes_after", "?")))
     b_pm = format_pm(project.begin_pm)
     e_pm = format_pm(project.end_pm)
-    raw_desc = str(project.raw_row.get("Project Description", "")).strip()
+    raw_desc = str(project.project_description or project.raw_row.get("Project Description", "")).strip()
     if len(raw_desc) > 85:
         raw_desc = raw_desc[:82] + "..."
     desc = html.escape(raw_desc)
@@ -2248,7 +2312,7 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
     added_lm = html.escape(str(raw.get("Total Added Lanes (Lane Miles)", raw.get("New GP Lanes (Lane Miles)", "?"))))
     facility = html.escape(str(raw.get("Facility Class checked by Lu") or raw.get("Facility Class") or raw.get("facility_class") or "Freeway").strip())
     area_type = html.escape(str(raw.get("area_type") or raw.get("Area Type") or raw.get('Area Type ("Urban", "Suburban", "Exurban", "Rural", or "Unknown")') or "Unknown").strip().capitalize())
-    desc = html.escape(str(raw.get("Project Description", "")).strip())
+    desc = html.escape(str(project.project_description or raw.get("Project Description", "")).strip())
 
     b_pm = format_pm(project.begin_pm)
     e_pm = format_pm(project.end_pm)
@@ -2280,7 +2344,7 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
         <tr><td style="padding: 2px 4px; color: #333; border-right: 1px solid #ccc;">Sensors:</td><td style="padding: 2px 4px;">{sensor_html}</td></tr>
       </table>
 
-      {f'<div style="font-size: 11.5px; color: #333; border: 1px solid #ccc; padding: 4px; margin-bottom: 6px; max-height: 55px; overflow-y: auto;">{desc}</div>' if desc else ''}
+      {f'<div style="font-size: 11.5px; color: #333; border: 1px solid #ccc; padding: 4px; margin-bottom: 6px; max-height: 55px; overflow-y: auto;"><b>Description:</b> {desc}</div>' if desc else ''}
 
       <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #000; font-size: 12px;">
         <a href="{urls['lane_config_url']}" target="_blank" style="color: #0000ee; text-decoration: underline;">[PeMS Lane Config]</a>
@@ -3182,52 +3246,1609 @@ def build_multi_project_map(
 
 
 # ---------------------------------------------------------------------------
+# HISTORICAL SATELLITE IMAGERY INTEGRATION (WAYBACK)
+# ---------------------------------------------------------------------------
+def _parse_project_date(val: Any, default_month: int = 1, default_day: int = 1) -> Optional[datetime.date]:
+    """Parse a date string, datetime object, or 4-digit year into a datetime.date."""
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val if isinstance(val, datetime.date) else val.date()
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return None
+    # 1. ISO format YYYY-MM-DD
+    try:
+        return datetime.date.fromisoformat(s)
+    except ValueError:
+        pass
+    # 2. Common formats
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%m-%d-%Y", "%d-%b-%Y"):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    # 3. Year only: e.g. "2019" or "2019.0"
+    match = re.match(r"^(\d{4})", s)
+    if match:
+        yr = int(match.group(1))
+        if 1950 <= yr <= 2035:
+            return datetime.date(yr, default_month, default_day)
+    return None
+
+
+def slice_project_corridor(
+    project: ProjectRecord,
+    slice_mi: float = 0.4,
+    idx_ref: Optional[IndexedGeoReference] = None
+) -> List[Dict[str, Any]]:
+    """
+    Partition a project corridor into sequential roadway segments of approximately slice_mi length.
+    Returns list of dicts with:
+      - 'index': 1-based integer
+      - 'start_pm': float
+      - 'end_pm': float
+      - 'start_coords': (lat, lon)
+      - 'end_coords': (lat, lon)
+      - 'length_mi': float
+    """
+    ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
+    sub = ref.get_corridor(project.route, project.pems_direction)
+    slices = []
+
+    is_abs = (
+        project.abs_begin_pm is not None
+        and not np.isnan(project.abs_begin_pm)
+        and project.abs_end_pm is not None
+        and not np.isnan(project.abs_end_pm)
+    )
+    if is_abs:
+        b_pm = float(project.abs_begin_pm)
+        e_pm = float(project.abs_end_pm)
+        pm_col = "_abs_pm"
+    else:
+        _, b_num = split_ca_pm(project.begin_pm)
+        _, e_num = split_ca_pm(project.end_pm)
+        b_pm = b_num
+        e_pm = e_num
+        pm_col = "_ca_num"
+
+    pts = None
+    if sub is not None and not sub.empty and b_pm is not None and e_pm is not None and not np.isnan(b_pm) and not np.isnan(e_pm):
+        min_pm, max_pm = min(float(b_pm), float(e_pm)), max(float(b_pm), float(e_pm))
+        ascending = float(b_pm) <= float(e_pm)
+        if is_abs:
+            cond = (sub["_abs_pm"] >= min_pm - 0.05) & (sub["_abs_pm"] <= max_pm + 0.05)
+            pts = sub[cond].sort_values(by="_abs_pm", ascending=ascending)
+        else:
+            county_clean = str(project.county).strip().lower()
+            cond = (sub["_ca_num"] >= min_pm - 0.05) & (sub["_ca_num"] <= max_pm + 0.05) & (sub["_county"] == county_clean)
+            pts = sub[cond].sort_values(by="_ca_num", ascending=ascending)
+        if pts is not None:
+            pts = pts.dropna(subset=["_lat", "_lng"])
+
+    if pts is not None and len(pts) >= 2:
+        step = max(1, int(round(slice_mi / 0.1)))
+        n_pts = len(pts)
+        for i in range(0, n_pts - 1, step):
+            j = min(i + step, n_pts - 1)
+            if j == i:
+                break
+            p0 = pts.iloc[i]
+            p1 = pts.iloc[j]
+            # Use State PM for user display if available, else absolute PM
+            if "_ca_num" in p0 and pd.notna(p0["_ca_num"]) and float(p0["_ca_num"]) > 0:
+                s_pm = float(p0["_ca_num"])
+                e_pm_val = float(p1["_ca_num"])
+            else:
+                s_pm = float(p0[pm_col])
+                e_pm_val = float(p1[pm_col])
+            length = round(abs(float(p1[pm_col]) - float(p0[pm_col])), 2)
+            if length == 0:
+                length = round(0.1 * (j - i), 2)
+            slices.append({
+                "index": len(slices) + 1,
+                "start_pm": round(s_pm, 2),
+                "end_pm": round(e_pm_val, 2),
+                "abs_start_pm": round(float(p0["_abs_pm"]), 2) if "_abs_pm" in p0 and pd.notna(p0["_abs_pm"]) else None,
+                "abs_end_pm": round(float(p1["_abs_pm"]), 2) if "_abs_pm" in p1 and pd.notna(p1["_abs_pm"]) else None,
+                "start_coords": (float(p0["_lat"]), float(p0["_lng"])),
+                "end_coords": (float(p1["_lat"]), float(p1["_lng"])),
+                "length_mi": length
+            })
+    else:
+        # Fallback to endpoints
+        builder = ProjectPeMSQueryBuilder(project)
+        start_pt, end_pt = builder.resolve_geometry()
+        if start_pt and end_pt:
+            (lat1, lon1), (lat2, lon2) = start_pt, end_pt
+            mid_lat = (lat1 + lat2) / 2.0
+            dx_m = (lon2 - lon1) * 111320.0 * math.cos(math.radians(mid_lat))
+            dy_m = (lat2 - lat1) * 111320.0
+            dist_m = math.hypot(dx_m, dy_m)
+            dist_mi = max(0.1, dist_m / 1609.34)
+            n_chunks = max(1, int(math.ceil(dist_mi / slice_mi)))
+
+            p_start_pm = float(b_pm) if b_pm is not None and not np.isnan(b_pm) else 0.0
+            p_end_pm = float(e_pm) if e_pm is not None and not np.isnan(e_pm) else dist_mi
+
+            for k in range(n_chunks):
+                t0 = k / n_chunks
+                t1 = (k + 1) / n_chunks
+                s_coords = (lat1 + t0 * (lat2 - lat1), lon1 + t0 * (lon2 - lon1))
+                e_coords = (lat1 + t1 * (lat2 - lat1), lon1 + t1 * (lon2 - lon1))
+                s_pm = p_start_pm + t0 * (p_end_pm - p_start_pm)
+                e_pm_val = p_start_pm + t1 * (p_end_pm - p_start_pm)
+                slices.append({
+                    "index": k + 1,
+                    "start_pm": round(s_pm, 2),
+                    "end_pm": round(e_pm_val, 2),
+                    "start_coords": s_coords,
+                    "end_coords": e_coords,
+                    "length_mi": round(abs(e_pm_val - s_pm), 2)
+                })
+
+    return slices
+
+
+def create_stacked_slice_image(
+    before_img_path: str,
+    after_img_path: str,
+    out_path: str,
+    project: ProjectRecord,
+    slice_info: Dict[str, Any],
+    before_capture_date: Optional[str] = None,
+    after_capture_date: Optional[str] = None,
+    zoom: int = 19,
+) -> str:
+    """
+    Combine Before and After highway corridor strips into a single pixel-locked, vertically stacked comparison PNG.
+    """
+    from PIL import Image, ImageDraw
+    import wayback_imagery.core as wayback
+
+    img_b = Image.open(before_img_path)
+    img_a = Image.open(after_img_path)
+
+    w = max(img_b.width, img_a.width)
+    header_h = 76
+    divider_h = 32
+    footer_h = 36
+    total_h = header_h + img_b.height + divider_h + img_a.height + footer_h
+
+    canvas = Image.new("RGB", (w, total_h), (24, 24, 27))
+    draw = ImageDraw.Draw(canvas)
+
+    font_lg = wayback._load_font(max(15, min(24, w // 80)))
+    font_sm = wayback._load_font(max(11, min(16, w // 120)))
+
+    # Header
+    title = f"PROJECT {project.project_id} | ROUTE {project.route} {project.direction} | SEGMENT {slice_info['index']}: PM {slice_info['start_pm']:.2f} -> {slice_info['end_pm']:.2f} ({slice_info['length_mi']:.2f} mi)"
+    subtitle = f"County: {project.county} | District: {project.dist} | Native Zoom {zoom} (~0.3m/px resolution) | Highway runs Left to Right"
+    draw.text((24, 16), title, fill=(255, 255, 255), font=font_lg)
+    draw.text((24, 46), subtitle, fill=(161, 161, 170), font=font_sm)
+
+    # Paste Before
+    canvas.paste(img_b, (0, header_h))
+
+    # Before Badge
+    b_badge = f"▲ BEFORE (Pre-Construction) | Flight: {before_capture_date or 'Unknown'}"
+    draw.rectangle([(20, header_h + 14), (20 + int(font_sm.getlength(b_badge)) + 20, header_h + 40)], fill=(0, 0, 0))
+    draw.text((30, header_h + 19), b_badge, fill=(56, 189, 248), font=font_sm)
+
+    # Divider bar
+    y_div = header_h + img_b.height
+    draw.rectangle([(0, y_div), (w, y_div + divider_h)], fill=(39, 39, 42))
+    div_text = f"▲ BEFORE (Pre-Construction)   |   ▼ AFTER (Post-Opening)   [Aligned Roadway Strip: {slice_info['length_mi']:.2f} mi]"
+    draw.text((24, y_div + 8), div_text, fill=(212, 212, 216), font=font_sm)
+
+    # Paste After
+    canvas.paste(img_a, (0, y_div + divider_h))
+
+    # After Badge
+    y_after = y_div + divider_h
+    a_badge = f"▼ AFTER (Post-Opening) | Flight: {after_capture_date or 'Unknown'}"
+    draw.rectangle([(20, y_after + 14), (20 + int(font_sm.getlength(a_badge)) + 20, y_after + 40)], fill=(0, 0, 0))
+    draw.text((30, y_after + 19), a_badge, fill=(74, 222, 128), font=font_sm)
+
+    # Footer
+    y_foot = total_h - footer_h
+    draw.rectangle([(0, y_foot), (w, total_h)], fill=(18, 18, 20))
+    foot_text = "Source: Esri World Imagery Wayback Archive | UCD CERCET Highway Capacity Expansion Project Tool"
+    draw.text((24, y_foot + 10), foot_text, fill=(113, 113, 122), font=font_sm)
+
+    canvas.save(out_path, quality=95)
+    return out_path
+
+
+def generate_slices_html_report(
+    project: ProjectRecord,
+    slices_data: List[Dict[str, Any]],
+    before_meta: Dict[str, Any],
+    after_meta: Dict[str, Any],
+    output_dir: str,
+    overview_img: Optional[str] = None
+) -> str:
+    """
+    Generate a self-contained, interactive HTML comparison report with Before/After curtain wipe sliders.
+    """
+    html_path = os.path.join(output_dir, "index.html")
+
+    cards_html = []
+    nav_links = []
+
+    for s in slices_data:
+        idx = s["index"]
+        b_fn = os.path.basename(s["before_image"])
+        a_fn = os.path.basename(s["after_image"])
+        st_fn = os.path.basename(s["stacked_image"])
+        s_pm_str = f"PM {s['start_pm']:.2f} &rarr; {s['end_pm']:.2f}"
+        nav_links.append(f'<a href="#seg-{idx}" class="nav-chip">Seg {idx} ({s_pm_str})</a>')
+
+        sensors_callout = ""
+        if s.get("sensors"):
+            sensor_badges = "".join(
+                f'<span class="sensor-pill">&#128205; Sensor #{st["id"]} ({st["type"]}) PM {st["pm"]}</span>'
+                for st in s["sensors"]
+            )
+            sensors_callout = f'<div class="sensor-row">{sensor_badges}</div>'
+
+        bearing_str = f"{s.get('bearing', 0):.0f}&deg;" if s.get('bearing') is not None else ""
+
+        card = f"""
+        <div class="segment-card" id="seg-{idx}">
+          <div class="segment-header">
+            <div class="segment-title-group">
+              <span class="seg-badge">Segment {idx} of {len(slices_data)}</span>
+              <h2 class="seg-title">{s_pm_str} ({s['length_mi']:.2f} miles)</h2>
+              {f'<span class="seg-bearing">Heading {bearing_str}</span>' if bearing_str else ''}
+            </div>
+            <div class="view-toggles" data-seg="{idx}">
+              <button class="toggle-btn active" data-view="slider">Curtain Slider</button>
+              <button class="toggle-btn" data-view="stacked">Stacked</button>
+              <button class="toggle-btn" data-view="split">Side-by-Side</button>
+            </div>
+          </div>
+
+          {sensors_callout}
+
+          <!-- View: Curtain Wipe Slider -->
+          <div class="view-panel panel-slider active" id="panel-slider-{idx}">
+            <div class="compare-box" id="compare-box-{idx}">
+              <img src="{b_fn}" class="img-base" alt="Before Image" loading="lazy">
+              <img src="{a_fn}" class="img-overlay" alt="After Image" loading="lazy">
+              <div class="slider-divider">
+                <div class="slider-thumb">&#8596;</div>
+              </div>
+              <div class="badge-overlay badge-left">BEFORE: {s['before_capture_date']}</div>
+              <div class="badge-overlay badge-right">AFTER: {s['after_capture_date']}</div>
+            </div>
+            <div class="slider-hint">&#9664; Drag slider to wipe between Pre-Construction and Post-Opening imagery &#9654;</div>
+          </div>
+
+          <!-- View: Vertically Stacked -->
+          <div class="view-panel panel-stacked" id="panel-stacked-{idx}">
+            <img src="{st_fn}" class="full-stacked-img" alt="Stacked Comparison" loading="lazy">
+          </div>
+
+          <!-- View: Side-by-Side -->
+          <div class="view-panel panel-split" id="panel-split-{idx}">
+            <div class="split-grid">
+              <div class="split-col">
+                <div class="col-tag tag-before">BEFORE: {s['before_capture_date']}</div>
+                <img src="{b_fn}" class="split-img" alt="Before" loading="lazy">
+              </div>
+              <div class="split-col">
+                <div class="col-tag tag-after">AFTER: {s['after_capture_date']}</div>
+                <img src="{a_fn}" class="split-img" alt="After" loading="lazy">
+              </div>
+            </div>
+          </div>
+
+          <div class="segment-footer">
+            <span class="meta-note">Resolution: Native Zoom {s.get('zoom', 19)} (~0.3m/px) | Dimensions: {s.get('width', 0)}&times;{s.get('height', 0)} px</span>
+            <div class="actions">
+              <a href="{st_fn}" target="_blank" class="action-link">&#129125; Open Stacked Image</a>
+              <a href="{b_fn}" target="_blank" class="action-link">&#128065; Before Strip</a>
+              <a href="{a_fn}" target="_blank" class="action-link">&#128065; After Strip</a>
+            </div>
+          </div>
+        </div>
+        """
+        cards_html.append(card)
+
+    nav_chips_html = "".join(nav_links)
+    all_cards_html = "\n".join(cards_html)
+
+    overview_html = ""
+    if overview_img and os.path.exists(os.path.join(output_dir, overview_img)):
+        overview_html = f"""
+        <div class="overview-section">
+          <h3>Full Project Corridor Overview</h3>
+          <img src="{overview_img}" class="overview-img" alt="Project Corridor Overview">
+        </div>
+        """
+
+    full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project {project.project_id} - Roadway Geometry Historical Comparison</title>
+  <style>
+    :root {{
+      --bg: #09090b;
+      --card-bg: #18181b;
+      --border: #27272a;
+      --border-focus: #3f3f46;
+      --text: #f4f4f5;
+      --text-muted: #a1a1aa;
+      --before-accent: #38bdf8;
+      --after-accent: #4ade80;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.5;
+      padding-bottom: 80px;
+    }}
+    header {{
+      background: #111114;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 16px 24px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }}
+    .header-content {{
+      max-width: 1400px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }}
+    .title-area h1 {{
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    .badge-pid {{
+      background: #2563eb;
+      color: #fff;
+      font-size: 0.8rem;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-weight: 600;
+    }}
+    .subtitle {{
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }}
+    .global-controls {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }}
+    .global-btn {{
+      background: #27272a;
+      border: 1px solid var(--border-focus);
+      color: var(--text);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }}
+    .global-btn:hover {{
+      background: #3f3f46;
+    }}
+    .nav-bar {{
+      max-width: 1400px;
+      margin: 16px auto 0 auto;
+      padding: 0 24px;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 8px;
+    }}
+    .nav-chip {{
+      background: #1f1f23;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: color 0.15s, border-color 0.15s;
+    }}
+    .nav-chip:hover {{
+      color: #fff;
+      border-color: #52525b;
+    }}
+    .container {{
+      max-width: 1400px;
+      margin: 24px auto;
+      padding: 0 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }}
+    .info-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }}
+    .info-card h4 {{
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }}
+    .info-card p {{
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #fff;
+      margin-top: 4px;
+    }}
+    .segment-card {{
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    }}
+    .segment-header {{
+      padding: 16px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+      gap: 12px;
+    }}
+    .segment-title-group {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .seg-badge {{
+      background: #27272a;
+      border: 1px solid var(--border-focus);
+      color: #e4e4e7;
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 600;
+    }}
+    .seg-title {{
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #fff;
+    }}
+    .seg-bearing {{
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }}
+    .sensor-row {{
+      padding: 10px 20px;
+      background: #121215;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .sensor-pill {{
+      background: #7c2d12;
+      color: #fed7aa;
+      font-size: 0.75rem;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-weight: 500;
+    }}
+    .view-toggles {{
+      display: flex;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }}
+    .toggle-btn {{
+      background: #18181b;
+      border: none;
+      color: var(--text-muted);
+      padding: 6px 12px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }}
+    .toggle-btn.active {{
+      background: #3f3f46;
+      color: #fff;
+      font-weight: 600;
+    }}
+    .view-panel {{ display: none; padding: 20px; background: #0c0c0e; }}
+    .view-panel.active {{ display: block; }}
+    
+    /* Curtain Slider Component */
+    .compare-box {{
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      user-select: none;
+      cursor: ew-resize;
+      background: #000;
+      line-height: 0;
+    }}
+    .img-base {{
+      display: block;
+      width: 100%;
+      height: auto;
+      pointer-events: none;
+    }}
+    .img-overlay {{
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      pointer-events: none;
+      clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%);
+    }}
+    .slider-divider {{
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 2px;
+      background: #ffffff;
+      box-shadow: 0 0 8px rgba(0,0,0,0.8);
+      pointer-events: none;
+    }}
+    .slider-thumb {{
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 28px;
+      height: 28px;
+      background: #ffffff;
+      color: #000;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 700;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+    }}
+    .badge-overlay {{
+      position: absolute;
+      top: 14px;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      pointer-events: none;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.6);
+      line-height: 1.2;
+    }}
+    .badge-left {{
+      left: 14px;
+      background: rgba(14, 165, 233, 0.9);
+      color: #fff;
+    }}
+    .badge-right {{
+      right: 14px;
+      background: rgba(34, 197, 94, 0.9);
+      color: #000;
+    }}
+    .slider-hint {{
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 10px;
+    }}
+    .full-stacked-img {{
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }}
+    .split-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }}
+    .split-col {{
+      position: relative;
+    }}
+    .col-tag {{
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }}
+    .tag-before {{ color: var(--before-accent); }}
+    .tag-after {{ color: var(--after-accent); }}
+    .split-img {{
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }}
+    .segment-footer {{
+      padding: 12px 20px;
+      background: #141417;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }}
+    .meta-note {{
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+    }}
+    .action-link {{
+      color: var(--before-accent);
+      font-size: 0.8rem;
+      text-decoration: none;
+    }}
+    .action-link:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-content">
+    <div class="title-area">
+      <h1><span class="badge-pid">PID {project.project_id}</span> Route {project.route} {project.direction} Roadway Geometry Comparison</h1>
+      <div class="subtitle">{project.county} County (District {project.dist}) | Postmile Range: {project.begin_pm} &rarr; {project.end_pm}</div>
+      {f'<div class="header-desc" style="font-size: 0.82rem; color: #d4d4d8; margin-top: 5px; max-width: 900px; line-height: 1.4;"><strong>Description:</strong> {html.escape(project.project_description)}</div>' if project.project_description else ''}
+    </div>
+    <div class="global-controls">
+      <button class="global-btn" id="btn-all-slider">Wipe View (All)</button>
+      <button class="global-btn" id="btn-all-stacked">Stacked View (All)</button>
+      <button class="global-btn" id="btn-all-split">Side-by-Side (All)</button>
+    </div>
+  </div>
+</header>
+
+<div class="nav-bar">
+  {nav_chips_html}
+</div>
+
+<div class="container">
+  <div class="info-grid">
+    <div class="info-card">
+      <h4>Route & Corridor</h4>
+      <p>Route {project.route} {project.direction} ({project.county})</p>
+    </div>
+    <div class="info-card">
+      <h4>Postmile Range</h4>
+      <p>{project.begin_pm} &rarr; {project.end_pm}</p>
+    </div>
+    <div class="info-card">
+      <h4>Pre-Construction Target</h4>
+      <p>{project.construction_begin_date or 'N/A'}</p>
+    </div>
+    <div class="info-card">
+      <h4>Post-Opening Target</h4>
+      <p>{project.open_to_traffic_date or 'N/A'}</p>
+    </div>
+    <div class="info-card">
+      <h4>Total Slices</h4>
+      <p>{len(slices_data)} Segments (Zoom 19)</p>
+    </div>
+  </div>
+
+  {f'<div class="project-desc-box" style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px 20px; font-size: 0.88rem; color: #e4e4e7; line-height: 1.5;"><strong style="color: #fff;">Project Description:</strong> {html.escape(project.project_description)}</div>' if project.project_description else ''}
+
+  {overview_html}
+
+  {all_cards_html}
+</div>
+
+<script>
+  // Interactive Curtain Split Slider logic
+  document.querySelectorAll('.compare-box').forEach(box => {{
+    const overlay = box.querySelector('.img-overlay');
+    const divider = box.querySelector('.slider-divider');
+    let isDown = false;
+
+    function updatePos(clientX) {{
+      const rect = box.getBoundingClientRect();
+      let x = clientX - rect.left;
+      if (x < 0) x = 0;
+      if (x > rect.width) x = rect.width;
+      const pct = (x / rect.width) * 100;
+      overlay.style.clipPath = `polygon(0 0, ${{pct.toFixed(2)}}% 0, ${{pct.toFixed(2)}}% 100%, 0 100%)`;
+      divider.style.left = `${{pct.toFixed(2)}}%`;
+    }}
+
+    box.addEventListener('mousedown', e => {{
+      isDown = true;
+      updatePos(e.clientX);
+    }});
+
+    window.addEventListener('mouseup', () => {{
+      isDown = false;
+    }});
+
+    window.addEventListener('mousemove', e => {{
+      if (!isDown) return;
+      updatePos(e.clientX);
+    }});
+
+    box.addEventListener('touchstart', e => {{
+      isDown = true;
+      if (e.touches.length > 0) updatePos(e.touches[0].clientX);
+    }}, {{passive: true}});
+
+    window.addEventListener('touchend', () => {{
+      isDown = false;
+    }});
+
+    window.addEventListener('touchmove', e => {{
+      if (!isDown) return;
+      if (e.touches.length > 0) updatePos(e.touches[0].clientX);
+    }}, {{passive: true}});
+
+    box.addEventListener('dblclick', () => {{
+      overlay.style.clipPath = 'polygon(0 0, 50% 0, 50% 100%, 0 100%)';
+      divider.style.left = '50%';
+    }});
+  }});
+
+  // View Mode Switching
+  document.querySelectorAll('.view-toggles').forEach(toggleGroup => {{
+    const segIdx = toggleGroup.getAttribute('data-seg');
+    const btns = toggleGroup.querySelectorAll('.toggle-btn');
+
+    btns.forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        btns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const viewMode = btn.getAttribute('data-view');
+
+        const card = document.getElementById(`seg-${{segIdx}}`);
+        card.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
+        const targetPanel = card.querySelector(`.panel-${{viewMode}}`);
+        if (targetPanel) targetPanel.classList.add('active');
+      }});
+    }});
+  }});
+
+  // Global Controls
+  function setAllViews(mode) {{
+    document.querySelectorAll('.segment-card').forEach(card => {{
+      card.querySelectorAll('.toggle-btn').forEach(b => {{
+        b.classList.toggle('active', b.getAttribute('data-view') === mode);
+      }});
+      card.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
+      const target = card.querySelector(`.panel-${{mode}}`);
+      if (target) target.classList.add('active');
+    }});
+  }}
+
+  document.getElementById('btn-all-slider').addEventListener('click', () => setAllViews('slider'));
+  document.getElementById('btn-all-stacked').addEventListener('click', () => setAllViews('stacked'));
+  document.getElementById('btn-all-split').addEventListener('click', () => setAllViews('split'));
+</script>
+
+</body>
+</html>
+"""
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+
+    return html_path
+
+
+def generate_corridor_slices(
+    project_id: str,
+    slice_mi: float = 0.4,
+    zoom: int = 19,
+    half_width_m: float = 40.0,
+    output_dir: str = "downloads/imagery",
+    master_csv_path: Optional[str] = None,
+    custom_before_date: Optional[str] = None,
+    custom_after_date: Optional[str] = None,
+    open_browser: bool = True,
+    workers: int = 8,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Generate a complete high-resolution (Zoom 19) corridor slice comparison suite
+    and interactive HTML report for a Caltrans capacity expansion project.
+    """
+    try:
+        import wayback_imagery.core as wayback
+    except ImportError:
+        sibling_src = os.path.abspath(os.path.join(WORKSPACE_DIR, "..", "..", "..", "..", "wayback_imagery", "src"))
+        if os.path.isdir(sibling_src) and sibling_src not in sys.path:
+            sys.path.insert(0, sibling_src)
+        import wayback_imagery.core as wayback
+
+    # 1. Load project
+    projects = load_master_csv(master_csv_path)
+    matched = [p for p in projects if str(p.project_id).strip() == str(project_id).strip()]
+    if not matched:
+        raise ValueError(f"Project ID '{project_id}' not found in master project list.")
+    proj = matched[0]
+
+    # 2. Partition corridor into slices
+    slices = slice_project_corridor(proj, slice_mi=slice_mi)
+    if not slices:
+        raise ValueError(f"Could not compute corridor geometry for project {project_id}.")
+
+    # 3. Create dedicated project folder
+    safe_route = normalize_route(proj.route)
+    safe_dir = proj.pems_direction
+    clean_begin = re.sub(r'[^A-Za-z0-9\.]', '', proj.begin_pm)
+    clean_end = re.sub(r'[^A-Za-z0-9\.]', '', proj.end_pm)
+    folder_name = f"PID_{proj.project_id}_Route{safe_route}_{safe_dir}_PM{clean_begin}-{clean_end}"
+    proj_dir = os.path.join(output_dir, folder_name)
+    os.makedirs(proj_dir, exist_ok=True)
+
+    if verbose:
+        print(f"\n================================================================================")
+        print(f"CORRIDOR SLICES GENERATION: Project {proj.project_id} (Route {proj.route} {proj.direction})")
+        print(f"================================================================================")
+        if proj.project_description:
+            wrapped = textwrap.fill(proj.project_description, width=76, initial_indent="  Description:       ", subsequent_indent="                     ")
+            print(wrapped)
+        print(f"  Postmile Corridor: {proj.begin_pm} -> {proj.end_pm} ({len(slices)} slices of ~{slice_mi} mi)")
+        print(f"  Output Directory:  {proj_dir}")
+        print(f"  Target Zoom Level: Native Zoom {zoom} (~0.3m/px resolution)")
+
+    # 4. Resolve Target Dates
+    d_before = _parse_project_date(custom_before_date or proj.construction_begin_date or proj.start_year, 1, 1)
+    d_after = _parse_project_date(custom_after_date or proj.open_to_traffic_date or proj.end_year, 12, 31)
+
+    if not d_before or not d_after:
+        raise ValueError(f"Project {project_id} requires both construction date and open to traffic date.")
+
+    # 5. Resolve Esri Wayback release and flight capture dates once at corridor center
+    builder = ProjectPeMSQueryBuilder(proj)
+    s_c, e_c = builder.resolve_geometry()
+    lon_c, lat_c = (s_c[1] + e_c[1]) / 2.0, (s_c[0] + e_c[0]) / 2.0
+
+    if verbose:
+        print(f"  Querying Esri Wayback archive for capture flights around {d_before} and {d_after}...")
+
+    try:
+        c_before = wayback.find_release_by_capture(d_before, lon_c, lat_c, zoom=zoom, mode="before")
+    except ValueError:
+        c_before = wayback.find_release_by_capture(d_before, lon_c, lat_c, zoom=zoom, mode="nearest")
+
+    try:
+        c_after = wayback.find_release_by_capture(d_after, lon_c, lat_c, zoom=zoom, mode="after")
+    except ValueError:
+        c_after = wayback.find_release_by_capture(d_after, lon_c, lat_c, zoom=zoom, mode="nearest")
+
+    before_rel_id = c_before.release.release_id
+    after_rel_id = c_after.release.release_id
+    before_cap_str = c_before.capture_date.isoformat() if c_before.capture_date else str(d_before)
+    after_cap_str = c_after.capture_date.isoformat() if c_after.capture_date else str(d_after)
+
+    if verbose:
+        print(f"  ✓ Resolved BEFORE release {before_rel_id} (Captured: {before_cap_str})")
+        print(f"  ✓ Resolved AFTER  release {after_rel_id} (Captured: {after_cap_str})")
+
+    # 6. Map sensors to slices
+    sensors_by_slice = {s["index"]: [] for s in slices}
+    try:
+        vds_meta = load_vds_metadata()
+        if vds_meta is not None and not vds_meta.empty and proj.sensor_stations:
+            for sid in proj.sensor_stations:
+                matches = vds_meta[vds_meta["ID"].astype(str).str.strip() == str(sid).strip()]
+                if not matches.empty:
+                    s_row = matches.iloc[0]
+                    s_pm = s_row.get("State_PM") or s_row.get("Abs_PM")
+                    if s_pm and pd.notna(s_pm):
+                        _, s_num = split_ca_pm(s_pm)
+                        for s_dict in slices:
+                            min_spm = min(s_dict["start_pm"], s_dict["end_pm"])
+                            max_spm = max(s_dict["start_pm"], s_dict["end_pm"])
+                            if min_spm - 0.05 <= s_num <= max_spm + 0.05:
+                                sensors_by_slice[s_dict["index"]].append({
+                                    "id": str(sid),
+                                    "pm": s_num,
+                                    "type": str(s_row.get("Type", "ML")),
+                                    "lanes": str(s_row.get("Lanes", ""))
+                                })
+                                break
+    except Exception as exc:
+        LOGGER.debug(f"Sensor mapping warning: {exc}")
+
+    # 7. Generate each slice
+    slices_data = []
+    for s in slices:
+        idx = s["index"]
+        if verbose:
+            print(f"\n  [Slice {idx}/{len(slices)}] PM {s['start_pm']:.2f} -> {s['end_pm']:.2f} ({s['length_mi']:.2f} mi)...")
+
+        geom = wayback.corridor_geometry(s["start_coords"], s["end_coords"], half_width_m=half_width_m, pad_m=20.0)
+        prefix = f"slice_{idx:02d}_PM{s['start_pm']:.2f}-{s['end_pm']:.2f}"
+
+        # Raw Before Strip
+        b_res = wayback.generate_image(
+            bbox=geom.envelope,
+            date=d_before,
+            label=f"PID {proj.project_id} BEFORE | PM {s['start_pm']:.2f}-{s['end_pm']:.2f}",
+            out_dir=proj_dir,
+            corridor=geom,
+            zoom=zoom,
+            release_id=before_rel_id,
+            workers=workers,
+        )
+        b_dest = os.path.join(proj_dir, f"{prefix}_before.png")
+        if os.path.exists(b_res["path"]) and b_res["path"] != b_dest:
+            shutil.move(b_res["path"], b_dest)
+
+        # Raw After Strip
+        a_res = wayback.generate_image(
+            bbox=geom.envelope,
+            date=d_after,
+            label=f"PID {proj.project_id} AFTER | PM {s['start_pm']:.2f}-{s['end_pm']:.2f}",
+            out_dir=proj_dir,
+            corridor=geom,
+            zoom=zoom,
+            release_id=after_rel_id,
+            workers=workers,
+        )
+        a_dest = os.path.join(proj_dir, f"{prefix}_after.png")
+        if os.path.exists(a_res["path"]) and a_res["path"] != a_dest:
+            shutil.move(a_res["path"], a_dest)
+
+        # Stacked Comparison Image
+        stacked_dest = os.path.join(proj_dir, f"{prefix}_stacked.png")
+        create_stacked_slice_image(
+            before_img_path=b_dest,
+            after_img_path=a_dest,
+            out_path=stacked_dest,
+            project=proj,
+            slice_info=s,
+            before_capture_date=before_cap_str,
+            after_capture_date=after_cap_str,
+            zoom=zoom,
+        )
+
+        slice_rec = {
+            "index": idx,
+            "start_pm": s["start_pm"],
+            "end_pm": s["end_pm"],
+            "length_mi": s["length_mi"],
+            "bearing": geom.bearing,
+            "before_image": b_dest,
+            "after_image": a_dest,
+            "stacked_image": stacked_dest,
+            "before_capture_date": before_cap_str,
+            "after_capture_date": after_cap_str,
+            "zoom": zoom,
+            "width": b_res["width"],
+            "height": b_res["height"],
+            "sensors": sensors_by_slice.get(idx, [])
+        }
+        slices_data.append(slice_rec)
+
+        if verbose:
+            print(f"    ✓ Generated {prefix}_stacked.png ({b_res['width']}x{b_res['height']} px)")
+
+    # 8. Generate Full Corridor Overview Image (Macro view at Z15)
+    overview_fn = "00_overview_corridor.png"
+    overview_path = os.path.join(proj_dir, overview_fn)
+    try:
+        ov_bbox = wayback.bbox_from_segment(s_c, e_c, margin_m=200.0)
+        ov_res = wayback.generate_image(
+            bbox=ov_bbox,
+            date=d_after,
+            label=f"PROJECT {proj.project_id} FULL OVERVIEW | ROUTE {proj.route} {proj.direction} PM {proj.begin_pm}-{proj.end_pm}",
+            out_dir=proj_dir,
+            max_px=1600,
+            max_zoom=16,
+            release_id=after_rel_id,
+            points=[s_c, e_c],
+            workers=workers,
+        )
+        if os.path.exists(ov_res["path"]) and ov_res["path"] != overview_path:
+            shutil.move(ov_res["path"], overview_path)
+    except Exception as exc:
+        LOGGER.debug(f"Overview generation failed: {exc}")
+        overview_fn = None
+
+    # 9. Generate Interactive HTML Report
+    html_report = generate_slices_html_report(
+        project=proj,
+        slices_data=slices_data,
+        before_meta=c_before.as_dict(),
+        after_meta=c_after.as_dict(),
+        output_dir=proj_dir,
+        overview_img=overview_fn
+    )
+
+    # 10. Save metadata JSON
+    meta_json_path = os.path.join(proj_dir, "metadata.json")
+    with open(meta_json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "project_id": proj.project_id,
+            "project_description": proj.project_description,
+            "route": proj.route,
+            "direction": proj.direction,
+            "county": proj.county,
+            "postmiles": (proj.begin_pm, proj.end_pm),
+            "before_flight": c_before.as_dict(),
+            "after_flight": c_after.as_dict(),
+            "slices": [{k: v for k, v in s.items() if not k.endswith("_image")} for s in slices_data],
+        }, f, indent=2)
+
+    if verbose:
+        print(f"\n================================================================================")
+        print(f"✓ Corridor slices complete! Saved {len(slices_data)} high-res segments to:")
+        print(f"  {proj_dir}")
+        print(f"✓ Interactive HTML comparison report available at:")
+        print(f"  {html_report}")
+        print(f"================================================================================\n")
+
+    if open_browser:
+        webbrowser.open("file://" + os.path.abspath(html_report))
+
+    return {
+        "project_id": proj.project_id,
+        "folder": proj_dir,
+        "slices": slices_data,
+        "report_html": html_report,
+        "overview_image": overview_path if overview_fn else None,
+    }
+
+
+def get_project_imagery(
+    project_id: str,
+    period: str = "both",
+    aligned: bool = False,
+    margin_m: float = 150.0,
+    max_px: int = 4096,
+    max_zoom: int = 19,
+    zoom: Optional[int] = None,
+    output_dir: str = "downloads/imagery",
+    master_csv_path: Optional[str] = None,
+    custom_date: Optional[str] = None,
+    custom_before_date: Optional[str] = None,
+    custom_after_date: Optional[str] = None,
+    corridor_slices: bool = False,
+    slice_mi: float = 0.4,
+    open_browser: bool = False,
+    workers: int = 8,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Download and stitch historical aerial/satellite imagery from Esri World Imagery Wayback
+    for a Caltrans highway project, derived from its postmile range and construction timeline.
+
+    Parameters:
+      project_id: Project ID matching a row in the master project spreadsheet.
+      period: 'before' (pre-construction), 'after' (post-opening), 'both' (both before & after),
+              or a specific ISO date string 'YYYY-MM-DD'.
+      aligned: If True, uses corridor affine transformation to rotate the highway horizontally
+               with an integrated north arrow.
+      margin_m: Margin in meters added around the highway segment.
+      max_px: Upper bound for image dimension in pixels (default 4096).
+      max_zoom: Maximum zoom level (default 19, ~0.3m per pixel).
+      zoom: Explicit zoom level override (1-19).
+      output_dir: Local directory where annotated PNG images will be saved.
+      master_csv_path: Path to master projects CSV. Defaults to DEFAULT_MASTER_CSV.
+      custom_date: Explicit date override when querying a single date.
+      custom_before_date: Custom date string for 'before' (overrides spreadsheet).
+      custom_after_date: Custom date string for 'after' (overrides spreadsheet).
+      corridor_slices: If True, slices corridor into high-resolution (Zoom 19) segments and generates an interactive HTML viewer.
+      slice_mi: Length in miles of each corridor slice (default 0.4 mi).
+      open_browser: Whether to automatically launch the interactive HTML report in browser.
+      workers: Number of parallel tile download threads.
+      verbose: Whether to print progress to stdout.
+
+    Returns:
+      Dict with project metadata, resolved bounding box, and metadata of generated image(s).
+    """
+    if corridor_slices:
+        return generate_corridor_slices(
+            project_id=project_id,
+            slice_mi=slice_mi,
+            zoom=zoom or 19,
+            half_width_m=40.0,
+            output_dir=output_dir,
+            master_csv_path=master_csv_path,
+            custom_before_date=custom_before_date,
+            custom_after_date=custom_after_date,
+            open_browser=open_browser,
+            workers=workers,
+            verbose=verbose,
+        )
+
+    try:
+        import wayback_imagery.core as wayback
+    except ImportError:
+        # Check sibling repository directory if not installed in site-packages
+        sibling_src = os.path.abspath(os.path.join(WORKSPACE_DIR, "..", "..", "..", "..", "wayback_imagery", "src"))
+        if os.path.isdir(sibling_src) and sibling_src not in sys.path:
+            sys.path.insert(0, sibling_src)
+        try:
+            import wayback_imagery.core as wayback
+        except ImportError as exc:
+            raise ImportError(
+                "wayback-imagery is required to download historical satellite imagery.\n"
+                "Please install it via:\n"
+                "  pip install pillow>=10.1\n"
+                "  pip install git+https://github.com/erbarwick/wayback-imagery.git\n"
+                "or for local editable installation: pip install -e /path/to/wayback_imagery"
+            ) from exc
+
+    # 1. Load project record from CSV
+    projects = load_master_csv(master_csv_path)
+    matched = [p for p in projects if str(p.project_id).strip() == str(project_id).strip()]
+    if not matched:
+        raise ValueError(f"Project ID '{project_id}' not found in master project list ({master_csv_path or DEFAULT_MASTER_CSV}).")
+    proj = matched[0]
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print(f"HISTORICAL IMAGERY: Project {proj.project_id} (Route {proj.route} {proj.direction})")
+        print("=" * 70)
+        if proj.project_description:
+            wrapped = textwrap.fill(proj.project_description, width=68, initial_indent="  Description:        ", subsequent_indent="                      ")
+            print(wrapped)
+        print(f"  Route & Corridor:   Route {proj.route} {proj.direction} ({proj.county} PM {proj.begin_pm} -> {proj.end_pm})")
+        print(f"  Timeline Target:    Const: {proj.construction_begin_date or proj.start_year} | Open: {proj.open_to_traffic_date or proj.end_year}")
+
+    # 2. Resolve coordinates from postmiles
+    builder = ProjectPeMSQueryBuilder(proj)
+    start_pt, end_pt = builder.resolve_geometry()
+    if not start_pt or not end_pt:
+        polyline = get_project_corridor_geometry(proj)
+        if len(polyline) >= 2:
+            start_pt, end_pt = polyline[0], polyline[-1]
+    if not start_pt or not end_pt:
+        raise ValueError(
+            f"Could not resolve geographic coordinates from postmile range "
+            f"({proj.begin_pm} to {proj.end_pm}) for project {proj.project_id} on Route {proj.route}."
+        )
+
+    # 3. Calculate Bounding Box or Aligned Corridor
+    corridor = None
+    if aligned:
+        corridor = wayback.corridor_geometry(start_pt, end_pt, half_width_m=35.0, pad_m=margin_m * 0.5)
+        bbox = corridor.envelope
+    else:
+        polyline = get_project_corridor_geometry(proj)
+        if len(polyline) >= 4:
+            lats = [p[0] for p in polyline]
+            lons = [p[1] for p in polyline]
+            mid_lat = (min(lats) + max(lats)) / 2.0
+            m_per_deg_lat = 111320.0
+            m_per_deg_lon = 111320.0 * math.cos(math.radians(mid_lat))
+            pad_x = max(margin_m, 0.1 * (max(lons) - min(lons)) * m_per_deg_lon) / m_per_deg_lon
+            pad_y = max(margin_m, 0.1 * (max(lats) - min(lats)) * m_per_deg_lat) / m_per_deg_lat
+            bbox = (min(lons) - pad_x, min(lats) - pad_y, max(lons) + pad_x, max(lats) + pad_y)
+        else:
+            bbox = wayback.bbox_from_segment(start_pt, end_pt, margin_m=margin_m, margin_frac=0.25)
+
+    # 4. Determine Target Dates & Selection Modes
+    target_tasks = []
+    if custom_date:
+        d = _parse_project_date(custom_date)
+        if not d:
+            raise ValueError(f"Invalid custom date '{custom_date}'. Please use YYYY-MM-DD.")
+        target_tasks.append(("custom", d, "nearest"))
+    elif period == "before":
+        d = _parse_project_date(custom_before_date or proj.construction_begin_date or proj.start_year, 1, 1)
+        if not d:
+            raise ValueError(f"Project {project_id} has no Construction Begin Date in spreadsheet. Specify --imagery-date.")
+        target_tasks.append(("before", d, "before"))
+    elif period == "after":
+        d = _parse_project_date(custom_after_date or proj.open_to_traffic_date or proj.end_year, 12, 31)
+        if not d:
+            raise ValueError(f"Project {project_id} has no Open to Traffic Date in spreadsheet. Specify --imagery-date.")
+        target_tasks.append(("after", d, "after"))
+    elif period in ("both", "before_after", "before-after"):
+        d_before = _parse_project_date(custom_before_date or proj.construction_begin_date or proj.start_year, 1, 1)
+        d_after = _parse_project_date(custom_after_date or proj.open_to_traffic_date or proj.end_year, 12, 31)
+        if d_before:
+            target_tasks.append(("before", d_before, "before"))
+        elif verbose:
+            LOGGER.warning(f"Project {project_id} has no Construction Begin Date. Skipping 'before' image.")
+        if d_after:
+            target_tasks.append(("after", d_after, "after"))
+        elif verbose:
+            LOGGER.warning(f"Project {project_id} has no Open to Traffic Date. Skipping 'after' image.")
+        if not target_tasks:
+            raise ValueError(f"Project {project_id} has neither construction begin date nor open to traffic date.")
+    else:
+        d = _parse_project_date(period)
+        if not d:
+            raise ValueError(f"Unknown period '{period}'. Use 'before', 'after', 'both', or 'YYYY-MM-DD'.")
+        target_tasks.append(("custom", d, "nearest"))
+
+    # 5. Download and stitch imagery
+    results = {}
+    for kind, target_date, mode in target_tasks:
+        label = f"PID {proj.project_id} ({kind.upper()}) - Route {proj.route} {proj.direction} PM {proj.begin_pm}-{proj.end_pm}"
+        if verbose:
+            print(f"\n[Wayback] Fetching {kind.upper()} imagery for Project {proj.project_id} (target date: {target_date}, mode: {mode})...")
+
+        try:
+            img_meta = wayback.generate_image(
+                bbox=bbox,
+                date=target_date,
+                label=label,
+                out_dir=output_dir,
+                zoom=zoom,
+                max_px=max_px,
+                max_zoom=max_zoom,
+                mode=mode,
+                select_by="capture",
+                points=[start_pt, end_pt] if not aligned else None,
+                workers=workers,
+                corridor=corridor,
+            )
+        except ValueError as exc:
+            if "No capture date" in str(exc) and mode in ("before", "after"):
+                if verbose:
+                    print(f"  Note: {exc} - Falling back to nearest available capture...")
+                img_meta = wayback.generate_image(
+                    bbox=bbox,
+                    date=target_date,
+                    label=label,
+                    out_dir=output_dir,
+                    zoom=zoom,
+                    max_px=max_px,
+                    max_zoom=max_zoom,
+                    mode="nearest",
+                    select_by="capture",
+                    points=[start_pt, end_pt] if not aligned else None,
+                    workers=workers,
+                    corridor=corridor,
+                )
+            else:
+                raise exc
+
+        results[kind] = img_meta
+        if verbose:
+            cap_d = img_meta.get("capture_date")
+            rel_d = img_meta.get("release_date")
+            zm = img_meta.get("zoom")
+            p = img_meta.get("path")
+            print(f"✓ Saved {kind.upper()} image -> {p} (Captured: {cap_d}, Release: {rel_d}, Zoom: {zm})")
+
+    return {
+        "project_id": proj.project_id,
+        "project_description": proj.project_description,
+        "route": proj.route,
+        "direction": proj.direction,
+        "county": proj.county,
+        "postmiles": (proj.begin_pm, proj.end_pm),
+        "coordinates": (start_pt, end_pt),
+        "bbox": list(bbox),
+        "aligned": aligned,
+        "imagery": results,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the organized CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="Consolidated PeMS Interface & Query Engine for CERCET CA Projects."
+        prog="pems_interface.py",
+        description="PeMS Interface & Corridor Query Engine for CERCET California Highway Projects.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Inspect a project (description, PMs, dates, detector stations, PeMS URLs):
+  python pems_interface.py -p 400000680
+
+  # High-resolution (Zoom 19) historical satellite imagery corridor slices & interactive HTML report:
+  python pems_interface.py -p 400000680 --slices
+
+  # Single satellite corridor before/after image:
+  python pems_interface.py -p 400000680 --imagery --aligned
+
+  # Interactive Folium map for a project:
+  python pems_interface.py -p 400000680 --map
+
+  # Download PeMS detector time-series data for a project across all available years:
+  python pems_interface.py -p 400000680 --download --granularity month
+
+  # Audit & compare spreadsheet sensors against active PeMS VDS detectors:
+  python pems_interface.py --audit --dist 4
+        """
     )
-    parser.add_argument("--input", "-i", default=DEFAULT_MASTER_CSV, help="Path to cleaned Master CSV.")
-    parser.add_argument("--inspect", "-p", help="Inspect a specific Project ID.")
-    parser.add_argument("--map", metavar="PID", help="Generate interactive map for a specific Project ID and open in browser.")
-    parser.add_argument("--map-all", action="store_true", help="Generate interactive map for all projects and open in browser.")
-    parser.add_argument("--output-map", "-o", help="Custom output path for generated HTML map.")
-    parser.add_argument("--no-open", action="store_true", help="Do not automatically open map in browser.")
-    parser.add_argument("--dist", help="Filter --map-all to a specific Caltrans District (e.g. '4').")
-    parser.add_argument("--no-stations", action="store_true", help="Do not include PeMS VDS station detector layers on single-project map.")
-    parser.add_argument("--include-stations", action="store_true", help="Include PeMS VDS station detector layers on multi-project map (--map-all).")
-    parser.add_argument("--station-buffer", type=float, default=3.0, help="Corridor postmile buffer in miles for nearby stations on the map (default: 3.0 mi).")
-    parser.add_argument("--map-station-types", default=None, help="Comma-separated station types to include on the map (default: all types partitioned by layer).")
-    parser.add_argument("--list-urls", action="store_true", help="List generated PeMS URLs for projects.")
-    parser.add_argument("--test-login", action="store_true", help="Test PeMS login credentials.")
-    parser.add_argument("--census", action="store_true", help="Search closest Census stations.")
-    parser.add_argument("--match-stations", action="store_true", help="Match active PeMS VDS stations to highway corridors and compare against sheet.")
-    parser.add_argument("--dry-run", action="store_true", default=None, help="Perform comparison in dry-run mode without modifying CSV (default: True).")
-    parser.add_argument("--apply", action="store_true", help="Apply updates to master CSV (disables dry-run; creates automated backup).")
-    parser.add_argument("--output-report", help="Save comparison report to CSV or Markdown file.")
-    parser.add_argument("--output-csv", help="Custom output path for updated master CSV when using --apply.")
-    parser.add_argument("--download-station", "-s", metavar="STATION_ID", help="Download detector data from PeMS for a specific station ID across all available years into the working directory.")
-    parser.add_argument("--download-project", metavar="PID", help="Download detector data from PeMS for all stations associated with a project ID.")
-    parser.add_argument("--data-type", default="flow", choices=["flow", "occ", "speed", "vmt", "vht", "delay", "aadt"], help="Data quantity to download from PeMS (default: 'flow').")
-    parser.add_argument("--granularity", default="month", choices=["month", "day", "hour", "week", "year", "5min"], help="Time granularity for detector time-series data (default: 'month').")
-    parser.add_argument("--export-format", "--format", "-f", dest="export_format", default="text", choices=["text", "xls", "xlsx"], help="Export format for downloaded PeMS files: 'text' (default) or 'xls'/'xlsx' (queries PeMS with native export=xls).")
-    parser.add_argument("--start-year", type=int, default=1999, help="Earliest year to query (default: 1999).")
-    parser.add_argument("--end-year", type=int, default=None, help="Latest year to query (default: current calendar year).")
-    parser.add_argument("--output-dir", default=".", help="Directory to save downloaded files (default: current working directory '.').")
-    parser.add_argument("--no-combine", action="store_true", help="Do not create a consolidated master CSV file across all years.")
-    parser.add_argument("--overwrite", action="store_true", help="Re-download and overwrite existing files even if already on disk.")
-    parser.add_argument("--station-types", default="ML,HV", help="Comma-separated station types to include for matching (default: 'ML,HV'). Use 'ALL' for all types.")
-    parser.add_argument("--buffer", type=float, default=0.1, help="Postmile buffer tolerance in miles (default: 0.1).")
-    parser.add_argument("--metadata-dir", help="Custom directory containing PeMS metadata text files.")
-    parser.add_argument("--route", "-r", help="Freeway route number for ad-hoc query.")
-    parser.add_argument("--dir", "-d", help="Freeway direction (N/S/E/W) for ad-hoc query.")
-    parser.add_argument("--begin-pm", type=float, help="Begin postmile for ad-hoc query.")
-    parser.add_argument("--end-pm", type=float, help="End postmile for ad-hoc query.")
-    parser.add_argument("--county", "-c", help="County for ad-hoc query.")
 
-    args = parser.parse_args()
+    # 1. Primary Actions & Target
+    act_group = parser.add_argument_group("Primary Actions & Target")
+    act_group.add_argument(
+        "--project", "-p", "--inspect",
+        dest="project",
+        metavar="PID",
+        help="Target Project ID. Default action is project inspection. Can also be combined with --slices, --imagery, --map, or --download."
+    )
+    act_group.add_argument(
+        "--slices", "--corridor-slices",
+        dest="slices",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PID",
+        help="Generate high-resolution (Zoom 19) corridor slices with curtain-slider HTML comparison report (e.g. --slices 400000680 or -p 400000680 --slices)."
+    )
+    act_group.add_argument(
+        "--imagery",
+        dest="imagery",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PID",
+        help="Download historical satellite imagery before and after construction (e.g. --imagery 400000680 or -p 400000680 --imagery)."
+    )
+    act_group.add_argument(
+        "--map",
+        dest="map",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PID",
+        help="Generate interactive HTML map for a project (e.g. --map 400000680 or -p 400000680 --map)."
+    )
+    act_group.add_argument(
+        "--map-all",
+        action="store_true",
+        help="Generate interactive HTML map for all projects statewide (or filtered by --dist)."
+    )
+    act_group.add_argument(
+        "--download", "--download-project",
+        dest="download_project",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PID",
+        help="Download PeMS detector time-series data for all stations in a project across all years."
+    )
+    act_group.add_argument(
+        "--station", "-s", "--download-station",
+        dest="download_station",
+        metavar="STATION_ID",
+        help="Download detector time-series data from PeMS for a specific station ID across all years."
+    )
+    act_group.add_argument(
+        "--audit", "--match-stations",
+        dest="match_stations",
+        action="store_true",
+        help="Audit and match active PeMS VDS stations along corridors against spreadsheet sensors."
+    )
+    act_group.add_argument(
+        "--list-urls",
+        action="store_true",
+        help="List generated PeMS URLs for projects."
+    )
+    act_group.add_argument(
+        "--test-login",
+        action="store_true",
+        help="Test PeMS portal login credentials."
+    )
 
+    # 2. Imagery & Corridor Slices Options
+    img_group = parser.add_argument_group("Imagery & Corridor Slices Options")
+    img_group.add_argument(
+        "--period", "--imagery-period",
+        dest="imagery_period",
+        default="both",
+        choices=["before", "after", "both"],
+        help="Imagery period relative to project construction: 'before', 'after', or 'both' (default: 'both')."
+    )
+    img_group.add_argument(
+        "--date", "--imagery-date",
+        dest="imagery_date",
+        help="Specific custom date (YYYY-MM-DD) for imagery retrieval."
+    )
+    img_group.add_argument(
+        "--zoom", "--imagery-zoom",
+        dest="imagery_zoom",
+        type=int,
+        default=None,
+        help="Force specific zoom level (1-19) for satellite imagery."
+    )
+    img_group.add_argument(
+        "--slice-mi",
+        type=float,
+        default=0.4,
+        help="Corridor slice segment length in miles for --slices (default: 0.4 mi)."
+    )
+    img_group.add_argument(
+        "--aligned",
+        action="store_true",
+        help="Rotate and crop single-frame imagery to an aligned highway corridor strip."
+    )
+    img_group.add_argument(
+        "--margin", "--imagery-margin",
+        dest="imagery_margin",
+        type=float,
+        default=150.0,
+        help="Margin around highway segment in meters (default: 150m)."
+    )
+
+    # 3. PeMS Data Download Options
+    dl_group = parser.add_argument_group("PeMS Data Download Options")
+    dl_group.add_argument(
+        "--data-type",
+        default="flow",
+        choices=["flow", "occ", "speed", "vmt", "vht", "delay", "aadt"],
+        help="Data quantity to download from PeMS (default: 'flow')."
+    )
+    dl_group.add_argument(
+        "--granularity",
+        default="month",
+        choices=["month", "day", "hour", "week", "year", "5min"],
+        help="Time granularity for detector time-series data (default: 'month')."
+    )
+    dl_group.add_argument(
+        "--format", "-f", "--export-format",
+        dest="export_format",
+        default="text",
+        choices=["text", "xls", "xlsx"],
+        help="Export format for downloaded PeMS files: 'text' (default) or 'xls'/'xlsx'."
+    )
+    dl_group.add_argument(
+        "--start-year",
+        type=int,
+        default=1999,
+        help="Earliest year to query (default: 1999)."
+    )
+    dl_group.add_argument(
+        "--end-year",
+        type=int,
+        default=None,
+        help="Latest year to query (default: current calendar year)."
+    )
+    dl_group.add_argument(
+        "--no-combine",
+        action="store_true",
+        help="Do not create a consolidated master CSV file across all queried years."
+    )
+    dl_group.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Re-download and overwrite existing files even if already on disk."
+    )
+
+    # 4. Interactive Mapping Options
+    map_group = parser.add_argument_group("Interactive Mapping Options")
+    map_group.add_argument(
+        "--output-map", "-o",
+        dest="output_map",
+        help="Custom output path for generated HTML map."
+    )
+    map_group.add_argument(
+        "--dist",
+        help="Filter --map-all or --audit to a specific Caltrans District (e.g. '4')."
+    )
+    map_group.add_argument(
+        "--no-stations",
+        action="store_true",
+        help="Do not include PeMS VDS station detector layers on single-project map."
+    )
+    map_group.add_argument(
+        "--include-stations",
+        action="store_true",
+        help="Include PeMS VDS station detector layers on multi-project map (--map-all)."
+    )
+    map_group.add_argument(
+        "--station-buffer",
+        type=float,
+        default=3.0,
+        help="Corridor postmile buffer in miles for nearby stations on the map (default: 3.0 mi)."
+    )
+    map_group.add_argument(
+        "--map-station-types",
+        default=None,
+        help="Comma-separated station types to include on the map (default: all types partitioned by layer)."
+    )
+
+    # 5. Corridor Audit & VDS Matching Options
+    audit_group = parser.add_argument_group("Corridor Audit & VDS Matching Options")
+    audit_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=None,
+        help="Perform station comparison in dry-run mode without modifying CSV (default: True)."
+    )
+    audit_group.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply updates to master CSV (disables dry-run; creates automated backup)."
+    )
+    audit_group.add_argument(
+        "--output-report",
+        help="Save comparison report to CSV or Markdown file."
+    )
+    audit_group.add_argument(
+        "--output-csv",
+        help="Custom output path for updated master CSV when using --apply."
+    )
+    audit_group.add_argument(
+        "--station-types",
+        default="ML,HV",
+        help="Comma-separated station types to include for matching (default: 'ML,HV'). Use 'ALL' for all types."
+    )
+    audit_group.add_argument(
+        "--buffer",
+        type=float,
+        default=0.1,
+        help="Postmile buffer tolerance in miles (default: 0.1)."
+    )
+    audit_group.add_argument(
+        "--metadata-dir",
+        help="Custom directory containing PeMS metadata text files."
+    )
+
+    # 6. Ad-Hoc Corridor Query Options
+    adhoc_group = parser.add_argument_group("Ad-Hoc Corridor Query Options")
+    adhoc_group.add_argument("--route", "-r", help="Freeway route number for ad-hoc query.")
+    adhoc_group.add_argument("--dir", "-d", help="Freeway direction (N/S/E/W) for ad-hoc query.")
+    adhoc_group.add_argument("--begin-pm", type=float, help="Begin postmile for ad-hoc query.")
+    adhoc_group.add_argument("--end-pm", type=float, help="End postmile for ad-hoc query.")
+    adhoc_group.add_argument("--county", "-c", help="County for ad-hoc query.")
+    adhoc_group.add_argument("--census", action="store_true", help="Search closest Census stations.")
+
+    # 7. General & Configuration
+    gen_group = parser.add_argument_group("General & Configuration")
+    gen_group.add_argument(
+        "--input", "-i",
+        default=DEFAULT_MASTER_CSV,
+        help="Path to cleaned Master CSV (default: staging/Master_CA_Project_List_Cleaned.csv)."
+    )
+    gen_group.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory to save downloaded files or imagery (default: '.')."
+    )
+    gen_group.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not automatically open generated HTML maps or slice reports in browser."
+    )
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # 1. Credentials check
     if args.test_login:
         print("\n--- Testing PeMS Login ---")
         client = PeMSClient(debug=True)
@@ -3239,37 +4860,7 @@ def main():
             sys.exit(1)
         return
 
-    if args.download_station:
-        download_station_data(
-            station_id=args.download_station,
-            data_type=args.data_type,
-            granularity=args.granularity,
-            start_year=args.start_year,
-            end_year=args.end_year,
-            output_dir=args.output_dir,
-            combine=not args.no_combine,
-            overwrite=args.overwrite,
-            verbose=True,
-            export_format=args.export_format
-        )
-        return
-
-    if args.download_project:
-        download_project_data(
-            project_id=args.download_project,
-            data_type=args.data_type,
-            granularity=args.granularity,
-            start_year=args.start_year,
-            end_year=args.end_year,
-            output_dir=args.output_dir,
-            master_csv_path=args.input if os.path.exists(args.input) else None,
-            combine=not args.no_combine,
-            overwrite=args.overwrite,
-            verbose=True,
-            export_format=args.export_format
-        )
-        return
-
+    # 2. Ad-hoc Query
     if args.route and args.dir and args.begin_pm is not None and args.end_pm is not None:
         print(f"\n--- Ad-hoc Query: Route {args.route} {args.dir} PM {args.begin_pm} - {args.end_pm} ---")
         ref_df = load_geo_reference()
@@ -3285,14 +4876,60 @@ def main():
         print(f"Reference segments in range: {len(stations)}")
         return
 
+    # 3. Station download (by single Station ID)
+    if args.download_station:
+        download_station_data(
+            station_id=args.download_station,
+            data_type=args.data_type,
+            granularity=args.granularity,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            output_dir=args.output_dir,
+            combine=not args.no_combine,
+            overwrite=args.overwrite,
+            verbose=True,
+            export_format=args.export_format
+        )
+        return
+
+    # Verify input Master CSV exists before project-level operations
     if not os.path.exists(args.input):
         print(f"Error: master CSV file not found: {args.input}")
         sys.exit(1)
 
     projects = load_master_csv(args.input)
-    print(f"Loaded {len(projects)} projects from {args.input}")
 
-    # Station matching and comparison pipeline
+    # Resolve target project ID from any argument that provided one
+    target_pid = None
+    if isinstance(args.slices, str):
+        target_pid = args.slices.strip()
+    elif isinstance(args.imagery, str):
+        target_pid = args.imagery.strip()
+    elif isinstance(args.map, str):
+        target_pid = args.map.strip()
+    elif isinstance(args.download_project, str):
+        target_pid = args.download_project.strip()
+    elif args.project:
+        target_pid = str(args.project).strip()
+
+    # 4. Multi-project map
+    if args.map_all:
+        out_file = args.output_map or ("all_ca_projects_map.html" if not args.dist else f"district_{args.dist}_projects_map.html")
+        open_b = not args.no_open
+        st_types = tuple(s.strip() for s in args.map_station_types.split(",")) if args.map_station_types else None
+        m = build_multi_project_map(
+            projects=projects,
+            dist=args.dist,
+            output_path=out_file,
+            open_browser=open_b,
+            include_stations=args.include_stations,
+            station_buffer_mi=args.station_buffer,
+            station_types=st_types,
+        )
+        print(f"\n✓ Generated interactive multi-project map -> {out_file}")
+        return
+
+    # 5. Station matching / corridor audit pipeline
     if args.match_stations:
         is_dry_run = True
         if args.apply:
@@ -3312,13 +4949,63 @@ def main():
             station_types=st_types,
             buffer_mi=args.buffer,
             dist_filter=args.dist,
-            project_id_filter=args.inspect,
+            project_id_filter=target_pid,
             verbose=True
         )
         return
 
+    # 6. Corridor Slices (high-resolution Zoom 19 with interactive report)
+    if args.slices:
+        if not target_pid:
+            print("Error: Please specify a Project ID to generate corridor slices (e.g. -p <PID> --slices or --slices <PID>).")
+            sys.exit(1)
+        out_d = args.output_dir if args.output_dir != "." else os.path.join(WORKSPACE_DIR, "downloads", "imagery")
+        generate_corridor_slices(
+            project_id=target_pid,
+            slice_mi=args.slice_mi,
+            zoom=args.imagery_zoom or 19,
+            output_dir=out_d,
+            master_csv_path=args.input if os.path.exists(args.input) else None,
+            custom_before_date=args.imagery_date if args.imagery_period == "before" else None,
+            custom_after_date=args.imagery_date if args.imagery_period == "after" else None,
+            open_browser=not args.no_open,
+            verbose=True
+        )
+        return
+
+    # 7. Satellite Imagery (single frame or corridor)
+    if args.imagery:
+        if not target_pid:
+            print("Error: Please specify a Project ID for imagery download (e.g. -p <PID> --imagery or --imagery <PID>).")
+            sys.exit(1)
+        out_d = args.output_dir if args.output_dir != "." else os.path.join(WORKSPACE_DIR, "downloads", "imagery")
+        get_project_imagery(
+            project_id=target_pid,
+            period=args.imagery_period,
+            aligned=args.aligned,
+            margin_m=args.imagery_margin,
+            zoom=args.imagery_zoom,
+            output_dir=out_d,
+            master_csv_path=args.input if os.path.exists(args.input) else None,
+            custom_date=args.imagery_date,
+            corridor_slices=False,
+            slice_mi=args.slice_mi,
+            open_browser=not args.no_open,
+            verbose=True
+        )
+        return
+
+    # 8. Single Project Map
     if args.map:
-        target_pid = str(args.map).strip()
+        if not target_pid:
+            print("Error: Please specify a Project ID for map generation (e.g. -p <PID> --map or --map <PID>).")
+            sys.exit(1)
+        matched = [p for p in projects if p.project_id == target_pid]
+        if matched and matched[0].project_description:
+            wrapped = textwrap.fill(matched[0].project_description, width=68, initial_indent="  Description:        ", subsequent_indent="                      ")
+            print(f"\n[Project {target_pid}]")
+            print(wrapped)
+
         out_file = args.output_map or f"route_map_{target_pid}.html"
         open_b = not args.no_open
         st_types = tuple(s.strip() for s in args.map_station_types.split(",")) if args.map_station_types else None
@@ -3336,24 +5023,28 @@ def main():
         print(f"\n✓ Generated interactive map for Project {target_pid} -> {out_file}")
         return
 
-    if args.map_all:
-        out_file = args.output_map or ("all_ca_projects_map.html" if not args.dist else f"district_{args.dist}_projects_map.html")
-        open_b = not args.no_open
-        st_types = tuple(s.strip() for s in args.map_station_types.split(",")) if args.map_station_types else None
-        m = build_multi_project_map(
-            projects=projects,
-            dist=args.dist,
-            output_path=out_file,
-            open_browser=open_b,
-            include_stations=args.include_stations,
-            station_buffer_mi=args.station_buffer,
-            station_types=st_types,
+    # 9. Download project detector data
+    if args.download_project:
+        if not target_pid:
+            print("Error: Please specify a Project ID for detector download (e.g. -p <PID> --download or --download <PID>).")
+            sys.exit(1)
+        download_project_data(
+            project_id=target_pid,
+            data_type=args.data_type,
+            granularity=args.granularity,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            output_dir=args.output_dir,
+            master_csv_path=args.input if os.path.exists(args.input) else None,
+            combine=not args.no_combine,
+            overwrite=args.overwrite,
+            verbose=True,
+            export_format=args.export_format
         )
-        print(f"\n✓ Generated interactive multi-project map -> {out_file}")
         return
 
-    if args.inspect:
-        target_pid = str(args.inspect).strip()
+    # 10. Project Inspection (default action when target_pid is provided without other action flags)
+    if target_pid:
         matched = [p for p in projects if p.project_id == target_pid]
         if not matched:
             print(f"Error: Project ID '{target_pid}' not found.")
@@ -3367,6 +5058,14 @@ def main():
             print("\n" + "=" * 70)
             print(f"PROJECT INSPECTION: {proj.project_id} (Direction: {proj.direction}) [Match {idx+1}/{len(matched)}]")
             print("=" * 70)
+            if proj.project_description:
+                wrapped_desc = textwrap.fill(
+                    proj.project_description,
+                    width=68,
+                    initial_indent="  Description:        ",
+                    subsequent_indent="                      "
+                )
+                print(wrapped_desc)
             print(f"  Route & Dir:        Route {proj.route} {proj.direction} (PeMS dir: {proj.pems_direction})")
             print(f"  District & County:  Dist {proj.dist}, {proj.county} ({proj.state})")
             print(f"  Postmiles:          Begin: {proj.begin_pm} | End: {proj.end_pm}")
@@ -3421,18 +5120,24 @@ def main():
             print("=" * 70)
         return
 
+    # 11. List URLs
     if args.list_urls:
         print("\nListing PeMS URLs for first 5 projects:")
         for proj in projects[:5]:
             builder = ProjectPeMSQueryBuilder(proj)
             urls = builder.generate_all_urls()
             print(f"\n[{proj.project_id}] {urls['corridor']}")
+            if proj.project_description:
+                short_desc = proj.project_description if len(proj.project_description) <= 80 else proj.project_description[:77] + "..."
+                print(f"  Description: {short_desc}")
             print(f"  Lane Config: {urls['lane_config_url']}")
             if proj.sensor_stations:
                 print(f"  Sensors ({len(proj.sensor_stations)}): {', '.join(proj.sensor_stations)}")
-        print(f"\n... (use --inspect <PID> to view full details for any project)")
+        print(f"\n... (use -p <PID> to inspect full details for any project)")
         return
 
+    # 12. Default summary
+    print(f"Loaded {len(projects)} projects from {args.input}")
     print("\nSummary of projects by District:")
     df_p = pd.DataFrame([{
         "PID": p.project_id,
@@ -3443,7 +5148,14 @@ def main():
         "Sensors": len(p.sensor_stations)
     } for p in projects])
     print(df_p.groupby("Dist").agg(projects=("PID", "count"), routes=("Route", "nunique"), sensors=("Sensors", "sum")))
-    print("\nReady! Use --inspect <PID> to inspect project URLs, or --test-login to verify PeMS access.")
+    print("\nQuick Start Guide:")
+    print("  Inspect a project:              python pems_interface.py -p <PID>")
+    print("  High-res corridor slices:       python pems_interface.py -p <PID> --slices")
+    print("  Satellite imagery:              python pems_interface.py -p <PID> --imagery")
+    print("  Interactive map:                python pems_interface.py -p <PID> --map")
+    print("  Download detector data:         python pems_interface.py -p <PID> --download")
+    print("  Audit detector stations:        python pems_interface.py --audit")
+    print("\nRun with --help to see all options.")
 
 
 if __name__ == "__main__":

@@ -65,6 +65,33 @@ def parse_num(val):
             return 0.0
     return 0.0
 
+def parse_other_lane(val):
+    """
+    Parse qualitative and quantitative strings in 'Number of other lane'.
+    Returns:
+      (directional_lanes: float, shared_median_lanes: float, is_ramp: bool)
+    """
+    if not val:
+        return 0.0, 0.0, False
+    s = str(val).strip().lower()
+    if not s or s == "nan" or s == "0" or s == "0.0":
+        return 0.0, 0.0, False
+    
+    # Check for shared median / TWLTL (center turn lanes are not directional through lanes)
+    if any(k in s for k in ['shared median', 'two-way left', 'twltl', 'center turn']):
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        n = float(m.group(0)) if m else 1.0
+        return 0.0, n, False
+
+    # Check for ramps / non-mainline
+    if 'ramp' in s or 'connector' in s:
+        return 0.0, 0.0, True
+
+    # Mainline directional lanes: Auxiliary, Truck Climbing, or plain number
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    n = float(m.group(0)) if m else 0.0
+    return n, 0.0, False
+
 def clean_dataset():
     df = pd.read_csv(RAW_CSV, dtype=str).fillna("")
     print(f"Read {len(df)} rows from {RAW_CSV}")
@@ -218,13 +245,13 @@ def clean_dataset():
         gp_b = parse_num(r.get('Number of GP Lanes Before Expansion', '0'))
         hov_b = parse_num(r.get('Number of HOV Lanes Before Expansion', '0'))
         hot_b = parse_num(r.get('Number of HOT Lanes Before Expansion', '0'))
-        oth_b = parse_num(r.get('Number of other lane before (specific)', '0'))
-        dir_b = int(round(gp_b + hov_b + hot_b + oth_b))
+        oth_b_dir, oth_b_shared, _ = parse_other_lane(r.get('Number of other lane before (specific)', '0'))
+        dir_b = int(round(gp_b + hov_b + hot_b + oth_b_dir))
         
         gp_a = parse_num(r.get('Number of GP Lanes After Expansion', '0'))
         hov_a = parse_num(r.get('Number of HOV Lanes After Expansion', '0'))
         hot_a = parse_num(r.get('Number of HOT Lanes After Expansion', '0'))
-        oth_a = parse_num(r.get('Number of other lane after (specific)', '0'))
+        oth_a_dir, oth_a_shared, _ = parse_other_lane(r.get('Number of other lane after (specific)', '0'))
         # Reconcile project-specific lane entry anomalies
         if pid == '414000032':
             # Project description explicitly states 6 lanes total (3 in each direction, 0 HOV).
@@ -232,7 +259,7 @@ def clean_dataset():
             hov_a = 0.0
             r['Number of HOV Lanes After Expansion'] = '0'
 
-        dir_a = int(round(gp_a + hov_a + hot_a + oth_a))
+        dir_a = int(round(gp_a + hov_a + hot_a + oth_a_dir))
 
         if dir_b > 0:
             r['dir_lanes_before'] = str(dir_b)
@@ -282,6 +309,45 @@ def clean_dataset():
         for c in list(r.keys()):
             if 'Sensor' in c and isinstance(r[c], str):
                 r[c] = r[c].strip()
+
+        # Format Sensor Activation Dates (convert Excel serial numbers like '44748' to ISO 'YYYY-MM-DD')
+        for s_num in [1, 2, 3]:
+            act_col = f'Sensor {s_num} Activation Date for New Lane'
+            yr_col = f's{s_num}_new_lane_year'
+            mo_col = f's{s_num}_new_lane_month'
+            dy_col = f's{s_num}_new_lane_day'
+            
+            act_val = str(r.get(act_col, '')).strip()
+            if act_val and act_val != 'nan':
+                iso_d, yr_p, mo_p, dy_p = parse_excel_date(act_val)
+                if iso_d and re.match(r"^\d{4}-\d{2}-\d{2}$", iso_d):
+                    r[act_col] = iso_d
+                elif not iso_d:
+                    y_str = str(r.get(yr_col, '')).replace('.0', '').strip()
+                    m_str = str(r.get(mo_col, '')).replace('.0', '').strip()
+                    d_str = str(r.get(dy_col, '')).replace('.0', '').strip()
+                    if y_str.isdigit() and m_str.isdigit() and int(m_str) in range(1, 13):
+                        y_int = int(y_str)
+                        m_int = int(m_str)
+                        d_int = int(d_str) if d_str.isdigit() and int(d_str) in range(1, 32) else 1
+                        try:
+                            dt = datetime.date(y_int, m_int, d_int)
+                            r[act_col] = dt.strftime("%Y-%m-%d")
+                        except ValueError:
+                            pass
+            else:
+                y_str = str(r.get(yr_col, '')).replace('.0', '').strip()
+                m_str = str(r.get(mo_col, '')).replace('.0', '').strip()
+                d_str = str(r.get(dy_col, '')).replace('.0', '').strip()
+                if y_str.isdigit() and m_str.isdigit() and int(m_str) in range(1, 13):
+                    y_int = int(y_str)
+                    m_int = int(m_str)
+                    d_int = int(d_str) if d_str.isdigit() and int(d_str) in range(1, 32) else 1
+                    try:
+                        dt = datetime.date(y_int, m_int, d_int)
+                        r[act_col] = dt.strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
 
         # --- SENSORS & HOV SEPARATION ---
         s1 = r.get('Sensor Station 1 ID ', '').strip()
@@ -356,10 +422,23 @@ def clean_dataset():
             idx = indices[0]
             b = parse_num(clean_df.at[idx, 'dir_lanes_before'])
             a = parse_num(clean_df.at[idx, 'dir_lanes_after'])
+            delta = a - b
+            desc_lower = clean_df.at[idx, 'Project Description'].lower()
+            exp_dir = str(clean_df.at[idx, 'Expansion Direction ']).lower()
+            both_dirs = ('both directions' in desc_lower or 'each direction' in desc_lower or 'both' in exp_dir or 'bi-directional' in desc_lower)
+
             if b > 0:
-                clean_df.at[idx, 'total_lanes_before'] = str(int(b * 2))
+                tot_b = b * 2
+                clean_df.at[idx, 'total_lanes_before'] = str(int(tot_b))
+            else:
+                tot_b = parse_num(clean_df.at[idx, 'total_lanes_before'])
+
             if a > 0:
-                clean_df.at[idx, 'total_lanes_after'] = str(int(a * 2))
+                if both_dirs:
+                    tot_a = tot_b + (delta * 2) if tot_b > 0 else a * 2
+                else:
+                    tot_a = tot_b + delta if tot_b > 0 else a
+                clean_df.at[idx, 'total_lanes_after'] = str(int(tot_a))
 
     clean_df.to_csv(CLEAN_CSV, index=False)
     print(f"Saved cleaned CSV to {CLEAN_CSV} with {len(clean_df)} rows and {len(clean_df.columns)} columns")

@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import urllib.parse
 import os
 import glob
+import datetime
 import pandas as pd
 import numpy as np
 import folium
@@ -1276,6 +1277,283 @@ class TestBatchDownloadEngine(unittest.TestCase):
         finally:
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir)
+
+
+class TestProjectImagery(unittest.TestCase):
+    def test_parse_project_date(self):
+        # Full ISO string
+        self.assertEqual(pems_interface._parse_project_date("2020-06-01"), datetime.date(2020, 6, 1))
+        # Year only
+        self.assertEqual(pems_interface._parse_project_date("2019", 1, 1), datetime.date(2019, 1, 1))
+        self.assertEqual(pems_interface._parse_project_date("2019", 12, 31), datetime.date(2019, 12, 31))
+        # Slash format
+        self.assertEqual(pems_interface._parse_project_date("04/15/2018"), datetime.date(2018, 4, 15))
+        # Empty / None
+        self.assertIsNone(pems_interface._parse_project_date(None))
+        self.assertIsNone(pems_interface._parse_project_date(""))
+        self.assertIsNone(pems_interface._parse_project_date("nan"))
+
+    def test_get_project_imagery_invalid_pid(self):
+        with self.assertRaises(ValueError):
+            pems_interface.get_project_imagery("9999999999999_invalid")
+
+    @unittest.mock.patch("wayback_imagery.core.generate_image")
+    def test_get_project_imagery_mocked(self, mock_gen):
+        mock_gen.return_value = {
+            "path": "/mock/path.png",
+            "capture_date": "2018-09-06",
+            "release_date": "2019-06-26",
+            "zoom": 17,
+        }
+        res = pems_interface.get_project_imagery("313000020", period="both", verbose=False)
+        self.assertIn("before", res["imagery"])
+        self.assertIn("after", res["imagery"])
+        self.assertEqual(res["project_id"], "313000020")
+        self.assertEqual(mock_gen.call_count, 2)
+
+    def test_slice_project_corridor(self):
+        projects = pems_interface.load_master_csv()
+        p = next(p for p in projects if p.project_id == "313000020")
+        slices = pems_interface.slice_project_corridor(p, slice_mi=0.4)
+        self.assertGreaterEqual(len(slices), 3)
+        self.assertEqual(slices[0]["index"], 1)
+        self.assertIn("start_coords", slices[0])
+        self.assertIn("end_coords", slices[0])
+        self.assertGreater(slices[0]["length_mi"], 0)
+
+
+class TestCLIAndProjectDescription(unittest.TestCase):
+    """Tests verifying the streamlined CLI parsing and comprehensive project description display."""
+
+    def test_parse_master_row_extracts_project_description(self):
+        row = {
+            "Project ID": "123456",
+            "Dist": "4",
+            "Route": "101",
+            "Direction": "NB",
+            "Begin PM": "1.0",
+            "End PM": "2.0",
+            "Project Description": "Widen freeway from 4 to 6 lanes with HOV facility."
+        }
+        rec = pems_interface.parse_master_row(row)
+        self.assertEqual(rec.project_description, "Widen freeway from 4 to 6 lanes with HOV facility.")
+
+    def test_parse_master_row_handles_missing_description(self):
+        for val in ["", "nan", "None", None]:
+            row = {
+                "Project ID": "123456",
+                "Dist": "4",
+                "Route": "101",
+                "Direction": "NB",
+                "Begin PM": "1.0",
+                "End PM": "2.0",
+                "Project Description": val
+            }
+            rec = pems_interface.parse_master_row(row)
+            self.assertEqual(rec.project_description, "")
+
+    def test_parser_target_project_options(self):
+        parser = pems_interface.build_parser()
+
+        # -p PID
+        args = parser.parse_args(["-p", "400000680"])
+        self.assertEqual(args.project, "400000680")
+        self.assertFalse(args.slices)
+        self.assertFalse(args.imagery)
+        self.assertFalse(args.map)
+
+        # --project PID
+        args = parser.parse_args(["--project", "400000680"])
+        self.assertEqual(args.project, "400000680")
+
+        # --inspect PID (backward compatibility)
+        args = parser.parse_args(["--inspect", "400000680"])
+        self.assertEqual(args.project, "400000680")
+
+    def test_parser_slices_options(self):
+        parser = pems_interface.build_parser()
+
+        # -p PID --slices
+        args = parser.parse_args(["-p", "400000680", "--slices"])
+        self.assertEqual(args.project, "400000680")
+        self.assertTrue(args.slices)
+
+        # --slices PID
+        args = parser.parse_args(["--slices", "400000680"])
+        self.assertEqual(args.slices, "400000680")
+
+        # --corridor-slices PID (backward compatibility)
+        args = parser.parse_args(["--corridor-slices", "400000680"])
+        self.assertEqual(args.slices, "400000680")
+
+    def test_parser_imagery_options(self):
+        parser = pems_interface.build_parser()
+
+        # -p PID --imagery
+        args = parser.parse_args(["-p", "400000680", "--imagery"])
+        self.assertEqual(args.project, "400000680")
+        self.assertTrue(args.imagery)
+
+        # --imagery PID
+        args = parser.parse_args(["--imagery", "400000680"])
+        self.assertEqual(args.imagery, "400000680")
+
+        # aliases
+        args = parser.parse_args(["--imagery", "400000680", "--period", "before", "--date", "2018-05-01", "--zoom", "17", "--margin", "200"])
+        self.assertEqual(args.imagery_period, "before")
+        self.assertEqual(args.imagery_date, "2018-05-01")
+        self.assertEqual(args.imagery_zoom, 17)
+        self.assertEqual(args.imagery_margin, 200.0)
+
+    def test_parser_download_options(self):
+        parser = pems_interface.build_parser()
+
+        # -p PID --download
+        args = parser.parse_args(["-p", "400000680", "--download"])
+        self.assertEqual(args.project, "400000680")
+        self.assertTrue(args.download_project)
+
+        # --download PID
+        args = parser.parse_args(["--download", "400000680"])
+        self.assertEqual(args.download_project, "400000680")
+
+        # --download-project PID (backward compatibility)
+        args = parser.parse_args(["--download-project", "400000680"])
+        self.assertEqual(args.download_project, "400000680")
+
+        # Station download aliases
+        args = parser.parse_args(["-s", "404534", "--format", "xlsx"])
+        self.assertEqual(args.download_station, "404534")
+        self.assertEqual(args.export_format, "xlsx")
+
+        args = parser.parse_args(["--station", "404534"])
+        self.assertEqual(args.download_station, "404534")
+
+    def test_parser_audit_options(self):
+        parser = pems_interface.build_parser()
+
+        args = parser.parse_args(["--audit", "--dist", "4"])
+        self.assertTrue(args.match_stations)
+        self.assertEqual(args.dist, "4")
+
+        args = parser.parse_args(["--match-stations", "-p", "400000680"])
+        self.assertTrue(args.match_stations)
+        self.assertEqual(args.project, "400000680")
+
+    def test_inspect_output_includes_description(self):
+        import io
+        from unittest.mock import patch
+
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            pems_interface.main(["-p", "400000680"])
+        out = captured.getvalue()
+        self.assertIn("PROJECT INSPECTION: 400000680", out)
+        self.assertIn("Description:", out)
+        self.assertIn("In San Mateo County", out)
+
+    def test_generate_slices_html_report_includes_description(self):
+        proj = pems_interface.ProjectRecord(
+            project_id="TEST_DESC_01",
+            dist="4",
+            county="San Francisco",
+            state="CA",
+            route="101",
+            direction="NB",
+            begin_pm="1.0",
+            end_pm="2.0",
+            construction_begin_date="2018-01-01",
+            open_to_traffic_date="2020-01-01",
+            project_description="Add aux lane and ramp metering on Route 101."
+        )
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            before_meta = {"release": {"release_id": "r1"}, "capture_date": "2017-06-01"}
+            after_meta = {"release": {"release_id": "r2"}, "capture_date": "2021-06-01"}
+            html_out = pems_interface.generate_slices_html_report(
+                project=proj,
+                slices_data=[],
+                before_meta=before_meta,
+                after_meta=after_meta,
+                output_dir=tmp_dir
+            )
+            with open(html_out, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("Project Description:", content)
+            self.assertIn("Add aux lane and ramp metering on Route 101.", content)
+
+
+    def test_lane_counts_accuracy_713000217_and_twltl(self):
+        """Proof: Projects with shared median turn lanes (like 713000217 and 800000609) have correct 2 dir / 4 total lanes."""
+        csv_path = pems_interface.DEFAULT_MASTER_CSV
+        df = pd.read_csv(csv_path, dtype=str).fillna("")
+        
+        # PID 713000217 (SR 138 Littlerock: widen from 2 to 4 lanes with shared center turn lane)
+        r7 = df[df["Project ID"].str.strip() == "713000217"]
+        self.assertEqual(len(r7), 2)
+        for _, row in r7.iterrows():
+            self.assertEqual(row["dir_lanes_before"].split(".")[0], "1")
+            self.assertEqual(row["dir_lanes_after"].split(".")[0], "2")
+            self.assertEqual(row["total_lanes_before"].split(".")[0], "2")
+            self.assertEqual(row["total_lanes_after"].split(".")[0], "4")
+
+        # PID 800000609 (SR 138 Phelan: widen from 2 to 4 lanes with two-way left turn)
+        r8 = df[df["Project ID"].str.strip() == "800000609"]
+        self.assertEqual(len(r8), 2)
+        for _, row in r8.iterrows():
+            self.assertEqual(row["dir_lanes_before"].split(".")[0], "1")
+            self.assertEqual(row["dir_lanes_after"].split(".")[0], "2")
+            self.assertEqual(row["total_lanes_before"].split(".")[0], "2")
+            self.assertEqual(row["total_lanes_after"].split(".")[0], "4")
+
+    def test_sensor_activation_dates_formatted_properly(self):
+        """Proof: Sensor activation dates are formatted ISO YYYY-MM-DD and not unformatted Excel integers like 44748."""
+        csv_path = pems_interface.DEFAULT_MASTER_CSV
+        df = pd.read_csv(csv_path, dtype=str).fillna("")
+
+        # PID 300020420 (Excel date serial 44748 -> 2022-07-06)
+        r3 = df[df["Project ID"].str.strip() == "300020420"]
+        self.assertFalse(r3.empty)
+        act_date = r3.iloc[0]["Sensor 1 Activation Date for New Lane"]
+        self.assertEqual(act_date, "2022-07-06")
+
+        # Verify no 5-digit Excel serial numbers remain in Sensor 1 Activation Date column
+        for idx, row in df.iterrows():
+            val = row.get("Sensor 1 Activation Date for New Lane", "").strip()
+            if val and val.isdigit() and len(val) == 5:
+                self.fail(f"Found unformatted Excel serial date '{val}' at row {idx} for PID {row.get('Project ID')}")
+
+    def test_apply_station_updates_formats_dates_and_avoids_misplacement(self):
+        """Proof: apply_station_updates_to_dataframe formats Excel date serials and does not misplace values."""
+        df_dummy = pd.DataFrame([{
+            "Project ID": "300020420",
+            "Direction": "EB",
+            "Number of Active Non-Ramp Sensors": "2",
+            "Sensor Station 1 ID ": "314000",
+            "Sensor Station 1: number of lanes after": "2",
+            "Sensor Station 1 Type": "VDS",
+            "Sensor Station 1 Name": "Old Station",
+            "Sensor 1 Activation Date for New Lane": "44748",
+            "Sensor Station 2 ID ": "314001",
+            "Sensor Station 2: number of lanes after": "2"
+        }])
+
+        st_new = pems_interface.VDSStationRecord(
+            id="3047131", fwy="80", dir="EB", district="3", county="Placer", city="Colfax",
+            state_pm="37.0", abs_pm=138.0, latitude=39.13, longitude=-120.91, length=0.5,
+            type="ML", lanes=2, name="Secret Town"
+        )
+        comp = pems_interface.StationComparisonResult(
+            project_id="300020420", route="80", direction="EB", district="3", county="Placer",
+            begin_pm="35.1", end_pm="38.3", abs_begin_pm=136.6, abs_end_pm=139.8,
+            existing_stations=["314000", "314001"], found_stations=[st_new], matched_stations=[],
+            missing_in_sheet=[], discrepancies=[], status="EXACT_MATCH", sheet_sensor_count=2, found_sensor_count=1
+        )
+
+        res = pems_interface.apply_station_updates_to_dataframe(df_dummy, [comp])
+        self.assertEqual(res.at[0, "Sensor Station 1 ID "], "3047131")
+        self.assertEqual(res.at[0, "Sensor 1 Activation Date for New Lane"], "2022-07-06")
+        self.assertEqual(res.at[0, "Sensor Station 2 ID "], "")
 
 
 if __name__ == "__main__":

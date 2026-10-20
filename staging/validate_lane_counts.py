@@ -13,6 +13,22 @@ def parse_num(val):
     m = re.search(r"[-+]?\d*\.?\d+", val_str)
     return float(m.group(0)) if m else 0.0
 
+def parse_other_lane(val):
+    if not val:
+        return 0.0, 0.0, False
+    s = str(val).strip().lower()
+    if not s or s == "nan" or s == "0" or s == "0.0":
+        return 0.0, 0.0, False
+    if any(k in s for k in ['shared median', 'two-way left', 'twltl', 'center turn']):
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        n = float(m.group(0)) if m else 1.0
+        return 0.0, n, False
+    if 'ramp' in s or 'connector' in s:
+        return 0.0, 0.0, True
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    n = float(m.group(0)) if m else 0.0
+    return n, 0.0, False
+
 def validate_lanes():
     df = pd.read_csv(CLEAN_CSV, dtype=str).fillna("")
     print(f"Loaded {len(df)} rows from {CLEAN_CSV}")
@@ -29,15 +45,17 @@ def validate_lanes():
         gp_b = parse_num(r.get('Number of GP Lanes Before Expansion', '0'))
         hov_b = parse_num(r.get('Number of HOV Lanes Before Expansion', '0'))
         hot_b = parse_num(r.get('Number of HOT Lanes Before Expansion', '0'))
-        oth_b = parse_num(r.get('Number of other lane before (specific)', '0'))
-        sum_b = gp_b + hov_b + hot_b + oth_b
+        oth_b = r.get('Number of other lane before (specific)', '0')
+        oth_b_dir, oth_b_shared, _ = parse_other_lane(oth_b)
+        sum_b = gp_b + hov_b + hot_b + oth_b_dir
         
         # Sub-category after lanes
         gp_a = parse_num(r.get('Number of GP Lanes After Expansion', '0'))
         hov_a = parse_num(r.get('Number of HOV Lanes After Expansion', '0'))
         hot_a = parse_num(r.get('Number of HOT Lanes After Expansion', '0'))
-        oth_a = parse_num(r.get('Number of other lane after (specific)', '0'))
-        sum_a = gp_a + hov_a + hot_a + oth_a
+        oth_a = r.get('Number of other lane after (specific)', '0')
+        oth_a_dir, oth_a_shared, _ = parse_other_lane(oth_a)
+        sum_a = gp_a + hov_a + hot_a + oth_a_dir
         
         # Filled directional columns
         dir_b_val = parse_num(r.get('dir_lanes_before', '0'))
@@ -99,6 +117,17 @@ def validate_lanes():
         if added_lm > 0 and dir_a_val > 0 and dir_b_val > 0:
             if dir_a_val <= dir_b_val:
                 issues.append(f"Capacity expansion added {added_lm} lane-miles, but dir_lanes_after ({dir_a_val}) <= dir_lanes_before ({dir_b_val})")
+
+        # Check 6: Explicit description lane count verification (e.g. 'widen from 2 lanes to 4 lanes')
+        desc = r.get('Project Description', '').lower()
+        m_widen = re.search(r"widen .*?from (\d+) lanes? to (\d+) lanes?", desc)
+        if m_widen:
+            exp_b = float(m_widen.group(1))
+            exp_a = float(m_widen.group(2))
+            if tot_b_val > 0 and tot_b_val != exp_b:
+                issues.append(f"Description states {exp_b} lanes before, but total_lanes_before is {tot_b_val}")
+            if tot_a_val > 0 and tot_a_val != exp_a:
+                issues.append(f"Description states {exp_a} lanes after, but total_lanes_after is {tot_a_val}")
                 
         audit_records.append({
             'row': idx,

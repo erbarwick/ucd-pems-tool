@@ -168,6 +168,39 @@ verifies that the returned text contains an actual data table.
 
 ---
 
+## Command-Line Interface (CLI) Quick Reference
+
+The CLI in `pems_interface.py` provides an intuitive, streamlined interface organized around your target project and task. All flags can be combined naturally with `-p <PID>` or passed directly:
+
+```bash
+# 1. INSPECT a project (description, postmiles, dates, sensor stations, and PeMS URLs):
+python pems_interface.py -p 400000680
+
+# 2. HIGH-RES CORRIDOR SLICES (Native Zoom 19 Before/After curtain-wipe comparison report):
+python pems_interface.py -p 400000680 --slices
+
+# 3. SATELLITE IMAGERY (download Before & After full corridor or segment image):
+python pems_interface.py -p 400000680 --imagery
+python pems_interface.py -p 400000680 --imagery --aligned     # Rotated corridor strip
+
+# 4. INTERACTIVE MAP (open project road path and detector stations in browser):
+python pems_interface.py -p 400000680 --map
+python pems_interface.py --map-all                           # All California projects
+
+# 5. DOWNLOAD PeMS DETECTOR DATA:
+python pems_interface.py -p 400000680 --download             # All stations for project
+python pems_interface.py -s 404534                           # Single station across years
+
+# 6. AUDIT SPREADSHEET VS. ACTIVE PeMS DETECTORS:
+python pems_interface.py --audit                             # Dry-run statewide
+python pems_interface.py -p 400000680 --audit                # Audit specific project
+python pems_interface.py --audit --apply                     # Commit updates with backup
+```
+
+> **Note:** All previous commands (such as `--inspect <PID>`, `--download-project <PID>`, `--download-station <SID>`, `--corridor-slices`, and `--match-stations`) remain 100% supported for backward compatibility. Run `python pems_interface.py --help` to see all grouped options and aliases.
+
+---
+
 ## Downloading data from PeMS
 
 ### With the command-line interface (CLI)
@@ -227,10 +260,45 @@ python pems_interface.py --download-station 400001 --data-type aadt
 You can download data for every detector station associated with a specific project ID in the master spreadsheet:
 
 ```bash
-python pems_interface.py --download-project 418000244 --output-dir my_project_data
+# Using the target project flag:
+python pems_interface.py -p 418000244 --download --output-dir my_project_data
+
+# Or directly:
+python pems_interface.py --download 418000244 --output-dir my_project_data
 ```
 
 This creates a project folder containing subfolders for each sensor station, with raw annual text exports and merged CSVs.
+
+---
+
+### Downloading historical satellite imagery (Before & After)
+
+You can download and stitch historical aerial/satellite imagery from the Esri Wayback archive for any project:
+
+```bash
+# Download both BEFORE (pre-construction) and AFTER (post-opening) imagery
+python pems_interface.py -p 218000125 --imagery
+
+# Download only pre-construction imagery
+python pems_interface.py -p 218000125 --imagery --period before
+
+# Download aligned corridor imagery (rotated horizontally along highway alignment)
+python pems_interface.py -p 218000125 --imagery --aligned
+
+# Download imagery for a custom date
+python pems_interface.py -p 218000125 --imagery --date 2019-06-01
+
+# High-Resolution (Native Zoom 19) Slices with Interactive Curtain-Wipe HTML Report:
+python pems_interface.py -p 313000020 --slices
+
+# Customize slice length (e.g. 0.25 miles for winding corridors)
+python pems_interface.py -p 313000020 --slices --slice-mi 0.25
+```
+
+When using `--corridor-slices`, the tool creates an organized folder per project containing:
+- `01_PM..._stacked.png`: Native Zoom 19 (~0.3m / 11 in per pixel) vertically stacked Before/After comparison images with road geometry aligned pixel-for-pixel.
+- `index.html`: A self-contained, interactive HTML comparison report with interactive curtain-wipe split sliders, view toggles (wipe, stacked, side-by-side), and PeMS sensor pins along the corridor.
+
 ---
 
 ## 4. Auditing project data
@@ -330,4 +398,8 @@ census_df = pems_interface.find_closest_census_stations(
     route="80", district="4", ca_pm=11.4, top_n=3
 )
 print(census_df[["ID", "CA PM", "Name", "pm_diff"]])
-``` 
+# Download BEFORE and AFTER satellite imagery for a project:
+imagery = pems_interface.get_project_imagery("218000125", period="both")
+print("Before image path:", imagery["imagery"]["before"]["path"])
+print("After image path:", imagery["imagery"]["after"]["path"])
+```

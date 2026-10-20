@@ -46,16 +46,24 @@ def update_total_lanes():
             idx = indices[0]
             b = parse_num(df.at[idx, 'dir_lanes_before'])
             a = parse_num(df.at[idx, 'dir_lanes_after'])
+            delta = a - b
             
-            # Check if undivided highway (e.g. SR 49, SR 70, SR 1)
-            desc = df.at[idx, 'Project Description'].lower()
-            facility = df.at[idx, 'Facility Class'].lower()
-            
-            # If standard divided freeway, total = 2 * dir
+            desc_lower = df.at[idx, 'Project Description'].lower()
+            exp_dir = str(df.at[idx, 'Expansion Direction ']).lower()
+            both_dirs = ('both directions' in desc_lower or 'each direction' in desc_lower or 'both' in exp_dir or 'bi-directional' in desc_lower)
+
             if b > 0:
-                df.at[idx, 'total_lanes_before'] = str(int(b * 2))
+                tot_b = b * 2
+                df.at[idx, 'total_lanes_before'] = str(int(tot_b))
+            else:
+                tot_b = parse_num(df.at[idx, 'total_lanes_before'])
+
             if a > 0:
-                df.at[idx, 'total_lanes_after'] = str(int(a * 2))
+                if both_dirs:
+                    tot_a = tot_b + (delta * 2) if tot_b > 0 else a * 2
+                else:
+                    tot_a = tot_b + delta if tot_b > 0 else a
+                df.at[idx, 'total_lanes_after'] = str(int(tot_a))
                 
     df.to_csv(CLEAN_CSV, index=False)
     print(f"Updated total_lanes in {CLEAN_CSV}")
