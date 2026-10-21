@@ -14,7 +14,10 @@ from hpms_interface import (
     CA_COUNTY_FIPS,
     CA_FIPS_TO_COUNTY,
     HPMS_SPATIAL_ENDPOINTS,
-    HPMS_SECTION_ENDPOINTS
+    HPMS_SECTION_ENDPOINTS,
+    parse_postmile,
+    _fmt_aadt_display,
+    _is_empty_cell
 )
 
 
@@ -284,6 +287,244 @@ class TestHPMSCorridorEngine(unittest.TestCase):
         # Verify backup was created
         backups = [f for f in os.listdir(self.temp_dir.name) if f.startswith("master.csv.bak_")]
         self.assertEqual(len(backups), 1)
+
+
+class TestRobustDataIntegrity(unittest.TestCase):
+    """Test rigorous data integrity guards, edge-case postmiles, strict querying,
+    qualitative cell protection, and direction-aware resolution."""
+
+    def test_parse_postmile(self):
+        # Numeric inputs
+        self.assertEqual(parse_postmile(12.3), (12.3, "12.3"))
+        self.assertEqual(parse_postmile(0.0), (0.0, "0.0"))
+        self.assertEqual(parse_postmile("18.5"), (18.5, "18.5"))
+
+        # Caltrans alignment prefix codes (R, M, L, C, G)
+        self.assertEqual(parse_postmile("R18.1"), (18.1, "R18.1"))
+        self.assertEqual(parse_postmile("M5.0"), (5.0, "M5.0"))
+        self.assertEqual(parse_postmile("L10.5"), (10.5, "L10.5"))
+        self.assertEqual(parse_postmile("C2.3"), (2.3, "C2.3"))
+        self.assertEqual(parse_postmile("G0.8"), (0.8, "G0.8"))
+
+        # Suffixes and explicit 'PM' text
+        self.assertEqual(parse_postmile("PM 50.6"), (50.6, "PM 50.6"))
+        self.assertEqual(parse_postmile("14.2R"), (14.2, "14.2R"))
+        self.assertEqual(parse_postmile("R14.2A"), (14.2, "R14.2A"))
+
+        # Empty, None, NaN
+        self.assertEqual(parse_postmile(None), (None, ""))
+        self.assertEqual(parse_postmile(""), (None, ""))
+        self.assertEqual(parse_postmile("nan"), (None, ""))
+        self.assertEqual(parse_postmile("None"), (None, ""))
+
+    def test_is_empty_cell(self):
+        # Empty cells
+        self.assertTrue(_is_empty_cell(None))
+        self.assertTrue(_is_empty_cell(float("nan")))
+        self.assertTrue(_is_empty_cell(""))
+        self.assertTrue(_is_empty_cell("   "))
+        self.assertTrue(_is_empty_cell("nan"))
+        self.assertTrue(_is_empty_cell("None"))
+        self.assertTrue(_is_empty_cell("0"))
+        self.assertTrue(_is_empty_cell("0.0"))
+        self.assertTrue(_is_empty_cell(0))
+
+        # Non-empty cells containing qualitative researcher notes or values
+        self.assertFalse(_is_empty_cell(16000))
+        self.assertFalse(_is_empty_cell("16000"))
+        self.assertFalse(_is_empty_cell("8,510; 2020 \n 10,000; 2030"))
+        self.assertFalse(_is_empty_cell("ADT: 23,000-36,000"))
+        self.assertFalse(_is_empty_cell("10,000 (2025)"))
+        self.assertFalse(_is_empty_cell("4 lanes (2 HOV)"))
+
+    def test_fmt_aadt_display(self):
+        # Integers and formatted strings
+        self.assertEqual(_fmt_aadt_display(16000), "16,000")
+        self.assertEqual(_fmt_aadt_display("25000"), "25,000")
+        self.assertEqual(_fmt_aadt_display("25000.0"), "25,000")
+        self.assertEqual(_fmt_aadt_display(25000.0), "25,000")
+
+        # Complex archival annotations preserved verbatim
+        raw_note = "8,510; 2020 \n 10,000; 2030"
+        self.assertEqual(_fmt_aadt_display(raw_note), raw_note)
+        raw_range = "23,000-36,000"
+        self.assertEqual(_fmt_aadt_display(raw_range), raw_range)
+
+        # Empty / None
+        self.assertEqual(_fmt_aadt_display(None), "(None)")
+        self.assertEqual(_fmt_aadt_display(""), "(None)")
+        self.assertEqual(_fmt_aadt_display("nan"), "(None)")
+
+    def test_cross_county_inversion_guard(self):
+        """Verify that begin_pm > end_pm within a single county is guarded against false snapping."""
+        temp_dir = tempfile.TemporaryDirectory()
+        ref_csv = os.path.join(temp_dir.name, "ref.csv")
+        df_ref = pd.DataFrame([
+            {"Route": 101, "County": "Santa Clara", "CA PM": "50.6", "Abs PM": 400.0},
+            {"Route": 101, "County": "Santa Clara", "CA PM": "6.3", "Abs PM": 355.6}
+        ])
+        df_ref.to_csv(ref_csv, index=False)
+        engine = HPMSCorridorEngine(ref_path=ref_csv)
+
+        # Inverted corridor (begin_pm 50.6 > end_pm 6.3 in Santa Clara)
+        b, e = engine.resolve_absolute_postmiles(101, "Santa Clara", 50.6, 6.3)
+        self.assertIsNone(b)
+        self.assertIsNone(e)
+        temp_dir.cleanup()
+
+    def test_snap_threshold_guard(self):
+        """Verify that postmiles that differ by > 2.0 miles from any reference point return None."""
+        temp_dir = tempfile.TemporaryDirectory()
+        ref_csv = os.path.join(temp_dir.name, "ref.csv")
+        df_ref = pd.DataFrame([
+            {"Route": 4, "County": "Contra Costa", "CA PM": "15.0", "Abs PM": 30.0},
+            {"Route": 4, "County": "Contra Costa", "CA PM": "20.0", "Abs PM": 35.0}
+        ])
+        df_ref.to_csv(ref_csv, index=False)
+        engine = HPMSCorridorEngine(ref_path=ref_csv)
+
+        # 25.0 is 5 miles away from closest reference point (20.0) -> exceeds 2.0 mi threshold
+        b, e = engine.resolve_absolute_postmiles(4, "Contra Costa", 15.0, 25.0)
+        self.assertIsNone(b)
+        self.assertIsNone(e)
+        temp_dir.cleanup()
+
+    @patch("hpms_interface.HPMSClient.query")
+    def test_strict_historical_route_id_query(self, mock_query):
+        """Verify that HPMS historical queries strictly match Caltrans SHS routes and omit dangerous wildcards."""
+        client = HPMSClient(cache_dir=tempfile.mkdtemp())
+        mock_query.return_value = []
+
+        # 2018 query
+        client.get_historical_event_lanes(route_number=4, begin_pm=10.0, end_pm=20.0, year=2018)
+        self.assertTrue(mock_query.called)
+        where_clause = mock_query.call_args[1]["where"]
+
+        # Ensure exact SHS patterns are checked
+        self.assertIn("route_id='SHS_004_P'", where_clause)
+        self.assertIn("route_id='SHS_4_P'", where_clause)
+        # Ensure dangerous wildcard like '%4%P%' is NOT present
+        self.assertNotIn("%4%P%", where_clause)
+
+    def test_dual_direction_handling(self):
+        """Verify that passing direction='NB' vs direction='SB' correctly targets directional rows."""
+        temp_dir = tempfile.TemporaryDirectory()
+        master_csv = os.path.join(temp_dir.name, "master.csv")
+        df_master = pd.DataFrame([
+            {
+                "Project ID": 1014000158,
+                "Route": 99,
+                "County": "San Joaquin",
+                "Direction": "NB",
+                "Begin PM": 10.0,
+                "End PM": 15.0,
+                "total_lanes_before": 4.0,
+                "total_lanes_after": 6.0,
+                "dir_lanes_before": 2.0,
+                "dir_lanes_after": 3.0,
+                "Project Description": "NB widening"
+            },
+            {
+                "Project ID": 1014000158,
+                "Route": 99,
+                "County": "San Joaquin",
+                "Direction": "SB",
+                "Begin PM": 12.0,
+                "End PM": 17.0,
+                "total_lanes_before": 4.0,
+                "total_lanes_after": 6.0,
+                "dir_lanes_before": 2.0,
+                "dir_lanes_after": 3.0,
+                "Project Description": "SB widening"
+            }
+        ])
+        df_master.to_csv(master_csv, index=False)
+
+        ref_csv = os.path.join(temp_dir.name, "ref.csv")
+        df_ref = pd.DataFrame([
+            {"Route": 99, "County": "San Joaquin", "CA PM": "10.0", "Abs PM": 100.0},
+            {"Route": 99, "County": "San Joaquin", "CA PM": "12.0", "Abs PM": 102.0},
+            {"Route": 99, "County": "San Joaquin", "CA PM": "15.0", "Abs PM": 105.0},
+            {"Route": 99, "County": "San Joaquin", "CA PM": "17.0", "Abs PM": 107.0}
+        ])
+        df_ref.to_csv(ref_csv, index=False)
+
+        engine = HPMSCorridorEngine(master_csv_path=master_csv, ref_path=ref_csv)
+
+        # Inspect NB
+        nb_insp = engine.inspect_project(1014000158, direction="NB")
+        self.assertEqual(nb_insp["direction"], "NB")
+        self.assertEqual(nb_insp["begin_pm"], 10.0)
+        self.assertEqual(nb_insp["end_pm"], 15.0)
+
+        # Inspect SB
+        sb_insp = engine.inspect_project(1014000158, direction="SB")
+        self.assertEqual(sb_insp["direction"], "SB")
+        self.assertEqual(sb_insp["begin_pm"], 12.0)
+        self.assertEqual(sb_insp["end_pm"], 17.0)
+
+        temp_dir.cleanup()
+
+    @patch("hpms_interface.HPMSCorridorEngine.tandem_audit_project")
+    def test_fill_local_spreadsheet_protects_qualitative_cells(self, mock_audit):
+        """Verify fill_local_spreadsheet never overwrites existing qualitative notes or ranges."""
+        temp_dir = tempfile.TemporaryDirectory()
+        master_csv = os.path.join(temp_dir.name, "master.csv")
+        df_master = pd.DataFrame([{
+            "Project ID": 8880001,
+            "Route": 80,
+            "County": "Solano",
+            "Direction": "EB",
+            "Existing AADT": "8,510; 2020 \n 10,000; 2030",
+            "forecast AADT": "ADT: 23,000-36,000",
+            "total_lanes_after": "4 lanes (2 HOV)",
+            "dir_lanes_after": 2.0
+        }])
+        df_master.to_csv(master_csv, index=False)
+
+        mock_audit.return_value = {
+            "hpms_2024_aadt": 25000,
+            "hpms_future_aadt": 35000,
+            "hpms_after_lanes": 4,
+            "pems_predom_lanes": 2
+        }
+
+        engine = HPMSCorridorEngine(master_csv_path=master_csv)
+        cand_df = engine.fill_local_spreadsheet(target_path=master_csv, project_id=8880001, apply=False)
+
+        # None of the qualitative fields should be proposed for replacement!
+        self.assertTrue(cand_df.empty, f"Expected empty candidates, but found: {cand_df}")
+        temp_dir.cleanup()
+
+    @patch("hpms_interface.HPMSCorridorEngine.tandem_audit_project")
+    def test_fill_local_spreadsheet_no_odd_lane_halving(self, mock_audit):
+        """Verify fill_local_spreadsheet does not naively halve odd lane counts (which are asymmetric)."""
+        temp_dir = tempfile.TemporaryDirectory()
+        master_csv = os.path.join(temp_dir.name, "master.csv")
+        df_master = pd.DataFrame([{
+            "Project ID": 8880002,
+            "Route": 101,
+            "County": "Mendocino",
+            "Direction": "NB",
+            "dir_lanes_after": None,
+            "dir_lanes_before": None
+        }])
+        df_master.to_csv(master_csv, index=False)
+
+        # 3 lanes total (odd count, e.g. 2 NB, 1 SB)
+        mock_audit.return_value = {
+            "hpms_after_lanes": 3,
+            "hpms_before_lanes": 3,
+            "pems_predom_lanes": None  # Rural, no PeMS
+        }
+
+        engine = HPMSCorridorEngine(master_csv_path=master_csv)
+        cand_df = engine.fill_local_spreadsheet(target_path=master_csv, project_id=8880002, apply=False)
+
+        # Directional lanes should NOT be proposed as 1.5
+        dir_fields = cand_df[cand_df["field"].isin(["dir_lanes_after", "dir_lanes_before"])]
+        self.assertTrue(dir_fields.empty, f"Expected no fractional directional proposals, found: {dir_fields}")
+        temp_dir.cleanup()
 
 
 if __name__ == "__main__":

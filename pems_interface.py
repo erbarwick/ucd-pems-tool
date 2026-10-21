@@ -5127,7 +5127,7 @@ def main(argv: Optional[List[str]] = None):
                     from hpms_interface import HPMSCorridorEngine
                     hpms_master = getattr(args, "master_csv", getattr(args, "input", DEFAULT_MASTER_CSV))
                     hpms_eng = HPMSCorridorEngine(master_csv_path=hpms_master)
-                    tandem_res = hpms_eng.tandem_audit_project(proj.project_id)
+                    tandem_res = hpms_eng.tandem_audit_project(proj.project_id, direction=proj.direction)
                     print(hpms_eng.format_tandem_output(tandem_res))
                 except Exception as exc:
                     print(f"\n  [HPMS VALIDATION ERROR]: {exc}")

@@ -12,6 +12,7 @@ are not instrumented).
 
 import os
 import sys
+import re
 import json
 import math
 import time
@@ -82,6 +83,63 @@ HPMS_HISTORIC_UNIVERSE = {
     1984: "j2gk-sh7k", 1983: "6itn-mw5q", 1982: "br2w-67fy", 1981: "wekv-ifsj",
     1980: "efu4-vidc"
 }
+
+
+def parse_postmile(val: Any) -> Tuple[Optional[float], str]:
+    """Parses a Caltrans postmile value, extracting the numeric float while preserving
+    the original string label (including prefixes like 'R', 'M', 'L', 'C', 'G' and suffixes).
+
+    Returns (numeric_float, original_string).
+    If val is invalid/empty, returns (None, "").
+    """
+    if val is None or pd.isna(val):
+        return None, ""
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return None, ""
+
+    cleaned = s.replace("PM", "").replace("pm", "").strip()
+    match = re.search(r"[-+]?\d*\.?\d+", cleaned)
+    if match:
+        try:
+            num = float(match.group(0))
+            return num, s
+        except Exception:
+            pass
+    return None, s
+
+
+def _fmt_aadt_display(val: Any) -> str:
+    """Formats an AADT value for display in reports.
+    If it is an integer or clean float, formats with commas.
+    If it is an archival range, curve, or annotation, preserves the raw string as-is.
+    If empty/null, returns '(None)'.
+    """
+    if pd.isna(val) or val is None:
+        return "(None)"
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return "(None)"
+
+    clean_dig = s.replace(".0", "").replace(",", "").strip()
+    if clean_dig.isdigit():
+        try:
+            return f"{int(clean_dig):,}"
+        except Exception:
+            pass
+    return s
+
+
+def _is_empty_cell(val: Any) -> bool:
+    """Returns True only if a cell is genuinely empty (None, NaN, blank string, or 0/0.0).
+    Returns False if the cell contains qualitative research notes, dates, ranges,
+    or non-integer strings (e.g. '8,510; 2020 \n 10,000; 2030' or '23,000-36,000').
+    This protects qualitative researcher data from being accidentally overwritten.
+    """
+    if val is None or pd.isna(val):
+        return True
+    s = str(val).strip()
+    return s in ("", "nan", "None", "0", "0.0")
 
 
 class HPMSClient:
@@ -179,24 +237,28 @@ class HPMSClient:
             rt_str = f"{route_number}"
             rt_pad = f"{route_number:03d}"
 
-            # Era-specific SODA query syntax
+            # Era-specific SODA query syntax: strictly match Caltrans State Highway System route IDs
+            # Avoid dangerous wildcards like '%{rt_str}%P%' which match unrelated county roads
             if year in [2018, 2019]:
                 # Text fields in 2018/2019
                 where_sql = (
                     f"state_code='{state_fips}' AND data_item='THROUGH_LANES' AND "
-                    f"(route_id='SHS_{rt_str}_P' or route_id like '%{rt_str}%P%')"
+                    f"(route_id='SHS_{rt_pad}_P' or route_id='SHS_{rt_str}_P' or "
+                    f"route_id='SHS_{rt_pad}._P' or route_id='SHS_{rt_str}._P')"
                 )
             elif year == 2020:
                 # Numeric state_code, underscore field names
                 where_sql = (
                     f"state_code={state_fips} AND data_item='THROUGH_LANES' AND "
-                    f"(route_id='SHS_{rt_str}_P' or route_id like '%{rt_str}%P%')"
+                    f"(route_id='SHS_{rt_pad}._P' or route_id='SHS_{rt_pad}_P' or "
+                    f"route_id='SHS_{rt_str}._P' or route_id='SHS_{rt_str}_P')"
                 )
             else:
                 # 2021-2024: stateid, dataitem, routeid without underscores
                 where_sql = (
                     f"stateid={state_fips} AND dataitem='THROUGH_LANES' AND "
-                    f"(routeid='SHS_{rt_str}._P' or routeid='SHS_{rt_pad}._P' or routeid like '%{rt_str}%P%')"
+                    f"(routeid='SHS_{rt_pad}._P' or routeid='SHS_{rt_pad}_P' or "
+                    f"routeid='SHS_{rt_str}._P' or routeid='SHS_{rt_str}_P')"
                 )
 
             raw_rows = self.query(uid, where=where_sql, limit=5000)
@@ -281,7 +343,6 @@ class HPMSCorridorEngine:
     def resolve_absolute_postmiles(self, route: int, county: str,
                                    begin_pm: float, end_pm: float) -> Tuple[Optional[float], Optional[float]]:
         """Converts County Postmiles (CA PM) to Absolute / Continuous Postmiles (Abs PM)
-
         matching HPMS begin_point / end_point linear referencing.
         """
         if self.ref_df.empty:
@@ -313,19 +374,30 @@ class HPMSCorridorEngine:
         # Sort by CA PM
         sub_valid = sub_valid.sort_values(by="clean_ca_pm")
 
+        # Guard against cross-county boundary inversion: if begin_pm > end_pm,
+        # snapping both against the same county produces an inverted, false corridor.
+        if begin_pm > end_pm:
+            return None, None
+
         # Find closest Abs PM for begin_pm and end_pm
         idx_b = (sub_valid["clean_ca_pm"] - begin_pm).abs().idxmin()
         idx_e = (sub_valid["clean_ca_pm"] - end_pm).abs().idxmin()
+
+        delta_b = abs(sub_valid.loc[idx_b, "clean_ca_pm"] - begin_pm)
+        delta_e = abs(sub_valid.loc[idx_e, "clean_ca_pm"] - end_pm)
+        if delta_b > 2.0 or delta_e > 2.0:
+            # Distance too large to snap safely
+            return None, None
 
         abs_begin = float(sub_valid.loc[idx_b, "clean_abs_pm"])
         abs_end = float(sub_valid.loc[idx_e, "clean_abs_pm"])
 
         return min(abs_begin, abs_end), max(abs_begin, abs_end)
 
-    def inspect_project(self, project_id: Any) -> Dict[str, Any]:
+    def inspect_project(self, project_id: Any, direction: Optional[str] = None) -> Dict[str, Any]:
         """Inspects a highway project, resolving its HPMS corridor data, ground-truth lane counts,
-
         AADT, facility type, and cross-checks against the master spreadsheet values.
+        Direction-aware: properly distinguishes NB/SB or EB/WB rows.
         """
         target_pid_str = str(project_id).strip().replace(".0", "")
         master_pids = self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
@@ -333,31 +405,55 @@ class HPMSCorridorEngine:
         if p_rows.empty:
             raise ValueError(f"Project ID {project_id} not found in {self.master_csv_path}")
 
-        row = p_rows.iloc[0]
+        # Direction-aware row selection
+        if direction:
+            dir_clean = direction.strip().upper()
+            dir_match = p_rows[p_rows["Direction"].astype(str).str.strip().str.upper().str.startswith(dir_clean[0])]
+            row = dir_match.iloc[0] if not dir_match.empty else p_rows.iloc[0]
+        else:
+            row = p_rows.iloc[0]
 
+        dir_val = str(row.get("Direction", "NB")).strip()
         route = int(row.get("Route", 0))
         county = str(row.get("County", "")).strip()
         county_fips = CA_COUNTY_FIPS.get(county.lower())
         desc = str(row.get("Project Description", "")).strip()
         proj_type = str(row.get("Project Type (\"Capacity Expansion\" or \"New Roadway\")", row.get("project_type", ""))).strip()
 
-        # Postmiles
-        try:
-            begin_pm = float(row.get("Begin PM", 0))
-            end_pm = float(row.get("End PM", 0))
-        except Exception:
-            begin_pm, end_pm = 0.0, 0.0
+        # Robust postmile parsing preserving prefixes
+        begin_pm_float, orig_begin_str = parse_postmile(row.get("Begin PM"))
+        end_pm_float, orig_end_str = parse_postmile(row.get("End PM"))
+        begin_pm = begin_pm_float if begin_pm_float is not None else 0.0
+        end_pm = end_pm_float if end_pm_float is not None else 0.0
 
         # Absolute postmiles
         abs_begin = row.get("temp_abs_begin")
         abs_end = row.get("temp_abs_end")
-        if pd.isna(abs_begin) or pd.isna(abs_end) or abs_begin == "" or abs_end == "":
-            calc_b, calc_e = self.resolve_absolute_postmiles(route, county, begin_pm, end_pm)
-            abs_begin = calc_b if calc_b is not None else begin_pm
-            abs_end = calc_e if calc_e is not None else end_pm
-        else:
-            abs_begin = float(abs_begin)
-            abs_end = float(abs_end)
+        has_temp_abs = False
+        try:
+            if pd.notna(abs_begin) and pd.notna(abs_end) and str(abs_begin).strip() != "" and str(abs_end).strip() != "":
+                abs_begin = float(abs_begin)
+                abs_end = float(abs_end)
+                has_temp_abs = True
+        except Exception:
+            has_temp_abs = False
+
+        pm_warning = None
+        if not has_temp_abs:
+            if begin_pm_float is not None and end_pm_float is not None and begin_pm_float > end_pm_float:
+                pm_warning = (f"CROSS_COUNTY_POSTMILE_AMBIGUITY: Begin PM ({orig_begin_str}) > End PM ({orig_end_str}). "
+                              "Corridor appears to span multiple counties. Continuous absolute postmiles required.")
+                abs_begin = min(begin_pm, end_pm)
+                abs_end = max(begin_pm, end_pm)
+            else:
+                calc_b, calc_e = self.resolve_absolute_postmiles(route, county, begin_pm, end_pm)
+                if calc_b is not None and calc_e is not None:
+                    abs_begin, abs_end = calc_b, calc_e
+                else:
+                    abs_begin = min(begin_pm, end_pm)
+                    abs_end = max(begin_pm, end_pm)
+                    if begin_pm_float is not None and end_pm_float is not None:
+                        pm_warning = "Could not safely snap County PMs to continuous Abs PM (snapping delta > 2.0 mi or county boundary issue)."
 
         # Dates & spreadsheet lane values
         open_year = row.get("open_traffic_year")
@@ -368,6 +464,7 @@ class HPMSCorridorEngine:
         lanes_before = row.get("total_lanes_before")
         lanes_after = row.get("total_lanes_after")
         dir_before = row.get("dir_lanes_before")
+        dir_after = row.get("dir_lanes_after")
         dir_after = row.get("dir_lanes_after")
 
         # Query 2024 HPMS Spatial Sections
@@ -435,6 +532,8 @@ class HPMSCorridorEngine:
 
         return {
             "project_id": project_id,
+            "direction": dir_val,
+            "district": row.get("Dist", ""),
             "route": route,
             "county": county,
             "county_fips": county_fips,
@@ -442,8 +541,11 @@ class HPMSCorridorEngine:
             "project_type": proj_type,
             "begin_pm": begin_pm,
             "end_pm": end_pm,
+            "orig_begin_pm": orig_begin_str,
+            "orig_end_pm": orig_end_str,
             "abs_begin": abs_begin,
             "abs_end": abs_end,
+            "pm_warning": pm_warning,
             "const_date": const_date,
             "open_date": open_date,
             "const_year": const_year,
@@ -460,12 +562,12 @@ class HPMSCorridorEngine:
             "sections": parsed_sections
         }
 
-    def audit_project(self, project_id: int) -> Dict[str, Any]:
+    def audit_project(self, project_id: Any, direction: Optional[str] = None) -> Dict[str, Any]:
         """Audits project lane counts comparing historical HPMS pre-construction data
-
         and modern post-construction data against the spreadsheet values.
+        Direction-aware: properly targets NB/SB or EB/WB records.
         """
-        insp = self.inspect_project(project_id)
+        insp = self.inspect_project(project_id, direction=direction)
 
         const_year = insp.get("const_year")
         open_year = insp.get("open_year")
@@ -773,27 +875,39 @@ class HPMSCorridorEngine:
         ]
         return "\n".join(lines)
 
-    def tandem_audit_project(self, project_id: Any) -> Dict[str, Any]:
+    def tandem_audit_project(self, project_id: Any, direction: Optional[str] = None) -> Dict[str, Any]:
         """Performs a comprehensive triad audit comparing Spreadsheet, PeMS, and HPMS data side by side
-
         for roadway geometry (before/after lanes) and traffic volumes (baseline/forecast AADT).
+        Direction-aware: accurately targets specific travel direction (e.g. NB vs SB).
         """
         # 1. Base HPMS inspection & historical audit
-        insp = self.inspect_project(project_id)
-        hist_audit = self.audit_project(project_id)
+        insp = self.inspect_project(project_id, direction=direction)
+        hist_audit = self.audit_project(project_id, direction=direction)
 
         route = insp["route"]
         county = insp["county"]
-        dir_val = str(self.master_df[self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(project_id).strip().replace(".0", "")].iloc[0].get("Direction", "NB"))
-        dist_val = str(self.master_df[self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(project_id).strip().replace(".0", "")].iloc[0].get("Dist", ""))
+        dir_val = insp.get("direction", "NB")
+        dist_val = str(insp.get("district") or "")
 
         bp = insp["begin_pm"]
         ep = insp["end_pm"]
         ab = insp["abs_begin"]
         ae = insp["abs_end"]
+        orig_bp = insp.get("orig_begin_pm") or f"{bp:.1f}"
+        orig_ep = insp.get("orig_end_pm") or f"{ep:.1f}"
+        pm_warning = insp.get("pm_warning")
 
-        # 2. Spreadsheet attributes
-        s_row = self.master_df[self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(project_id).strip().replace(".0", "")].iloc[0]
+        # 2. Spreadsheet attributes from direction-specific row
+        target_pid_str = str(project_id).strip().replace(".0", "")
+        master_pids = self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        p_rows = self.master_df[master_pids == target_pid_str]
+        if direction and not p_rows.empty:
+            dir_clean = direction.strip().upper()
+            dir_match = p_rows[p_rows["Direction"].astype(str).str.strip().str.upper().str.startswith(dir_clean[0])]
+            s_row = dir_match.iloc[0] if not dir_match.empty else p_rows.iloc[0]
+        else:
+            s_row = p_rows.iloc[0] if not p_rows.empty else pd.Series()
+
         s_b = insp.get("spreadsheet_lanes_before")
         s_a = insp.get("spreadsheet_lanes_after")
         s_db = insp.get("spreadsheet_dir_before")
@@ -851,6 +965,8 @@ class HPMSCorridorEngine:
         hpms_after = hist_audit.get("hpms_after_lanes")
         hpms_wt = hist_audit.get("hpms_after_weighted")
         hpms_before = hist_audit.get("hpms_before_lanes")
+        hpms_sections_count = insp.get("hpms_sections_count", 0)
+        has_hpms_coverage = (hpms_sections_count > 0) and (hpms_after is not None)
 
         lane_verdict = "NEEDS_REVIEW"
         verdict_detail = ""
@@ -871,16 +987,26 @@ class HPMSCorridorEngine:
         hpms_total_match = False
         hpms_partial = False
         target_total = s_a_val if s_a_val is not None else (s_da_val * 2.0 if s_da_val is not None else None)
-        if hpms_after is not None and target_total is not None:
+        if has_hpms_coverage and target_total is not None:
             hpms_total_match = (abs(hpms_after - target_total) < 0.01)
             if hpms_wt is not None:
                 hpms_partial = (abs(hpms_wt - target_total) <= 0.6)
 
-        if s_a_val is None and s_da_val is None:
+        if pm_warning and "CROSS_COUNTY" in pm_warning:
+            lane_verdict = "CROSS_COUNTY_BOUNDARY_REVIEW"
+            verdict_detail = pm_warning
+        elif s_a_val is None and s_da_val is None:
             lane_verdict = "MISSING_SPREADSHEET_DATA"
             verdict_detail = f"Spreadsheet missing post-expansion lane counts. Ground truth: PeMS={pems_predom_lanes or 'N/A'} dir, HPMS={hpms_after or 'N/A'} total."
         elif pems_instrumented:
-            if pems_dir_match and hpms_total_match:
+            if not has_hpms_coverage:
+                if pems_dir_match:
+                    lane_verdict = "PEMS_VERIFIED_HPMS_UNAVAILABLE"
+                    verdict_detail = f"Spreadsheet matches PeMS ({pems_predom_lanes} dir lanes); HPMS has 0 road segments for this corridor."
+                else:
+                    lane_verdict = "PEMS_DIVERGES_HPMS_UNAVAILABLE"
+                    verdict_detail = f"PeMS detectors show {pems_predom_lanes} dir lanes (vs sheet {s_da_val or target_total}); HPMS segments unavailable."
+            elif pems_dir_match and hpms_total_match:
                 lane_verdict = "ALL_THREE_CONCUR"
                 verdict_detail = f"Spreadsheet (Total {target_total:.0f}, Dir {s_da_val or target_total/2:.1f}), PeMS ({pems_predom_lanes} dir), and HPMS ({hpms_after} total) all concur."
             elif pems_dir_match and hpms_partial:
@@ -896,19 +1022,19 @@ class HPMSCorridorEngine:
                 lane_verdict = "DISCREPANCY"
                 verdict_detail = f"Discrepancy: Sheet Total={target_total:.0f}, PeMS={pems_predom_lanes} dir, HPMS={hpms_after} total."
         else:
-            # PeMS uninstrumented
-            if hpms_total_match:
+            # PeMS uninstrumented (0 stations)
+            if not has_hpms_coverage:
+                lane_verdict = "NO_GROUND_TRUTH_AVAILABLE"
+                verdict_detail = "Neither PeMS sensors nor HPMS road segments available for this corridor."
+            elif hpms_total_match:
                 lane_verdict = "UNINSTRUMENTED_PEMS_RESOLVED_BY_HPMS"
                 verdict_detail = f"PeMS has 0 sensors (rural highway); HPMS confirms ground truth ({hpms_after} total lanes) matching spreadsheet."
             elif hpms_partial:
                 lane_verdict = "PARTIAL_CORRIDOR_EXPANSION"
                 verdict_detail = f"HPMS shows passing/truck climbing expansion on portion of segment ({hpms_wt:.2f} wt total lanes vs sheet {target_total:.0f})."
-            elif hpms_after is not None:
+            else:
                 lane_verdict = "HPMS_MISMATCH_UNINSTRUMENTED_PEMS"
                 verdict_detail = f"PeMS has 0 sensors; HPMS reports {hpms_after} total lanes vs spreadsheet {target_total:.0f}."
-            else:
-                lane_verdict = "NO_GROUND_TRUTH_AVAILABLE"
-                verdict_detail = "Neither PeMS sensors nor HPMS segments available."
 
         return {
             "project_id": project_id,
@@ -918,8 +1044,11 @@ class HPMSCorridorEngine:
             "district": dist_val,
             "begin_pm": bp,
             "end_pm": ep,
+            "orig_begin_pm": orig_bp,
+            "orig_end_pm": orig_ep,
             "abs_begin": ab,
             "abs_end": ae,
+            "pm_warning": pm_warning,
             "description": insp.get("description", ""),
             "const_date": insp.get("const_date"),
             "open_date": insp.get("open_date"),
@@ -944,7 +1073,7 @@ class HPMSCorridorEngine:
             "hpms_after_year": 2024,
             "hpms_after_lanes": hpms_after,
             "hpms_after_weighted": hpms_wt,
-            "hpms_sections_count": insp.get("hpms_sections_count", 0),
+            "hpms_sections_count": hpms_sections_count,
             "hpms_lane_distribution": insp.get("hpms_lane_distribution_mi", {}),
             "hpms_2024_aadt": insp.get("hpms_avg_aadt_2024"),
             "hpms_future_aadt": hpms_future_aadt,
@@ -961,12 +1090,13 @@ class HPMSCorridorEngine:
         route = data["route"]
         county = data["county"]
         dir_val = data["direction"]
-        bp = data["begin_pm"]
-        ep = data["end_pm"]
+        bp = data.get("orig_begin_pm") or f"{data['begin_pm']:.1f}"
+        ep = data.get("orig_end_pm") or f"{data['end_pm']:.1f}"
         ab = data["abs_begin"]
         ae = data["abs_end"]
         cd = data["const_date"]
         od = data["open_date"]
+        pm_warn = data.get("pm_warning")
 
         s_b = str(data["sheet_total_before"])
         s_a = str(data["sheet_total_after"])
@@ -982,11 +1112,11 @@ class HPMSCorridorEngine:
         h_a_ln = f"{data['hpms_after_lanes']} lanes" if data["hpms_after_lanes"] is not None else "N/A"
         h_wt = f"{data['hpms_after_weighted']} wt" if data["hpms_after_weighted"] is not None else ""
 
-        # AADT formatting
-        s_aadt = f"{int(float(data['sheet_aadt'])):,}" if pd.notna(data.get("sheet_aadt")) and str(data.get("sheet_aadt")).replace('.0','').isdigit() else "(None)"
-        s_yr = f"({int(float(data['sheet_aadt_year']))})" if pd.notna(data.get("sheet_aadt_year")) and str(data.get("sheet_aadt_year")).replace('.0','').isdigit() else ""
-        s_fc = f"{int(float(data['sheet_forecast_aadt'])):,}" if pd.notna(data.get("sheet_forecast_aadt")) and str(data.get("sheet_forecast_aadt")).replace('.0','').isdigit() else "(None)"
-        s_fc_yr = f"({int(float(data['sheet_forecast_year']))})" if pd.notna(data.get("sheet_forecast_year")) and str(data.get("sheet_forecast_year")).replace('.0','').isdigit() else ""
+        # AADT formatting using _fmt_aadt_display to preserve archival strings/ranges
+        s_aadt = _fmt_aadt_display(data.get("sheet_aadt"))
+        s_yr = f"({data['sheet_aadt_year']})" if pd.notna(data.get("sheet_aadt_year")) and str(data.get("sheet_aadt_year")).strip() not in ("", "nan") else ""
+        s_fc = _fmt_aadt_display(data.get("sheet_forecast_aadt"))
+        s_fc_yr = f"({data['sheet_forecast_year']})" if pd.notna(data.get("sheet_forecast_year")) and str(data.get("sheet_forecast_year")).strip() not in ("", "nan") else ""
 
         h_aadt = f"{data['hpms_2024_aadt']:,} vpd" if data.get("hpms_2024_aadt") else "N/A"
         h_fc = f"{data['hpms_future_aadt']:,} vpd" if data.get("hpms_future_aadt") else "N/A"
@@ -1004,6 +1134,10 @@ class HPMSCorridorEngine:
             "=" * 88,
             f"  Description:       {wrapped_desc}",
             f"  Corridor:          Route {route} {dir_val} | {county} County | PM {bp} - {ep} (Abs {ab:.2f} - {ae:.2f})",
+        ]
+        if pm_warn:
+            lines.append(f"  [BOUNDARY ALERT]:  {pm_warn}")
+        lines.extend([
             f"  Schedule:          Const: {cd or '(Unknown)'} | Open: {od or '(Unknown)'}",
             "",
             "-" * 88,
@@ -1026,7 +1160,7 @@ class HPMSCorridorEngine:
             f"VERDICT: {data['lane_verdict']}",
             f"  {data['verdict_detail']}",
             "=" * 88
-        ]
+        ])
         return "\n".join(lines)
 
     def audit_district(self, district: Optional[int] = None) -> pd.DataFrame:
@@ -1046,8 +1180,9 @@ class HPMSCorridorEngine:
             if pd.isna(pid):
                 continue
             pid = int(pid)
+            direction_val = row.get("Direction")
             try:
-                t = self.tandem_audit_project(pid)
+                t = self.tandem_audit_project(pid, direction=direction_val)
                 results.append({
                     "Project ID": pid,
                     "Route": t["route"],
@@ -1080,16 +1215,19 @@ class HPMSCorridorEngine:
                     "Verdict Detail": t["verdict_detail"],
                     "Description": t["description"]
                 })
-                print(f"  [{i}/{total}] PID {pid} (Route {t['route']}): {t['lane_verdict']}")
+                dir_label = f" {t['direction']}" if t.get('direction') else ""
+                print(f"  [{i}/{total}] PID {pid}{dir_label} (Route {t['route']}): {t['lane_verdict']}")
             except Exception as e:
+                dir_label = f" {direction_val}" if direction_val else ""
                 results.append({
                     "Project ID": pid,
                     "Route": row.get("Route"),
                     "County": row.get("County"),
+                    "Direction": direction_val,
                     "Lane Verdict": f"ERROR: {e}",
                     "Description": row.get("Project Description", "")
                 })
-                print(f"  [{i}/{total}] PID {pid}: ERROR {e}")
+                print(f"  [{i}/{total}] PID {pid}{dir_label}: ERROR {e}")
 
         return pd.DataFrame(results)
 
@@ -1144,18 +1282,20 @@ class HPMSCorridorEngine:
             pid = row.get("Project ID")
             if pd.isna(pid):
                 continue
+            direction_val = row.get("Direction")
             try:
-                t = self.tandem_audit_project(pid)
+                t = self.tandem_audit_project(pid, direction=direction_val)
             except Exception:
                 continue
 
             # 1. Existing AADT
             curr_aadt = row.get("Existing AADT")
-            if pd.isna(curr_aadt) or str(curr_aadt).strip() in ("", "0", "0.0") or not str(curr_aadt).replace('.', '').isdigit():
+            if _is_empty_cell(curr_aadt):
                 if t.get("hpms_2024_aadt"):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "Existing AADT",
                         "current_val": curr_aadt,
                         "proposed_val": int(t["hpms_2024_aadt"]),
@@ -1167,11 +1307,12 @@ class HPMSCorridorEngine:
 
             # 2. Forecast AADT
             curr_fc = row.get(fc_aadt_col)
-            if pd.isna(curr_fc) or str(curr_fc).strip() in ("", "0", "0.0") or not str(curr_fc).replace('.', '').isdigit():
+            if _is_empty_cell(curr_fc):
                 if t.get("hpms_future_aadt"):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": fc_aadt_col,
                         "current_val": curr_fc,
                         "proposed_val": int(t["hpms_future_aadt"]),
@@ -1183,11 +1324,12 @@ class HPMSCorridorEngine:
 
             # 3. Total Lanes After
             curr_tla = row.get("total_lanes_after")
-            if pd.isna(curr_tla) or str(curr_tla).strip() in ("", "0", "0.0") or not str(curr_tla).replace('.', '').isdigit():
+            if _is_empty_cell(curr_tla):
                 if t.get("hpms_after_lanes"):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "total_lanes_after",
                         "current_val": curr_tla,
                         "proposed_val": float(t["hpms_after_lanes"]),
@@ -1198,6 +1340,7 @@ class HPMSCorridorEngine:
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "total_lanes_after",
                         "current_val": curr_tla,
                         "proposed_val": float(t["pems_predom_lanes"] * 2),
@@ -1207,35 +1350,38 @@ class HPMSCorridorEngine:
 
             # 4. Directional Lanes After
             curr_dla = row.get("dir_lanes_after")
-            if pd.isna(curr_dla) or str(curr_dla).strip() in ("", "0", "0.0") or not str(curr_dla).replace('.', '').isdigit():
+            if _is_empty_cell(curr_dla):
                 if t.get("pems_predom_lanes"):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "dir_lanes_after",
                         "current_val": curr_dla,
                         "proposed_val": float(t["pems_predom_lanes"]),
                         "source": "PeMS Active Mainline VDS",
                         "confidence": "HIGH"
                     })
-                elif t.get("hpms_after_lanes"):
+                elif t.get("hpms_after_lanes") and (float(t["hpms_after_lanes"]) % 2 == 0):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "dir_lanes_after",
                         "current_val": curr_dla,
-                        "proposed_val": round(float(t["hpms_after_lanes"]) / 2.0, 1),
-                        "source": "HPMS 2024 (halved for directional)",
+                        "proposed_val": float(int(t["hpms_after_lanes"]) // 2),
+                        "source": "HPMS 2024 (halved for symmetric roadway)",
                         "confidence": "MEDIUM"
                     })
 
             # 5. Total Lanes Before
             curr_tlb = row.get("total_lanes_before")
-            if pd.isna(curr_tlb) or str(curr_tlb).strip() in ("", "0", "0.0") or not str(curr_tlb).replace('.', '').isdigit():
+            if _is_empty_cell(curr_tlb):
                 if t.get("hpms_before_lanes"):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "total_lanes_before",
                         "current_val": curr_tlb,
                         "proposed_val": float(t["hpms_before_lanes"]),
@@ -1245,15 +1391,16 @@ class HPMSCorridorEngine:
 
             # 6. Directional Lanes Before
             curr_dlb = row.get("dir_lanes_before")
-            if pd.isna(curr_dlb) or str(curr_dlb).strip() in ("", "0", "0.0") or not str(curr_dlb).replace('.', '').isdigit():
-                if t.get("hpms_before_lanes"):
+            if _is_empty_cell(curr_dlb):
+                if t.get("hpms_before_lanes") and (float(t["hpms_before_lanes"]) % 2 == 0):
                     candidates.append({
                         "index": idx,
                         "project_id": pid,
+                        "direction": direction_val,
                         "field": "dir_lanes_before",
                         "current_val": curr_dlb,
-                        "proposed_val": round(float(t["hpms_before_lanes"]) / 2.0, 1),
-                        "source": "HPMS Historical (halved for directional)",
+                        "proposed_val": float(int(t["hpms_before_lanes"]) // 2),
+                        "source": "HPMS Historical (halved for symmetric roadway)",
                         "confidence": "MEDIUM"
                     })
 
@@ -1267,7 +1414,7 @@ class HPMSCorridorEngine:
             print(f"Total Candidate Fills Identified: {len(candidates)}")
             print("=" * 90)
             if candidates:
-                preview_cols = ["project_id", "field", "current_val", "proposed_val", "source", "confidence"]
+                preview_cols = [c for c in ["project_id", "direction", "field", "current_val", "proposed_val", "source", "confidence"] if c in cand_df.columns]
                 print(cand_df[preview_cols].to_string(index=False))
                 print("-" * 90)
                 print("NOTE: No changes have been written to disk. To apply these updates, run with:")
@@ -1313,6 +1460,8 @@ def parse_args():
     # Target project
     parser.add_argument("--project", "-p", "--inspect", type=int,
                         help="Target Project ID to inspect with HPMS & PeMS data (includes full description).")
+    parser.add_argument("--direction", "-dir", type=str, default=None,
+                        help="Direction of travel (e.g. NB, SB, EB, WB) for directional corridor queries or dual-row projects.")
     parser.add_argument("--tandem", "-t", action="store_true",
                         help="Run triad verification comparing Spreadsheet, PeMS, and HPMS side by side.")
     parser.add_argument("--map", "-m", nargs="?", const=-1, type=int,
@@ -1369,22 +1518,33 @@ def main():
         pid = args.map
 
     if pid:
-        if args.map is not None:
-            # Generate map
-            out_file = engine.generate_hpms_map(pid, output_html=args.output_map)
-            print(f"\nSuccessfully generated HPMS corridor map for Project {pid}:")
-            print(f"  {out_file}")
-            # Also show tandem summary
-            res = engine.tandem_audit_project(pid)
-            print(engine.format_tandem_output(res))
-        elif args.audit:
-            # Audit single project (historical HPMS audit)
-            audit_res = engine.audit_project(pid)
-            print(engine.format_audit_output(audit_res))
+        # Check if project has directional rows in master_df
+        matching_rows = engine.master_df[
+            engine.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(pid)
+        ]
+        if args.direction:
+            directions_to_audit = [args.direction]
         else:
-            # Default: triad multi-source tandem verification!
-            tandem_res = engine.tandem_audit_project(pid)
-            print(engine.format_tandem_output(tandem_res))
+            dirs = matching_rows["Direction"].dropna().unique().tolist() if "Direction" in matching_rows.columns else []
+            directions_to_audit = dirs if len(dirs) > 1 else [None]
+
+        for dir_target in directions_to_audit:
+            if args.map is not None:
+                # Generate map
+                out_file = engine.generate_hpms_map(pid, output_html=args.output_map)
+                print(f"\nSuccessfully generated HPMS corridor map for Project {pid}:")
+                print(f"  {out_file}")
+                # Also show tandem summary
+                res = engine.tandem_audit_project(pid, direction=dir_target)
+                print(engine.format_tandem_output(res))
+            elif args.audit:
+                # Audit single project (historical HPMS audit)
+                audit_res = engine.audit_project(pid, direction=dir_target)
+                print(engine.format_audit_output(audit_res))
+            else:
+                # Default: triad multi-source tandem verification!
+                tandem_res = engine.tandem_audit_project(pid, direction=dir_target)
+                print(engine.format_tandem_output(tandem_res))
 
     elif args.audit or args.audit_all:
         # District-wide or statewide audit
