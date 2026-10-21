@@ -4659,6 +4659,11 @@ Examples:
         action="store_true",
         help="Test PeMS portal login credentials."
     )
+    act_group.add_argument(
+        "--hpms",
+        action="store_true",
+        help="Cross-reference and validate project corridor with FHWA HPMS ground-truth lane counts and AADT."
+    )
 
     # 2. Imagery & Corridor Slices Options
     img_group = parser.add_argument_group("Imagery & Corridor Slices Options")
@@ -5116,6 +5121,16 @@ def main(argv: Optional[List[str]] = None):
                         print("\n  Closest Census Stations:")
                         for _, crow in census_df.iterrows():
                             print(f"    ID: {crow['ID']} | PM: {crow['CA PM']} | Type: {crow['Type']} | Name: {crow['Name']} (delta: {crow['pm_diff']:.2f})")
+
+            if args.hpms:
+                try:
+                    from hpms_interface import HPMSCorridorEngine
+                    hpms_master = getattr(args, "master_csv", getattr(args, "input", DEFAULT_MASTER_CSV))
+                    hpms_eng = HPMSCorridorEngine(master_csv_path=hpms_master)
+                    hpms_res = hpms_eng.inspect_project(proj.project_id)
+                    print(hpms_eng.format_inspection_output(hpms_res))
+                except Exception as exc:
+                    print(f"\n  [HPMS VALIDATION ERROR]: {exc}")
 
             print("=" * 70)
         return

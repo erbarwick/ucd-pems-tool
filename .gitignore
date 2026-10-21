@@ -17,6 +17,7 @@ downloads/*.txt
 downloads/*.txt.*
 downloads/*.zip
 downloads/imagery/
+downloads/hpms_cache/
 *.bk
 *.bak
 *.bak_*
