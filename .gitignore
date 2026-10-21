@@ -41,6 +41,8 @@ Thumbs.db
 route_map_*.html
 all_ca_projects_map.html
 district_*_projects_map.html
+hpms_triad_audit_*.csv
+hpms_audit_report_*.csv
 *.log
 
 # Backups

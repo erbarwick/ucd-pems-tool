@@ -205,6 +205,86 @@ class TestHPMSCorridorEngine(unittest.TestCase):
             self.assertIn("Project 9990001", content)
             self.assertIn("Widen conventional highway", content)
 
+    @patch.object(HPMSClient, "get_spatial_sections")
+    @patch.object(HPMSClient, "get_historical_event_lanes")
+    def test_tandem_audit_project_uninstrumented(self, mock_hist, mock_spatial):
+        mock_spatial.return_value = [
+            {
+                "begin_point": "48.5", "end_point": "49.8",
+                "through_lanes": "4", "dir_through_lanes": "2",
+                "aadt": "16000", "facility_type": "2",
+                "future_aadt": "22000", "future_aadt_year": "2040"
+            }
+        ]
+        mock_hist.return_value = [
+            {"begin_point": 48.5, "end_point": 49.8, "value_numeric": "2"}
+        ]
+
+        tandem = self.engine.tandem_audit_project(9990001)
+        self.assertEqual(tandem["lane_verdict"], "UNINSTRUMENTED_PEMS_RESOLVED_BY_HPMS")
+        self.assertEqual(tandem["hpms_after_lanes"], 4)
+        self.assertEqual(tandem["hpms_2024_aadt"], 16000)
+        self.assertEqual(tandem["hpms_future_aadt"], 22000)
+        self.assertEqual(tandem["hpms_future_year"], 2040)
+
+        report = self.engine.format_tandem_output(tandem)
+        self.assertIn("CERCET TRIAD CORRIDOR VERIFICATION", report)
+        self.assertIn("UNINSTRUMENTED_PEMS_RESOLVED_BY_HPMS", report)
+        self.assertIn("16,000 vpd", report)
+        self.assertIn("22,000 vpd", report)
+
+    def test_fill_local_spreadsheet_box_guard(self):
+        """CRITICAL: Ensure engine strictly forbids targeting any Box-Box directory path."""
+        box_path = "/Users/erb/Library/CloudStorage/Box-Box/CERCET - Historical Accuracy of TDM Forecasts/Master.csv"
+        with self.assertRaises(PermissionError) as ctx:
+            self.engine.fill_local_spreadsheet(target_path=box_path)
+        self.assertIn("CRITICAL SAFETY VIOLATION", str(ctx.exception))
+        self.assertIn("Box spreadsheet", str(ctx.exception))
+
+    @patch.object(HPMSClient, "get_spatial_sections")
+    @patch.object(HPMSClient, "get_historical_event_lanes")
+    def test_fill_local_spreadsheet_preview_and_apply(self, mock_hist, mock_spatial):
+        mock_spatial.return_value = [
+            {
+                "begin_point": "48.5", "end_point": "49.8",
+                "through_lanes": "4", "dir_through_lanes": "2",
+                "aadt": "16000", "facility_type": "2",
+                "future_aadt": "25000", "future_aadt_year": "2040"
+            }
+        ]
+        mock_hist.return_value = [
+            {"begin_point": 48.5, "end_point": 49.8, "value_numeric": "2"}
+        ]
+
+        # 1. Preview mode (apply=False)
+        cand_df = self.engine.fill_local_spreadsheet(target_path=self.master_csv, project_id=9990001, apply=False)
+        self.assertFalse(cand_df.empty)
+        fields = cand_df["field"].tolist()
+        self.assertIn("Existing AADT", fields)
+        self.assertTrue(any("forecast AADT" in f for f in fields))
+
+        # File on disk should be unchanged
+        orig_df = pd.read_csv(self.master_csv)
+        self.assertNotIn("Existing AADT", orig_df.columns)
+
+        # Add empty Existing AADT column to master CSV for apply test
+        orig_df["Existing AADT"] = None
+        orig_df["year "] = None
+        orig_df.to_csv(self.master_csv, index=False)
+
+        # 2. Apply mode (apply=True)
+        applied_df = self.engine.fill_local_spreadsheet(target_path=self.master_csv, project_id=9990001, apply=True)
+        self.assertFalse(applied_df.empty)
+
+        # Verify update on disk
+        updated_df = pd.read_csv(self.master_csv)
+        self.assertEqual(int(updated_df.loc[0, "Existing AADT"]), 16000)
+        self.assertEqual(int(updated_df.loc[0, "year "]), 2024)
+
+        # Verify backup was created
+        backups = [f for f in os.listdir(self.temp_dir.name) if f.startswith("master.csv.bak_")]
+        self.assertEqual(len(backups), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

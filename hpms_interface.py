@@ -15,6 +15,8 @@ import sys
 import json
 import math
 import time
+import shutil
+import datetime
 import argparse
 import textwrap
 import urllib.request
@@ -718,7 +720,6 @@ class HPMSCorridorEngine:
         lines.append("=" * 70)
         return "\n".join(lines)
 
-
     def format_audit_output(self, data: Dict[str, Any]) -> str:
         """Formats the project lane audit into a comprehensive comparison report."""
         pid = data["project_id"]
@@ -731,12 +732,12 @@ class HPMSCorridorEngine:
         s_a = data["spreadsheet_lanes_after"]
         s_db = data["spreadsheet_dir_before"]
         s_da = data["spreadsheet_dir_after"]
+        status = data["audit_status"]
 
-        b_yr = data.get("hpms_before_year")
-        b_ln = data.get("hpms_before_lanes")
-        a_ln = data.get("hpms_after_lanes")
-        a_wt = data.get("hpms_after_weighted")
-        status = data.get("audit_status", "UNKNOWN")
+        b_yr = data["hpms_before_year"]
+        b_ln = data["hpms_before_lanes"]
+        a_ln = data["hpms_after_lanes"]
+        a_wt = data["hpms_after_weighted"]
 
         wrapped_desc = "\n                      ".join(textwrap.wrap(desc, width=54)) if desc else "(None)"
 
@@ -772,17 +773,273 @@ class HPMSCorridorEngine:
         ]
         return "\n".join(lines)
 
+    def tandem_audit_project(self, project_id: Any) -> Dict[str, Any]:
+        """Performs a comprehensive triad audit comparing Spreadsheet, PeMS, and HPMS data side by side
+
+        for roadway geometry (before/after lanes) and traffic volumes (baseline/forecast AADT).
+        """
+        # 1. Base HPMS inspection & historical audit
+        insp = self.inspect_project(project_id)
+        hist_audit = self.audit_project(project_id)
+
+        route = insp["route"]
+        county = insp["county"]
+        dir_val = str(self.master_df[self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(project_id).strip().replace(".0", "")].iloc[0].get("Direction", "NB"))
+        dist_val = str(self.master_df[self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(project_id).strip().replace(".0", "")].iloc[0].get("Dist", ""))
+
+        bp = insp["begin_pm"]
+        ep = insp["end_pm"]
+        ab = insp["abs_begin"]
+        ae = insp["abs_end"]
+
+        # 2. Spreadsheet attributes
+        s_row = self.master_df[self.master_df["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True) == str(project_id).strip().replace(".0", "")].iloc[0]
+        s_b = insp.get("spreadsheet_lanes_before")
+        s_a = insp.get("spreadsheet_lanes_after")
+        s_db = insp.get("spreadsheet_dir_before")
+        s_da = insp.get("spreadsheet_dir_after")
+
+        s_aadt = s_row.get("Existing AADT")
+        s_aadt_yr = s_row.get("year ") if "year " in s_row else s_row.get("year", s_row.get("Existing AADT Year"))
+        s_fc_aadt = s_row.get("forecast AADT ") if "forecast AADT " in s_row else s_row.get("forecast AADT")
+        s_fc_yr = s_row.get("forecast year ") if "forecast year " in s_row else s_row.get("forecast year")
+
+        # 3. PeMS VDS Detector Query
+        pems_instrumented = False
+        pems_stations = []
+        pems_lanes = []
+        pems_predom_lanes = None
+
+        try:
+            from pems_interface import load_vds_metadata
+            meta = load_vds_metadata()
+            pems_dir = dir_val[0] if dir_val else "N"
+            stns = meta.find_corridor_stations(
+                district=dist_val,
+                route=str(route),
+                direction=pems_dir,
+                begin_pm=bp,
+                end_pm=ep,
+                station_types=("ML", "HV")
+            )
+            if stns:
+                pems_instrumented = True
+                pems_stations = [s.id for s in stns]
+                pems_lanes = [s.lanes for s in stns if s.lanes is not None]
+                if pems_lanes:
+                    from collections import Counter
+                    pems_predom_lanes = Counter(pems_lanes).most_common(1)[0][0]
+        except Exception:
+            pass
+
+        # 4. HPMS AADT & Future Forecasts
+        hpms_sections = insp.get("sections", [])
+        hpms_future_aadt = None
+        hpms_future_yr = None
+        for s in hpms_sections:
+            fa = s.get("future_aadt")
+            fy = s.get("future_aadt_year")
+            if fa is not None and str(fa).strip() != "" and str(fa).strip() != "0":
+                try:
+                    hpms_future_aadt = int(float(fa))
+                    hpms_future_yr = int(float(fy)) if fy else None
+                    break
+                except Exception:
+                    pass
+
+        # 5. Triad Verdict Synthesis
+        hpms_after = hist_audit.get("hpms_after_lanes")
+        hpms_wt = hist_audit.get("hpms_after_weighted")
+        hpms_before = hist_audit.get("hpms_before_lanes")
+
+        lane_verdict = "NEEDS_REVIEW"
+        verdict_detail = ""
+
+        # Parse numeric spreadsheet values if present
+        s_a_val = float(s_a) if pd.notna(s_a) else None
+        s_da_val = float(s_da) if pd.notna(s_da) else None
+
+        # Check directional match with PeMS
+        pems_dir_match = False
+        if pems_instrumented and pems_predom_lanes is not None:
+            if s_da_val is not None:
+                pems_dir_match = (abs(pems_predom_lanes - s_da_val) < 0.01)
+            elif s_a_val is not None:
+                pems_dir_match = (abs(pems_predom_lanes - (s_a_val / 2.0)) < 0.01)
+
+        # Check total match with HPMS
+        hpms_total_match = False
+        hpms_partial = False
+        target_total = s_a_val if s_a_val is not None else (s_da_val * 2.0 if s_da_val is not None else None)
+        if hpms_after is not None and target_total is not None:
+            hpms_total_match = (abs(hpms_after - target_total) < 0.01)
+            if hpms_wt is not None:
+                hpms_partial = (abs(hpms_wt - target_total) <= 0.6)
+
+        if s_a_val is None and s_da_val is None:
+            lane_verdict = "MISSING_SPREADSHEET_DATA"
+            verdict_detail = f"Spreadsheet missing post-expansion lane counts. Ground truth: PeMS={pems_predom_lanes or 'N/A'} dir, HPMS={hpms_after or 'N/A'} total."
+        elif pems_instrumented:
+            if pems_dir_match and hpms_total_match:
+                lane_verdict = "ALL_THREE_CONCUR"
+                verdict_detail = f"Spreadsheet (Total {target_total:.0f}, Dir {s_da_val or target_total/2:.1f}), PeMS ({pems_predom_lanes} dir), and HPMS ({hpms_after} total) all concur."
+            elif pems_dir_match and hpms_partial:
+                lane_verdict = "CONCURS_WITH_PARTIAL_HPMS"
+                verdict_detail = f"Spreadsheet and PeMS concur ({pems_predom_lanes} dir); HPMS shows passing/climbing expansion on segment ({hpms_wt:.2f} wt lanes vs sheet {target_total:.0f})."
+            elif pems_dir_match and not hpms_total_match:
+                lane_verdict = "SPREADSHEET_MATCHES_PEMS_HPMS_DIVERGES"
+                verdict_detail = f"Spreadsheet matches PeMS ({pems_predom_lanes} dir lanes); HPMS reports {hpms_after} total lanes (wt: {hpms_wt})."
+            elif not pems_dir_match and hpms_total_match:
+                lane_verdict = "SPREADSHEET_MATCHES_HPMS_PEMS_DIVERGES"
+                verdict_detail = f"Spreadsheet matches HPMS ({hpms_after} total lanes); PeMS detectors show {pems_predom_lanes} dir lanes."
+            else:
+                lane_verdict = "DISCREPANCY"
+                verdict_detail = f"Discrepancy: Sheet Total={target_total:.0f}, PeMS={pems_predom_lanes} dir, HPMS={hpms_after} total."
+        else:
+            # PeMS uninstrumented
+            if hpms_total_match:
+                lane_verdict = "UNINSTRUMENTED_PEMS_RESOLVED_BY_HPMS"
+                verdict_detail = f"PeMS has 0 sensors (rural highway); HPMS confirms ground truth ({hpms_after} total lanes) matching spreadsheet."
+            elif hpms_partial:
+                lane_verdict = "PARTIAL_CORRIDOR_EXPANSION"
+                verdict_detail = f"HPMS shows passing/truck climbing expansion on portion of segment ({hpms_wt:.2f} wt total lanes vs sheet {target_total:.0f})."
+            elif hpms_after is not None:
+                lane_verdict = "HPMS_MISMATCH_UNINSTRUMENTED_PEMS"
+                verdict_detail = f"PeMS has 0 sensors; HPMS reports {hpms_after} total lanes vs spreadsheet {target_total:.0f}."
+            else:
+                lane_verdict = "NO_GROUND_TRUTH_AVAILABLE"
+                verdict_detail = "Neither PeMS sensors nor HPMS segments available."
+
+        return {
+            "project_id": project_id,
+            "route": route,
+            "county": county,
+            "direction": dir_val,
+            "district": dist_val,
+            "begin_pm": bp,
+            "end_pm": ep,
+            "abs_begin": ab,
+            "abs_end": ae,
+            "description": insp.get("description", ""),
+            "const_date": insp.get("const_date"),
+            "open_date": insp.get("open_date"),
+            # Spreadsheet
+            "sheet_total_before": s_b,
+            "sheet_total_after": s_a,
+            "sheet_dir_before": s_db,
+            "sheet_dir_after": s_da,
+            "sheet_aadt": s_aadt,
+            "sheet_aadt_year": s_aadt_yr,
+            "sheet_forecast_aadt": s_fc_aadt,
+            "sheet_forecast_year": s_fc_yr,
+            # PeMS
+            "pems_instrumented": pems_instrumented,
+            "pems_stations_count": len(pems_stations),
+            "pems_stations": pems_stations,
+            "pems_corridor_lanes": pems_lanes,
+            "pems_predom_lanes": pems_predom_lanes,
+            # HPMS
+            "hpms_before_year": hist_audit.get("hpms_before_year"),
+            "hpms_before_lanes": hpms_before,
+            "hpms_after_year": 2024,
+            "hpms_after_lanes": hpms_after,
+            "hpms_after_weighted": hpms_wt,
+            "hpms_sections_count": insp.get("hpms_sections_count", 0),
+            "hpms_lane_distribution": insp.get("hpms_lane_distribution_mi", {}),
+            "hpms_2024_aadt": insp.get("hpms_avg_aadt_2024"),
+            "hpms_future_aadt": hpms_future_aadt,
+            "hpms_future_year": hpms_future_yr,
+            # Synthesis
+            "lane_verdict": lane_verdict,
+            "verdict_detail": verdict_detail
+        }
+
+    def format_tandem_output(self, data: Dict[str, Any]) -> str:
+        """Formats the multi-source triad audit (Spreadsheet vs PeMS vs HPMS) into a clean terminal report."""
+        pid = data["project_id"]
+        desc = data["description"]
+        route = data["route"]
+        county = data["county"]
+        dir_val = data["direction"]
+        bp = data["begin_pm"]
+        ep = data["end_pm"]
+        ab = data["abs_begin"]
+        ae = data["abs_end"]
+        cd = data["const_date"]
+        od = data["open_date"]
+
+        s_b = str(data["sheet_total_before"])
+        s_a = str(data["sheet_total_after"])
+        s_db = str(data["sheet_dir_before"])
+        s_da = str(data["sheet_dir_after"])
+
+        p_inst = data["pems_instrumented"]
+        p_stns = data["pems_stations_count"]
+        p_ln = f"{data['pems_predom_lanes']} lanes" if data["pems_predom_lanes"] is not None else "(No VDS)"
+
+        h_b_yr = data["hpms_before_year"]
+        h_b_ln = f"{data['hpms_before_lanes']} lanes" if data["hpms_before_lanes"] is not None else "N/A"
+        h_a_ln = f"{data['hpms_after_lanes']} lanes" if data["hpms_after_lanes"] is not None else "N/A"
+        h_wt = f"{data['hpms_after_weighted']} wt" if data["hpms_after_weighted"] is not None else ""
+
+        # AADT formatting
+        s_aadt = f"{int(float(data['sheet_aadt'])):,}" if pd.notna(data.get("sheet_aadt")) and str(data.get("sheet_aadt")).replace('.0','').isdigit() else "(None)"
+        s_yr = f"({int(float(data['sheet_aadt_year']))})" if pd.notna(data.get("sheet_aadt_year")) and str(data.get("sheet_aadt_year")).replace('.0','').isdigit() else ""
+        s_fc = f"{int(float(data['sheet_forecast_aadt'])):,}" if pd.notna(data.get("sheet_forecast_aadt")) and str(data.get("sheet_forecast_aadt")).replace('.0','').isdigit() else "(None)"
+        s_fc_yr = f"({int(float(data['sheet_forecast_year']))})" if pd.notna(data.get("sheet_forecast_year")) and str(data.get("sheet_forecast_year")).replace('.0','').isdigit() else ""
+
+        h_aadt = f"{data['hpms_2024_aadt']:,} vpd" if data.get("hpms_2024_aadt") else "N/A"
+        h_fc = f"{data['hpms_future_aadt']:,} vpd" if data.get("hpms_future_aadt") else "N/A"
+        h_fc_yr = f"({data['hpms_future_year']})" if data.get("hpms_future_year") else ""
+
+        wrapped_desc = "\n                     ".join(textwrap.wrap(desc, width=64)) if desc else "(None)"
+
+        h_sec_cnt = data["hpms_sections_count"]
+        h_dist_str = str(data["hpms_lane_distribution"])
+
+        lines = [
+            "",
+            "=" * 88,
+            f"CERCET TRIAD CORRIDOR VERIFICATION: Project {pid} [{data['lane_verdict']}]",
+            "=" * 88,
+            f"  Description:       {wrapped_desc}",
+            f"  Corridor:          Route {route} {dir_val} | {county} County | PM {bp} - {ep} (Abs {ab:.2f} - {ae:.2f})",
+            f"  Schedule:          Const: {cd or '(Unknown)'} | Open: {od or '(Unknown)'}",
+            "",
+            "-" * 88,
+            f"{'CROSS-SECTION (LANES)':<25} {'SPREADSHEET':<20} {'PEMS DETECTORS':<20} {'HPMS FEDERAL GROUND TRUTH':<23}",
+            "-" * 88,
+            f"{'Pre-Const Total':<25} {s_b:<20} {'(Station-level)':<20} {f'{h_b_ln} (Year {h_b_yr})':<23}",
+            f"{'Pre-Const Directional':<25} {s_db:<20} {'(Station-level)':<20} {'N/A':<23}",
+            f"{'Post-Const Total':<25} {s_a:<20} {p_ln:<20} {f'{h_a_ln} ({h_wt})':<23}",
+            f"{'Post-Const Directional':<25} {s_da:<20} {p_ln:<20} {'N/A':<23}",
+            f"{'Corridor Coverage':<25} {'Spreadsheet':<20} {f'{p_stns} active VDS':<20} {f'{h_sec_cnt} road segments':<23}",
+            f"{'Lane Miles Overlap':<25} {'(Single estimate)':<20} {'(Loop sensors)':<20} {h_dist_str:<23}",
+            "",
+            "-" * 88,
+            f"{'TRAFFIC VOLUMES (AADT)':<25} {'SPREADSHEET':<20} {'PEMS DETECTORS':<20} {'HPMS CERTIFIED VOLUMES':<23}",
+            "-" * 88,
+            f"{'Existing / Baseline':<25} {f'{s_aadt} {s_yr}':<20} {'(Time-series loop)':<20} {h_aadt:<23}",
+            f"{'Forecast / Future':<25} {f'{s_fc} {s_fc_yr}':<20} {'(Not forecasted)':<20} {f'{h_fc} {h_fc_yr}':<23}",
+            "",
+            "-" * 88,
+            f"VERDICT: {data['lane_verdict']}",
+            f"  {data['verdict_detail']}",
+            "=" * 88
+        ]
+        return "\n".join(lines)
+
     def audit_district(self, district: Optional[int] = None) -> pd.DataFrame:
-        """Audits all projects in a Caltrans District or statewide against HPMS ground truth."""
+        """Audits all projects in a Caltrans District or statewide against HPMS ground truth and PeMS detectors side by side."""
         df = self.master_df.copy()
         if district is not None:
-            # Filter by district
             dist_col = "Dist" if "Dist" in df.columns else "District"
             df = df[pd.to_numeric(df[dist_col], errors="coerce") == district]
 
         results = []
         total = len(df)
-        print(f"Auditing {total} projects against HPMS ground truth...")
+        scope_desc = f"District {district}" if district is not None else "Statewide"
+        print(f"\nRunning CERCET Triad Multi-Source Audit ({scope_desc}): {total} projects...")
 
         for i, (_, row) in enumerate(df.iterrows(), 1):
             pid = row.get("Project ID")
@@ -790,49 +1047,286 @@ class HPMSCorridorEngine:
                 continue
             pid = int(pid)
             try:
-                audit = self.audit_project(pid)
+                t = self.tandem_audit_project(pid)
                 results.append({
                     "Project ID": pid,
-                    "Route": audit["route"],
-                    "County": audit["county"],
-                    "Begin PM": audit["begin_pm"],
-                    "End PM": audit["end_pm"],
-                    "Spreadsheet Before": audit["spreadsheet_lanes_before"],
-                    "Spreadsheet After": audit["spreadsheet_lanes_after"],
-                    "HPMS 2024 Lanes": audit["hpms_after_lanes"],
-                    "HPMS 2024 Wt Lanes": audit["hpms_after_weighted"],
-                    "HPMS 2024 AADT": audit["hpms_avg_aadt_2024"],
-                    "Audit Status": audit["audit_status"],
-                    "HPMS Segments": audit["hpms_sections_count"],
-                    "Description": audit["description"]
+                    "Route": t["route"],
+                    "County": t["county"],
+                    "Direction": t["direction"],
+                    "District": t["district"],
+                    "Begin PM": t["begin_pm"],
+                    "End PM": t["end_pm"],
+                    "Abs Begin PM": t["abs_begin"],
+                    "Abs End PM": t["abs_end"],
+                    "Spreadsheet Total Before": t["sheet_total_before"],
+                    "Spreadsheet Total After": t["sheet_total_after"],
+                    "Spreadsheet Dir Before": t["sheet_dir_before"],
+                    "Spreadsheet Dir After": t["sheet_dir_after"],
+                    "PeMS Predom Lanes (Dir)": t["pems_predom_lanes"],
+                    "PeMS Active VDS Count": t["pems_stations_count"],
+                    "HPMS Before Year": t["hpms_before_year"],
+                    "HPMS Before Lanes (Total)": t["hpms_before_lanes"],
+                    "HPMS 2024 Lanes (Total)": t["hpms_after_lanes"],
+                    "HPMS 2024 Wt Lanes": t["hpms_after_weighted"],
+                    "HPMS Segments Count": t["hpms_sections_count"],
+                    "Spreadsheet Existing AADT": t["sheet_aadt"],
+                    "Spreadsheet Baseline Year": t["sheet_aadt_year"],
+                    "HPMS 2024 AADT": t["hpms_2024_aadt"],
+                    "Spreadsheet Forecast AADT": t["sheet_forecast_aadt"],
+                    "Spreadsheet Forecast Year": t["sheet_forecast_year"],
+                    "HPMS Future AADT": t["hpms_future_aadt"],
+                    "HPMS Future Year": t["hpms_future_year"],
+                    "Lane Verdict": t["lane_verdict"],
+                    "Verdict Detail": t["verdict_detail"],
+                    "Description": t["description"]
                 })
-                print(f"  [{i}/{total}] PID {pid} (Route {audit['route']}): {audit['audit_status']}")
+                print(f"  [{i}/{total}] PID {pid} (Route {t['route']}): {t['lane_verdict']}")
             except Exception as e:
                 results.append({
                     "Project ID": pid,
                     "Route": row.get("Route"),
                     "County": row.get("County"),
-                    "Audit Status": f"ERROR: {e}",
+                    "Lane Verdict": f"ERROR: {e}",
                     "Description": row.get("Project Description", "")
                 })
                 print(f"  [{i}/{total}] PID {pid}: ERROR {e}")
 
         return pd.DataFrame(results)
 
+    def fill_local_spreadsheet(self, target_path: Optional[str] = None,
+                               project_id: Optional[Any] = None,
+                               district: Optional[int] = None,
+                               apply: bool = False) -> pd.DataFrame:
+        """Identifies missing or unverifiable attributes in the local spreadsheet and proposes or applies
+        high-confidence ground-truth values from HPMS and PeMS.
+
+        CRITICAL SAFETY RULE: Refuses to touch any file path inside Box-Box.
+        Targets strictly staging/Master_CA_Project_List_Cleaned.csv (or a specified local path)
+        with automatic timestamped backups before writing.
+        """
+        if target_path is None:
+            target_path = os.path.join(WORKSPACE_DIR, "staging", "Master_CA_Project_List_Cleaned.csv")
+
+        abs_path = os.path.abspath(target_path)
+        # STRICT BOX-BOX REJECTION GUARD
+        if "box-box" in abs_path.lower() or "cloudstorage/box" in abs_path.lower():
+            raise PermissionError(
+                f"CRITICAL SAFETY VIOLATION: Refusing to modify Box spreadsheet at {target_path}. "
+                "Direct edits to the Box master spreadsheet are strictly prohibited. "
+                "Target only local repository files (e.g. staging/Master_CA_Project_List_Cleaned.csv)."
+            )
+
+        if not os.path.exists(target_path):
+            raise FileNotFoundError(f"Local master spreadsheet not found: {target_path}")
+
+        df_local = pd.read_csv(target_path, low_memory=False)
+
+        # Determine target rows
+        if project_id is not None:
+            target_pid_str = str(project_id).strip().replace(".0", "")
+            pids = df_local["Project ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            sub_df = df_local[pids == target_pid_str]
+        elif district is not None:
+            dist_col = "Dist" if "Dist" in df_local.columns else "District"
+            sub_df = df_local[pd.to_numeric(df_local[dist_col], errors="coerce") == district]
+        else:
+            sub_df = df_local
+
+        # Year and AADT column name resolution
+        year_col = "year " if "year " in df_local.columns else "year"
+        fc_aadt_col = "forecast AADT " if "forecast AADT " in df_local.columns else "forecast AADT"
+        fc_year_col = "forecast year " if "forecast year " in df_local.columns else "forecast year"
+
+        candidates = []
+        applied_count = 0
+
+        for idx, row in sub_df.iterrows():
+            pid = row.get("Project ID")
+            if pd.isna(pid):
+                continue
+            try:
+                t = self.tandem_audit_project(pid)
+            except Exception:
+                continue
+
+            # 1. Existing AADT
+            curr_aadt = row.get("Existing AADT")
+            if pd.isna(curr_aadt) or str(curr_aadt).strip() in ("", "0", "0.0") or not str(curr_aadt).replace('.', '').isdigit():
+                if t.get("hpms_2024_aadt"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "Existing AADT",
+                        "current_val": curr_aadt,
+                        "proposed_val": int(t["hpms_2024_aadt"]),
+                        "field_year": year_col,
+                        "proposed_year": 2024,
+                        "source": "HPMS 2024 Certified Traffic Volumes",
+                        "confidence": "HIGH"
+                    })
+
+            # 2. Forecast AADT
+            curr_fc = row.get(fc_aadt_col)
+            if pd.isna(curr_fc) or str(curr_fc).strip() in ("", "0", "0.0") or not str(curr_fc).replace('.', '').isdigit():
+                if t.get("hpms_future_aadt"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": fc_aadt_col,
+                        "current_val": curr_fc,
+                        "proposed_val": int(t["hpms_future_aadt"]),
+                        "field_year": fc_year_col,
+                        "proposed_year": t.get("hpms_future_year") or 2040,
+                        "source": "HPMS Official Future Forecast",
+                        "confidence": "HIGH"
+                    })
+
+            # 3. Total Lanes After
+            curr_tla = row.get("total_lanes_after")
+            if pd.isna(curr_tla) or str(curr_tla).strip() in ("", "0", "0.0") or not str(curr_tla).replace('.', '').isdigit():
+                if t.get("hpms_after_lanes"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "total_lanes_after",
+                        "current_val": curr_tla,
+                        "proposed_val": float(t["hpms_after_lanes"]),
+                        "source": "HPMS 2024 Ground Truth",
+                        "confidence": "HIGH"
+                    })
+                elif t.get("pems_predom_lanes"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "total_lanes_after",
+                        "current_val": curr_tla,
+                        "proposed_val": float(t["pems_predom_lanes"] * 2),
+                        "source": "PeMS VDS Sensors (bi-directional estimate)",
+                        "confidence": "MEDIUM"
+                    })
+
+            # 4. Directional Lanes After
+            curr_dla = row.get("dir_lanes_after")
+            if pd.isna(curr_dla) or str(curr_dla).strip() in ("", "0", "0.0") or not str(curr_dla).replace('.', '').isdigit():
+                if t.get("pems_predom_lanes"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "dir_lanes_after",
+                        "current_val": curr_dla,
+                        "proposed_val": float(t["pems_predom_lanes"]),
+                        "source": "PeMS Active Mainline VDS",
+                        "confidence": "HIGH"
+                    })
+                elif t.get("hpms_after_lanes"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "dir_lanes_after",
+                        "current_val": curr_dla,
+                        "proposed_val": round(float(t["hpms_after_lanes"]) / 2.0, 1),
+                        "source": "HPMS 2024 (halved for directional)",
+                        "confidence": "MEDIUM"
+                    })
+
+            # 5. Total Lanes Before
+            curr_tlb = row.get("total_lanes_before")
+            if pd.isna(curr_tlb) or str(curr_tlb).strip() in ("", "0", "0.0") or not str(curr_tlb).replace('.', '').isdigit():
+                if t.get("hpms_before_lanes"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "total_lanes_before",
+                        "current_val": curr_tlb,
+                        "proposed_val": float(t["hpms_before_lanes"]),
+                        "source": f"HPMS Pre-Const Historical Event ({t.get('hpms_before_year')})",
+                        "confidence": "HIGH"
+                    })
+
+            # 6. Directional Lanes Before
+            curr_dlb = row.get("dir_lanes_before")
+            if pd.isna(curr_dlb) or str(curr_dlb).strip() in ("", "0", "0.0") or not str(curr_dlb).replace('.', '').isdigit():
+                if t.get("hpms_before_lanes"):
+                    candidates.append({
+                        "index": idx,
+                        "project_id": pid,
+                        "field": "dir_lanes_before",
+                        "current_val": curr_dlb,
+                        "proposed_val": round(float(t["hpms_before_lanes"]) / 2.0, 1),
+                        "source": "HPMS Historical (halved for directional)",
+                        "confidence": "MEDIUM"
+                    })
+
+        cand_df = pd.DataFrame(candidates)
+
+        if not apply:
+            # Preview Mode
+            print("\n" + "=" * 90)
+            print("LOCAL SPREADSHEET FILL PREVIEW (DRY-RUN)")
+            print(f"Target File: {target_path}")
+            print(f"Total Candidate Fills Identified: {len(candidates)}")
+            print("=" * 90)
+            if candidates:
+                preview_cols = ["project_id", "field", "current_val", "proposed_val", "source", "confidence"]
+                print(cand_df[preview_cols].to_string(index=False))
+                print("-" * 90)
+                print("NOTE: No changes have been written to disk. To apply these updates, run with:")
+                if project_id:
+                    print(f"  python hpms_interface.py -p {project_id} --apply-local")
+                elif district:
+                    print(f"  python hpms_interface.py --dist {district} --fill-local --apply-local")
+                else:
+                    print("  python hpms_interface.py --fill-local --apply-local")
+            else:
+                print("All examined attributes are already populated.")
+            print("=" * 90)
+            return cand_df
+
+        # Apply Mode
+        if candidates:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{target_path}.bak_{ts}"
+            shutil.copy2(target_path, backup_path)
+            print(f"\n[BACKUP CREATED]: {backup_path}")
+
+            for c in candidates:
+                idx = c["index"]
+                fld = c["field"]
+                val = c["proposed_val"]
+                df_local.at[idx, fld] = val
+                if "field_year" in c and c["field_year"] and "proposed_year" in c:
+                    df_local.at[idx, c["field_year"]] = c["proposed_year"]
+                applied_count += 1
+
+            df_local.to_csv(target_path, index=False)
+            print(f"[APPLIED SUCCESSFULLY]: Updated {applied_count} values in {target_path}")
+        else:
+            print("\nNo candidate fills to apply.")
+
+        return cand_df
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="FHWA HPMS Ground-Truth Highway Interface for CERCET Project Validation."
+        description="FHWA HPMS & Caltrans PeMS Multi-Source Ground-Truth Interface for CERCET Project Validation."
     )
     # Target project
     parser.add_argument("--project", "-p", "--inspect", type=int,
-                        help="Target Project ID to inspect with HPMS data (includes full description).")
+                        help="Target Project ID to inspect with HPMS & PeMS data (includes full description).")
+    parser.add_argument("--tandem", "-t", action="store_true",
+                        help="Run triad verification comparing Spreadsheet, PeMS, and HPMS side by side.")
     parser.add_argument("--map", "-m", nargs="?", const=-1, type=int,
                         help="Generate interactive HTML map with HPMS road segments colored by lane count (e.g. --map 713000217).")
     parser.add_argument("--audit", "-a", action="store_true",
                         help="Audit project lane counts against HPMS ground truth (single project with -p, or district with --dist).")
+    parser.add_argument("--audit-all", action="store_true",
+                        help="Run full triad audit statewide across all projects in the master dataset.")
     parser.add_argument("--dist", "-d", type=int,
                         help="Caltrans District number for district-wide audit (e.g. --audit --dist 7).")
+    parser.add_argument("--fill-local", action="store_true",
+                        help="Preview candidate values to fill missing attributes in the local master spreadsheet.")
+    parser.add_argument("--apply-local", action="store_true",
+                        help="Apply high-confidence fills directly to local spreadsheet (staging/Master_CA_Project_List_Cleaned.csv) with backup.")
     parser.add_argument("--output-map", "-o", type=str,
                         help="Custom output file path for generated HTML map.")
     parser.add_argument("--output-report", type=str,
@@ -859,6 +1353,16 @@ def main():
 
     engine = HPMSCorridorEngine(master_csv_path=args.input)
 
+    # 1. Fill Local Spreadsheet Option
+    if args.fill_local or args.apply_local:
+        engine.fill_local_spreadsheet(
+            target_path=args.input,
+            project_id=args.project,
+            district=args.dist,
+            apply=args.apply_local
+        )
+        return
+
     # Determine target PID
     pid = args.project
     if args.map and args.map != -1:
@@ -870,26 +1374,29 @@ def main():
             out_file = engine.generate_hpms_map(pid, output_html=args.output_map)
             print(f"\nSuccessfully generated HPMS corridor map for Project {pid}:")
             print(f"  {out_file}")
-            # Also show inspection summary
-            res = engine.inspect_project(pid)
-            print(engine.format_inspection_output(res))
+            # Also show tandem summary
+            res = engine.tandem_audit_project(pid)
+            print(engine.format_tandem_output(res))
         elif args.audit:
-            # Audit single project
+            # Audit single project (historical HPMS audit)
             audit_res = engine.audit_project(pid)
             print(engine.format_audit_output(audit_res))
         else:
-            # Default: inspect project
-            res = engine.inspect_project(pid)
-            print(engine.format_inspection_output(res))
+            # Default: triad multi-source tandem verification!
+            tandem_res = engine.tandem_audit_project(pid)
+            print(engine.format_tandem_output(tandem_res))
 
-    elif args.audit:
+    elif args.audit or args.audit_all:
         # District-wide or statewide audit
         report_df = engine.audit_district(district=args.dist)
         out_path = args.output_report or os.path.join(WORKSPACE_DIR, f"hpms_audit_report_dist_{args.dist or 'all'}.csv")
         report_df.to_csv(out_path, index=False)
-        print(f"\nAudit complete! Saved report to:\n  {out_path}")
+        print(f"\nAudit complete! Saved side-by-side report to:\n  {out_path}")
         print("\nAudit Summary by Status:")
-        print(report_df["Audit Status"].value_counts())
+        if "Lane Verdict" in report_df.columns:
+            print(report_df["Lane Verdict"].value_counts())
+        elif "Audit Status" in report_df.columns:
+            print(report_df["Audit Status"].value_counts())
 
     elif args.route and args.begin_pm is not None and args.end_pm is not None:
         county_fips = CA_COUNTY_FIPS.get(args.county.lower()) if args.county else None
@@ -916,12 +1423,14 @@ def main():
             print(f"  ... and {len(sections) - 20} more segments.")
     else:
         # If no arguments provided, show help
-        print("HPMS Interface & Corridor Ground-Truth Validation Engine")
+        print("CERCET Multi-Source Triad Interface (Spreadsheet vs PeMS vs HPMS)")
         print("Usage:")
-        print("  python hpms_interface.py -p <PID>            # Inspect project with HPMS data & description")
-        print("  python hpms_interface.py -p <PID> --map      # Generate interactive Folium map with HPMS layers")
-        print("  python hpms_interface.py -p <PID> --audit    # Compare HPMS before/after lanes vs spreadsheet")
-        print("  python hpms_interface.py --audit --dist <D>  # District-wide lane validation audit")
+        print("  python hpms_interface.py -p <PID>            # Triad verification (Spreadsheet vs PeMS vs HPMS side-by-side)")
+        print("  python hpms_interface.py -p <PID> --map      # Interactive Folium map with HPMS layer popups")
+        print("  python hpms_interface.py --audit --dist <D>  # District-wide triad audit with side-by-side output")
+        print("  python hpms_interface.py --audit-all         # Statewide triad audit across all projects")
+        print("  python hpms_interface.py --fill-local        # Preview ground-truth fills for local spreadsheet")
+        print("  python hpms_interface.py --apply-local       # Apply ground-truth fills to local spreadsheet with backup")
         print("\nRun `python hpms_interface.py --help` for full options.")
 
 
