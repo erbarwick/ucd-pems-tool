@@ -121,9 +121,12 @@ coordinates) of every
 highway in California
 
 - **State Postmile (`CA PM`) vs. Absolute Postmile (`Abs PM`)**:
-    - **State Postmiles (`CA PM`)**: For state planning purposes; CA PM resets to 0 at every county boundary
+    - **State Postmiles (`CA PM`)**: For state planning purposes; CA PM resets to 0 at every county boundary.
     - **Absolute Postmiles (`Abs PM`)**: More stable over time; 0 starts at the southern or western boundary of
       California.
+    - **Automatic Conversion**: `pems_interface.py` uses `resolve_absolute_postmiles()` to automatically calculate
+      continuous Absolute Postmiles from county-relative California Postmiles (`Begin PM` and `End PM`), ensuring consistent
+      linear referencing and corridor alignment even across county borders and HPMS spatial datasets.
 
 ### Source 3: PeMS Detector Metadata (`downloads/metadata/`)
 
@@ -173,8 +176,8 @@ verifies that the returned text contains an actual data table.
 The CLI in `pems_interface.py` provides an intuitive, streamlined interface organized around your target project and task. All flags can be combined naturally with `-p <PID>` or passed directly:
 
 ```bash
-# 1. INSPECT a project (description, postmiles, dates, sensor stations, and PeMS URLs):
-python pems_interface.py -p 400000680
+# 1. INSPECT a project (description, CA & calculated Absolute postmiles, dates, sensor stations, and PeMS URLs):
+python pems_interface.py -p 200000288
 
 # 2. HIGH-RES CORRIDOR SLICES (Native Zoom 19 Before/After curtain-wipe comparison report):
 python pems_interface.py -p 400000680 --slices
@@ -195,6 +198,16 @@ python pems_interface.py -s 404534                           # Single station ac
 python pems_interface.py --audit                             # Dry-run statewide
 python pems_interface.py -p 400000680 --audit                # Audit specific project
 python pems_interface.py --audit --apply                     # Commit updates with backup
+
+# 7. INFER OPEN-TO-TRAFFIC DATE (PeMS Lane Config & Detector Telemetry):
+python pems_interface.py -p 300020420 --find-open-date          # Infer opening date with telemetry proof
+python pems_interface.py --find-open-date                       # Evaluate all missing projects statewide
+python pems_interface.py --find-open-date --apply               # Commit inferred dates with backup
+
+# 8. FETCH RAW PeMS STATION LANE TABLES & TSN ROADWAY METRICS:
+python pems_interface.py -p 400000680 --lanes                 # Fetch lane tables & TSN metrics for all project stations
+python pems_interface.py -s 410756 --lanes                    # Fetch raw lane table & TSN metrics for single station
+python pems_interface.py -p 400000680 --lanes --output-report reports/lanes.json  # Export structured JSON
 ```
 
 > **Note:** All previous commands (such as `--inspect <PID>`, `--download-project <PID>`, `--download-station <SID>`, `--corridor-slices`, and `--match-stations`) remain 100% supported for backward compatibility. Run `python pems_interface.py --help` to see all grouped options and aliases.
@@ -303,11 +316,13 @@ When using `--corridor-slices`, the tool creates an organized folder per project
 
 ## 4. Auditing project data
 
-To inspect all project attributes (route, direction, postmiles, coordinates, dates, and sensors) and view PeMS URLs:
+To inspect all project attributes (route, direction, county postmiles, automatically calculated absolute postmiles, coordinates, dates, and sensors) and view PeMS URLs:
 
 ```bash
-python pems_interface.py --inspect 418000244
+python pems_interface.py -p 200000288
 ```
+
+When inspecting a project (`-p <PID>` or `--inspect <PID>`), `pems_interface.py` dynamically resolves county-relative postmiles (`Begin PM` and `End PM`) to continuous absolute postmiles using the 331K-row reference table. For projects where absolute postmiles are not yet populated in the spreadsheet, they are automatically calculated and displayed on the `Absolute PMs:` line.
 
 To run a check across all projects to identify which spreadsheet sensors match active PeMS sensors and flag
 discrepancies:
@@ -332,6 +347,110 @@ python pems_interface.py --match-stations --apply
 
 > Note: This command also automatically creates a timestamped backup of the master CSV before modifying.
  
+---
+
+## Automatically Inferring "Open to Traffic Date" (Option 1)
+
+For projects missing an "Open to Traffic Date", or projects where only an approximate completion year is recorded, `pems_interface.py` can automatically discover the exact opening date using PeMS lane configuration history and detector telemetry:
+
+1. **Station Configuration Step-Changes**: Queries the historical configuration records from the PeMS VDS Summary (`dnode=VDS&content=summary&tab=summary&station_id={st_id}`) to detect the exact date where the recorded number of lanes increments (e.g., stepping from 2 to 3 lanes) or where new sensors are first commissioned as `Active`.
+2. **Daily Telemetry Corroboration**: Queries daily flow timeseries (`tab=det_timeseries&q=flow&gn=day`) around the transition period. In PeMS, each active lane generates 288 daily sample intervals; a permanent step-change in `# Lane Points` (e.g. 576 $\rightarrow$ 864 points = 2 to 3 lanes) or the onset of sustained mainline flow ($>500$ veh/day) corroborates the activation with `HIGH` confidence.
+
+### Command-Line Usage:
+
+```bash
+# Infer opening date for a specific project (DRY RUN):
+python pems_interface.py -p 300020420 --find-open-date
+
+# Run statewide evaluation across all projects missing Open to Traffic Date:
+python pems_interface.py --find-open-date
+
+# Filter evaluation to a specific Caltrans District:
+python pems_interface.py --find-open-date --dist 3
+
+# Fast scan without daily flow telemetry verification:
+python pems_interface.py -p 300020420 --find-open-date --no-telemetry
+
+# Commit inferred dates (HIGH and MEDIUM confidence) to the master CSV:
+python pems_interface.py --find-open-date --apply
+
+# Export a structured inference report (CSV or Markdown):
+python pems_interface.py --find-open-date --output-report reports/inferred_open_dates.md
+```
+
+### Python API Example:
+
+```python
+from pems_interface import PeMSClient, infer_project_open_to_traffic, load_master_csv
+
+client = PeMSClient()
+client.login()
+
+# Infer opening date for project 300020420
+inf = infer_project_open_to_traffic("300020420", client=client, check_telemetry=True)
+
+print(f"Project:      {inf.project_id} (Route {inf.route} {inf.direction})")
+print(f"Inferred:     {inf.inferred_date} ({inf.confidence} confidence)")
+print(f"Method:       {inf.method}")
+print(f"Evidence:     {inf.evidence}")
+```
+
+---
+
+## Inspecting Raw PeMS Station Lane Tables & Caltrans TSN Roadway Metrics
+
+You can directly fetch and display the raw PeMS station lane tables and Caltrans TSN roadway attributes for any project or detector station without guessing or synthesizing lane classifications.
+
+### What PeMS Defines:
+* **Caltrans TSN Roadway Metrics**: `Road Width` (ft), `Lane Width` (ft), `Inner Shoulder Width` & treated width, `Outer Shoulder Width` & treated width, `Design Speed Limit`, `Functional Class`, `Inner Median Type & Width`, `Surface`, `Terrain`, `Population`, `Barrier`, and `Roadway Use` (e.g. *"Median Lane is HOV Lane"*).
+* **PeMS Station Lane Configuration Table**: The detector loop setup across each lane numbered 1 to $N$, with sensor technology (e.g. `Dual Loop`, `Wavetronix SS125HD`) and PeMS facility type (strictly recorded as `Mainline` or `HOV`).
+* **PeMS Configuration History / Change Log**: The chronological timeline of lane configurations showing when lane counts changed (e.g. `12` -> `123` or `1234` -> `12345`), detector status (`Active`), and postmiles.
+* **Caltrans Construction History**: Start and end dates recorded for construction projects impacting the detector.
+
+> **Important:** PeMS does **not** track granular lane types such as *truck climbing lanes*, *auxiliary lanes*, or *turn pockets*. All through-lanes are uniformly labeled `Mainline` (or `HOV`). This tool presents the exact raw attributes recorded by Caltrans and PeMS so you can directly compare them against your spreadsheet.
+>
+> **HPMS Tandem Integration:** When Caltrans PeMS has not linked TSN data for a station (`Roadway Information (from TSN): Not Available`), the `--lanes` command automatically incorporates certified **FHWA / Caltrans HPMS Ground-Truth Roadway Attributes** for the project corridor (`Through Lanes`, `Facility Type`, `Access Control`, `Surface Type`, `Functional System`, `AADT`, and `Future Forecast AADT`).
+
+### Command-Line Usage:
+
+```bash
+# Fetch lane tables & TSN roadway metrics for all stations associated with a Project ID:
+python pems_interface.py -p 400000680 --lanes
+# or
+python pems_interface.py --lanes 400000680
+
+# Fetch lane table & TSN metrics for a single detector station ID:
+python pems_interface.py -s 410756 --lanes
+
+# Export structured JSON containing all parsed tables and TSN key-value pairs:
+python pems_interface.py -p 400000680 --lanes --output-report reports/project_lanes.json
+```
+
+### Python API Example:
+
+```python
+from pems_interface import (
+    PeMSClient,
+    fetch_project_lane_configurations,
+    fetch_station_lane_configuration,
+    format_lane_config_report,
+)
+
+client = PeMSClient()
+client.login()
+
+# Fetch for a project (includes spreadsheet sensors + active corridor VDS):
+res = fetch_project_lane_configurations("400000680", client=client)
+for st in res["stations"]:
+    print(f"Station {st.station_id}: {st.station_name}")
+    print("  TSN Metrics:", st.tsn_roadway_info)
+    print("  Lane Table: ", st.lane_table)
+    print("  Change Log: ", len(st.change_log), "events")
+
+# Pretty-print formatted report:
+print(format_lane_config_report(res["stations"], project=res["projects"][0]))
+```
+
 ---
 
 ## See the data on a map in your browser
@@ -374,6 +493,13 @@ You can import `pems_interface` as long as `pems_interface.py` is in the same di
 
 ```python
 import pems_interface
+
+# Calculate Absolute Postmiles from California County Postmiles:
+abs_begin, abs_end = pems_interface.resolve_absolute_postmiles(
+    route="5", county="Shasta", begin_pm="39", end_pm="41.2"
+)
+print(f"Absolute PMs: {abs_begin} -> {abs_end}")
+# Absolute PMs: 700.0 -> 702.2
 
 # PM to lat/long:
 coords = pems_interface.pm_to_coordinates(

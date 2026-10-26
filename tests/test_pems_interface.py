@@ -1556,6 +1556,586 @@ class TestCLIAndProjectDescription(unittest.TestCase):
         self.assertEqual(res.at[0, "Sensor Station 2 ID "], "")
 
 
+class TestAbsolutePostmileCalculation(unittest.TestCase):
+    """Tests for calculating absolute postmiles from California postmiles in pems_interface."""
+
+    def setUp(self):
+        self.mock_ref = pd.DataFrame([
+            {"Route": "5", "Direction": "S", "County": "Shasta", "CA PM": "39.0", "Abs PM": "700.0", "Latitude": "40.8688", "Longitude": "-122.3663"},
+            {"Route": "5", "Direction": "S", "County": "Shasta", "CA PM": "41.2", "Abs PM": "702.2", "Latitude": "40.8946", "Longitude": "-122.3833"},
+            {"Route": "138", "Direction": "W", "County": "Los Angeles", "CA PM": "R55.0", "Abs PM": "48.5", "Latitude": "34.5", "Longitude": "-117.9"},
+            {"Route": "138", "Direction": "W", "County": "Los Angeles", "CA PM": "56.3", "Abs PM": "49.8", "Latitude": "34.5", "Longitude": "-117.8"},
+        ])
+
+    def test_resolve_absolute_postmiles_numeric_and_prefixed(self):
+        # Plain numeric string route and PM
+        b, e = pems_interface.resolve_absolute_postmiles("5", "Shasta", "39", "41.2", ref_df=self.mock_ref)
+        self.assertAlmostEqual(b, 700.0, places=1)
+        self.assertAlmostEqual(e, 702.2, places=1)
+
+        # Prefixed CA PM (e.g. 'R55.0') and integer route
+        b, e = pems_interface.resolve_absolute_postmiles(138, "Los Angeles", "R55.0", "56.3", ref_df=self.mock_ref)
+        self.assertAlmostEqual(b, 48.5, places=1)
+        self.assertAlmostEqual(e, 49.8, places=1)
+
+    def test_builder_resolves_missing_absolute_postmiles(self):
+        proj = pems_interface.ProjectRecord(
+            project_id="200000288",
+            dist="2",
+            county="Shasta",
+            state="CA",
+            route="5",
+            direction="SB",
+            begin_pm="39",
+            end_pm="41.2",
+            abs_begin_pm=None,
+            abs_end_pm=None
+        )
+        self.assertIsNone(proj.abs_begin_pm)
+        self.assertIsNone(proj.abs_end_pm)
+
+        builder = pems_interface.ProjectPeMSQueryBuilder(proj, ref_df=self.mock_ref)
+        b, e = builder.resolve_absolute_postmiles()
+        self.assertAlmostEqual(b, 700.0, places=1)
+        self.assertAlmostEqual(e, 702.2, places=1)
+        self.assertAlmostEqual(proj.abs_begin_pm, 700.0, places=1)
+        self.assertAlmostEqual(proj.abs_end_pm, 702.2, places=1)
+
+    def test_project_inspection_cli_calculates_and_prints_absolute_pms(self):
+        """Proof: python pems_interface.py -p <PID> calculates absolute PMs from Begin PM and End PM."""
+        import io
+        from contextlib import redirect_stdout
+
+        f = io.StringIO()
+        with redirect_stdout(f):
+            pems_interface.main(["-p", "200000288"])
+        output = f.getvalue()
+
+        self.assertIn("PROJECT INSPECTION: 200000288", output)
+        self.assertIn("Postmiles:          Begin: 39 | End: 41.2", output)
+        self.assertIn("Absolute PMs:       Begin: 700.0 | End: 702.2", output)
+
+
+class TestOpenToTrafficInference(unittest.TestCase):
+    """Unit tests for Option 1: Open to Traffic Date inference via PeMS configuration & telemetry."""
+
+    def test_parse_any_date_formats(self):
+        # 5-digit Excel serial
+        d_excel = pems_interface.parse_any_date("43488")
+        self.assertEqual(d_excel, datetime.date(2019, 1, 23))
+
+        # Year only
+        d_yr = pems_interface.parse_any_date("2019")
+        self.assertEqual(d_yr, datetime.date(2019, 1, 1))
+
+        # YYYY/MM and MM/YYYY
+        d_ym = pems_interface.parse_any_date("2022/10")
+        self.assertEqual(d_ym, datetime.date(2022, 10, 1))
+        d_my = pems_interface.parse_any_date("10/2022")
+        self.assertEqual(d_my, datetime.date(2022, 10, 1))
+
+        # Textual date formats
+        d_text1 = pems_interface.parse_any_date("April 30th, 2018")
+        self.assertEqual(d_text1, datetime.date(2018, 4, 30))
+        d_text2 = pems_interface.parse_any_date("December, 2019")
+        self.assertEqual(d_text2, datetime.date(2019, 12, 1))
+        d_text3 = pems_interface.parse_any_date("May 22 2020")
+        self.assertEqual(d_text3, datetime.date(2020, 5, 22))
+
+        # ISO and slash dates
+        d_iso = pems_interface.parse_any_date("2020-02-28")
+        self.assertEqual(d_iso, datetime.date(2020, 2, 28))
+        d_slash = pems_interface.parse_any_date("07/06/2022")
+        self.assertEqual(d_slash, datetime.date(2022, 7, 6))
+
+        # Invalid/empty
+        self.assertIsNone(pems_interface.parse_any_date(""))
+        self.assertIsNone(pems_interface.parse_any_date("nan"))
+        self.assertIsNone(pems_interface.parse_any_date(None))
+
+    def test_parse_station_summary_configuration(self):
+        sample_html = """
+        <html>
+        <body>
+        <table class="grid">
+            <tr>
+                <th>Date</th><th>Status</th><th>Name</th><th>Lanes</th><th>CA PM</th><th>Abs PM</th><th>Length</th><th>Lat</th><th>Lng</th>
+            </tr>
+            <tr>
+                <td>02/06/2019</td><td>Active</td><td>Colfax Curve</td><td>12</td><td>34.447</td><td>135.93</td><td>5.00</td><td>39.1143</td><td>-120.9442</td>
+            </tr>
+            <tr>
+                <td>07/06/2022</td><td>Active</td><td>Colfax Curve</td><td>123</td><td>34.447</td><td>135.93</td><td>5.00</td><td>39.1143</td><td>-120.9442</td>
+            </tr>
+            <tr>
+                <td>12/15/2022</td><td>Active</td><td>Colfax Curve</td><td>123</td><td>34.447</td><td>135.93</td><td>4.48</td><td>39.1143</td><td>-120.9442</td>
+            </tr>
+        </table>
+        </body>
+        </html>
+        """
+        recs = pems_interface.parse_station_summary_configuration(sample_html)
+        self.assertEqual(len(recs), 3)
+        self.assertEqual(recs[0].date, datetime.date(2019, 2, 6))
+        self.assertEqual(recs[0].lane_count, 2)
+        self.assertEqual(recs[0].lanes_str, "12")
+
+        self.assertEqual(recs[1].date, datetime.date(2022, 7, 6))
+        self.assertEqual(recs[1].lane_count, 3)
+        self.assertEqual(recs[1].lanes_str, "123")
+
+    def test_detect_lane_config_step_changes(self):
+        recs = [
+            pems_interface.StationConfigRecord(
+                date=datetime.date(2018, 1, 1),
+                date_str="2018-01-01",
+                status="Active",
+                name="Test Station",
+                lanes_str="12",
+                lane_count=2,
+                ca_pm="10.0",
+                abs_pm="100.0"
+            ),
+            pems_interface.StationConfigRecord(
+                date=datetime.date(2020, 6, 15),
+                date_str="2020-06-15",
+                status="Active",
+                name="Test Station",
+                lanes_str="123",
+                lane_count=3,
+                ca_pm="10.0",
+                abs_pm="100.0"
+            ),
+        ]
+        # Detect lane increment
+        events = pems_interface.detect_lane_config_step_changes(recs, station_id="12345")
+        self.assertEqual(len(events), 2)
+        # Event 1: Commissioning / first active
+        self.assertEqual(events[0].change_type, "DETECTOR_COMMISSIONED")
+        self.assertEqual(events[0].change_date, datetime.date(2018, 1, 1))
+        # Event 2: Lane increment
+        self.assertEqual(events[1].change_type, "LANE_CONFIG_INCREMENT")
+        self.assertEqual(events[1].change_date, datetime.date(2020, 6, 15))
+        self.assertEqual(events[1].lanes_before, 2)
+        self.assertEqual(events[1].lanes_after, 3)
+
+        # Test min_date filtering: If min_date is 2019-01-01, baseline is 2 lanes and only lane increment is emitted
+        events_filtered = pems_interface.detect_lane_config_step_changes(
+            recs, station_id="12345", min_date=datetime.date(2019, 1, 1)
+        )
+        self.assertEqual(len(events_filtered), 1)
+        self.assertEqual(events_filtered[0].change_type, "LANE_CONFIG_INCREMENT")
+        self.assertEqual(events_filtered[0].change_date, datetime.date(2020, 6, 15))
+
+    def test_parse_daily_flow_telemetry(self):
+        sample_tsv = (
+            "Day\tFlow (Veh/Day)\t# Lane Points\t% Observed\n"
+            "07/04/2022\t10,310.0\t576\t100.0\n"
+            "07/05/2022\t13,355.0\t576\t100.0\n"
+            "07/06/2022\t16,772.0\t863\t98.8\n"
+            "07/07/2022\t18,980.0\t864\t100.0\n"
+            "07/08/2022\t24,163.0\t864\t100.0\n"
+        )
+        flow_records = pems_interface.parse_daily_flow_telemetry(sample_tsv)
+        self.assertEqual(len(flow_records), 5)
+        self.assertEqual(flow_records[0]["date"], datetime.date(2022, 7, 4))
+        self.assertEqual(flow_records[0]["lane_points"], 576)
+        self.assertEqual(flow_records[2]["date"], datetime.date(2022, 7, 6))
+        self.assertEqual(flow_records[2]["lane_points"], 863)
+
+    def test_detect_flow_telemetry_activation_lane_points_jump(self):
+        mock_client = unittest.mock.MagicMock()
+        mock_client.get_text_content.return_value = (
+            "Day\tFlow (Veh/Day)\t# Lane Points\t% Observed\n"
+            "07/01/2022\t10,000.0\t576\t100.0\n"
+            "07/02/2022\t10,000.0\t576\t100.0\n"
+            "07/03/2022\t10,000.0\t576\t100.0\n"
+            "07/04/2022\t10,310.0\t576\t100.0\n"
+            "07/05/2022\t13,355.0\t576\t100.0\n"
+            "07/06/2022\t16,772.0\t863\t98.8\n"
+            "07/07/2022\t18,980.0\t864\t100.0\n"
+            "07/08/2022\t24,163.0\t864\t100.0\n"
+            "07/09/2022\t25,000.0\t864\t100.0\n"
+        )
+        res = pems_interface.detect_flow_telemetry_activation(
+            client=mock_client,
+            station_id="314000",
+            target_year=2022,
+            candidate_date=datetime.date(2022, 7, 6),
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res.activation_date, datetime.date(2022, 7, 6))
+        self.assertEqual(res.activation_type, "LANE_POINTS_STEP_CHANGE")
+        self.assertEqual(res.lane_points_before, 576)
+        self.assertEqual(res.lane_points_after, 863)
+        self.assertIn("576 (~2 lanes) to 863 (~3 lanes)", res.evidence)
+
+    def test_infer_project_open_to_traffic_corroborated(self):
+        mock_client = unittest.mock.MagicMock()
+        mock_client.logged_in = True
+
+        sample_summary_html = """
+        <table>
+            <tr><th>Date</th><th>Status</th><th>Name</th><th>Lanes</th><th>CA PM</th><th>Abs PM</th></tr>
+            <tr><td>02/06/2019</td><td>Active</td><td>Colfax</td><td>12</td><td>34.4</td><td>135.9</td></tr>
+            <tr><td>07/06/2022</td><td>Active</td><td>Colfax</td><td>123</td><td>34.4</td><td>135.9</td></tr>
+        </table>
+        """
+        sample_tsv = (
+            "Day\tFlow (Veh/Day)\t# Lane Points\t% Observed\n"
+            "07/04/2022\t10,000.0\t576\t100.0\n"
+            "07/05/2022\t10,000.0\t576\t100.0\n"
+            "07/06/2022\t16,000.0\t864\t100.0\n"
+            "07/07/2022\t18,000.0\t864\t100.0\n"
+            "07/08/2022\t20,000.0\t864\t100.0\n"
+        )
+
+        def mock_get_content(url):
+            if "content=summary" in url:
+                return sample_summary_html
+            elif "tab=det_timeseries" in url:
+                return sample_tsv
+            return ""
+
+        mock_client.get_text_content.side_effect = mock_get_content
+
+        proj = pems_interface.ProjectRecord(
+            project_id="300020420",
+            dist="3",
+            county="Placer",
+            state="CA",
+            route="80",
+            direction="EB",
+            begin_pm="34.4",
+            end_pm="39.4",
+            construction_begin_date="2019-01-01",
+            open_to_traffic_date="2019-01-23",
+            sensor_stations=["314000"],
+        )
+
+        inf = pems_interface.infer_project_open_to_traffic(
+            proj,
+            client=mock_client,
+            check_telemetry=True,
+            verbose=False,
+        )
+
+        self.assertEqual(inf.project_id, "300020420")
+        self.assertEqual(inf.inferred_date, "2022-07-06")
+        self.assertEqual(inf.inferred_year, 2022)
+        self.assertEqual(inf.confidence, "HIGH")
+        self.assertEqual(inf.method, "CORROBORATED_TELEMETRY")
+        self.assertEqual(inf.station_id, "314000")
+        self.assertIn("incremented from 2 to 3 lanes on 2022-07-06", inf.evidence)
+
+    def test_apply_open_date_updates_to_dataframe(self):
+        raw_data = {
+            "Project ID": ["300020420", "9990001"],
+            "Direction": ["EB", "NB"],
+            "Open to Traffic Date": ["43488", None],
+            "Open to Traffic Date (formatted YYYY-MM-DD)": ["2019-01-23", None],
+            "open_traffic_year": [2019, None],
+            "open_traffic_month": [1, None],
+            "open_traffic_day": [23, None],
+            "Sensor Station 1 ID ": ["314000", "123456"],
+            "Sensor 1 Activation Date for New Lane": [None, None],
+        }
+        df = pd.DataFrame(raw_data)
+
+        inferences = [
+            pems_interface.OpenToTrafficInference(
+                project_id="300020420",
+                route="80",
+                direction="EB",
+                district="3",
+                county="Placer",
+                current_open_date="2019-01-23",
+                inferred_date="2022-07-06",
+                inferred_year=2022,
+                confidence="HIGH",
+                method="CORROBORATED_TELEMETRY",
+                evidence="Increment detected and verified",
+                station_id="314000",
+            )
+        ]
+
+        updated, count = pems_interface.apply_open_date_updates_to_dataframe(df, inferences)
+        self.assertEqual(count, 1)
+        self.assertEqual(updated.at[0, "Open to Traffic Date"], "2022-07-06")
+        self.assertEqual(updated.at[0, "Open to Traffic Date (formatted YYYY-MM-DD)"], "2022-07-06")
+        self.assertEqual(str(updated.at[0, "open_traffic_year"]), "2022")
+        self.assertEqual(str(updated.at[0, "open_traffic_month"]), "7")
+        self.assertEqual(str(updated.at[0, "open_traffic_day"]), "6")
+        self.assertEqual(updated.at[0, "Sensor 1 Activation Date for New Lane"], "2022-07-06")
+
+        # Second row unchanged
+        self.assertTrue(pd.isna(updated.at[1, "Open to Traffic Date"]))
+
+    def test_apply_open_date_to_master_csv_creates_backup(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = os.path.join(tmp_dir, "test_master.csv")
+            df = pd.DataFrame({
+                "Project ID": ["300020420"],
+                "Direction": ["EB"],
+                "Open to Traffic Date": ["43488"],
+                "Open to Traffic Date (formatted YYYY-MM-DD)": ["2019-01-23"],
+                "open_traffic_year": [2019],
+                "open_traffic_month": [1],
+                "open_traffic_day": [23],
+                "Sensor Station 1 ID ": ["314000"],
+                "Sensor 1 Activation Date for New Lane": [None],
+            })
+            df.to_csv(csv_path, index=False)
+
+            inf = pems_interface.OpenToTrafficInference(
+                project_id="300020420",
+                route="80",
+                direction="EB",
+                district="3",
+                county="Placer",
+                current_open_date="2019-01-23",
+                inferred_date="2022-07-06",
+                inferred_year=2022,
+                confidence="HIGH",
+                method="CORROBORATED_TELEMETRY",
+                evidence="Verified",
+                station_id="314000",
+            )
+
+            backup_path, target_path, count = pems_interface.apply_open_date_to_master_csv([inf], master_csv_path=csv_path)
+
+            self.assertTrue(os.path.exists(backup_path))
+            self.assertTrue(os.path.exists(target_path))
+            self.assertEqual(count, 1)
+
+            # Check updated file
+            updated_df = pd.read_csv(target_path)
+            self.assertEqual(updated_df.at[0, "Open to Traffic Date"], "2022-07-06")
+
+
+class TestStationLaneConfiguration(unittest.TestCase):
+    """Test suite for PeMS station lane tables, change logs, and TSN roadway metrics inspection."""
+
+    def test_build_station_config_url(self):
+        url = pems_interface.build_station_config_url("410756")
+        self.assertEqual(url, "https://pems.dot.ca.gov/?report_form=1&dnode=VDS&content=sta_cfg&station_id=410756")
+
+    def test_parse_station_configuration_page(self):
+        sample_html = """
+        <html>
+        <head><title>Caltrans PeMS > Mainline VDS 410756 - EB 12 OC > Change Log</title></head>
+        <body>
+          <table>
+            <tr><th colspan="2">Roadway Information (from TSN)</th></tr>
+            <tr><td>Road Width</td><td>48 ft</td></tr>
+            <tr><td>Lane Width</td><td>12.0 ft</td></tr>
+            <tr><td>Inner Shoulder Width</td><td>8 ft</td></tr>
+            <tr><td>Outer Shoulder Width</td><td>10 ft</td></tr>
+            <tr><td>Design Speed Limit</td><td>70 mph</td></tr>
+            <tr><td>Functional Class</td><td>Principal Arterial W/ C/L Prin Arterial</td></tr>
+            <tr><td>Inner Median Type</td><td>Unpaved</td></tr>
+          </table>
+
+          <table>
+            <tr><th colspan="9">Change Log</th></tr>
+            <tr>
+              <th>Date</th><th>Status</th><th>Name</th><th>Lanes</th>
+              <th>CA PM</th><th>Abs PM</th><th>Length</th><th>Lat</th><th>Lng</th>
+            </tr>
+            <tr>
+              <td>04/09/2016</td><td>Active</td><td>EB 12 OC</td><td>1234</td>
+              <td>11.86</td><td>39.33</td><td>0.82</td><td>38.20691</td><td>-122.151326</td>
+            </tr>
+            <tr>
+              <td>05/20/2017</td><td>Active</td><td>EB 12 OC</td><td>12345</td>
+              <td>11.86</td><td>39.33</td><td>0.75</td><td>38.20691</td><td>-122.151326</td>
+            </tr>
+          </table>
+
+          <table>
+            <tr><th colspan="2">Construction History</th></tr>
+            <tr><th>Start Date</th><th>End Date</th></tr>
+            <tr><td>03/14/2017</td><td>01/14/2018</td></tr>
+          </table>
+
+          <table>
+            <tr><th>Lane</th><th>Slot</th><th>Sensor Tech</th><th>Type</th></tr>
+            <tr><td>1</td><td>1</td><td>Dual Loop</td><td>Mainline</td></tr>
+            <tr><td>2</td><td>2</td><td>Dual Loop</td><td>Mainline</td></tr>
+            <tr><td>3</td><td>3</td><td>Dual Loop</td><td>Mainline</td></tr>
+          </table>
+        </body>
+        </html>
+        """
+        details = pems_interface.parse_station_configuration_page(sample_html, station_id="410756")
+        self.assertEqual(details.station_id, "410756")
+        self.assertEqual(details.station_name, "EB 12 OC")
+        self.assertEqual(details.station_type, "Mainline VDS")
+        self.assertIsNone(details.error)
+
+        # TSN checks
+        self.assertEqual(details.tsn_roadway_info.get("Road Width"), "48 ft")
+        self.assertEqual(details.tsn_roadway_info.get("Lane Width"), "12.0 ft")
+        self.assertEqual(details.tsn_roadway_info.get("Inner Shoulder Width"), "8 ft")
+        self.assertEqual(details.tsn_roadway_info.get("Outer Shoulder Width"), "10 ft")
+        self.assertEqual(details.tsn_roadway_info.get("Design Speed Limit"), "70 mph")
+
+        # Lane table checks
+        self.assertEqual(len(details.lane_table), 3)
+        self.assertEqual(details.lane_table[0]["Lane"], "1")
+        self.assertEqual(details.lane_table[0]["Sensor Tech"], "Dual Loop")
+        self.assertEqual(details.lane_table[0]["Type"], "Mainline")
+
+        # Change log checks
+        self.assertEqual(len(details.change_log), 2)
+        self.assertEqual(details.change_log[0]["Date"], "04/09/2016")
+        self.assertEqual(details.change_log[0]["Lanes"], "1234")
+        self.assertEqual(details.change_log[1]["Date"], "05/20/2017")
+        self.assertEqual(details.change_log[1]["Lanes"], "12345")
+
+        # Construction history checks
+        self.assertEqual(len(details.construction_history), 1)
+        self.assertEqual(details.construction_history[0]["Start Date"], "03/14/2017")
+        self.assertEqual(details.construction_history[0]["End Date"], "01/14/2018")
+
+    def test_parse_station_configuration_error_page(self):
+        err_html = """
+        <html>
+        <head><title>PeMS Internal Error</title></head>
+        <body>
+          <h1>Application Halted</h1>
+          <p>Missing numeric segment identifier.</p>
+        </body>
+        </html>
+        """
+        details = pems_interface.parse_station_configuration_page(err_html, station_id="716177")
+        self.assertEqual(details.station_id, "716177")
+        self.assertIsNotNone(details.error)
+        self.assertIn("PeMS internal error", details.error)
+
+    def test_parse_station_configuration_tsn_not_available_and_id_header(self):
+        sample_html = """
+        <html>
+        <head><title>Caltrans PeMS > Mainline VDS 3411074 - 65NB Galleria Blvd > Change Log</title></head>
+        <body>
+          <table class="blue_outline_table">
+            <tr><td class="blue_outline_caption" colspan="2">Roadway Information (from TSN)</td></tr>
+            <tr><td style="font-style: italic">Not Available</td></tr>
+          </table>
+          <table>
+            <tr><th>Lane</th><th>Slot</th><th>ID</th><th>Type</th></tr>
+            <tr class="even"><td>1</td><td>1</td><td>34110717</td><td>Mainline</td></tr>
+            <tr class="odd"><td>2</td><td>2</td><td>34110718</td><td>Mainline</td></tr>
+            <tr class="even"><td>3</td><td>3</td><td>34110719</td><td>Mainline</td></tr>
+          </table>
+        </body>
+        </html>
+        """
+        details = pems_interface.parse_station_configuration_page(sample_html, station_id="3411074")
+        self.assertEqual(details.station_id, "3411074")
+        self.assertEqual(details.tsn_roadway_info.get("Status"), "Not Available in PeMS")
+        self.assertEqual(len(details.lane_table), 3)
+        self.assertEqual(details.lane_table[0]["Lane"], "1")
+        self.assertEqual(details.lane_table[0]["ID"], "34110717")
+        self.assertEqual(details.lane_table[0]["Type"], "Mainline")
+
+    def test_format_lane_config_report(self):
+        details = pems_interface.StationLaneConfigDetails(
+            station_id="410756",
+            station_name="EB 12 OC",
+            district="4",
+            route="80",
+            direction="E",
+            county="Solano",
+            station_type="ML",
+            ca_pm="11.86",
+            abs_pm=39.33,
+            latitude=38.20691,
+            longitude=-122.151326,
+            tsn_roadway_info={"Road Width": "48 ft", "Lane Width": "12.0 ft"},
+            lane_table=[{"Lane": "1", "Slot": "1", "Sensor Tech": "Dual Loop", "Type": "Mainline"}],
+            change_log=[{"Date": "04/09/2016", "Status": "Active", "Lanes": "12345"}],
+            construction_history=[{"Start Date": "03/14/2017", "End Date": "01/14/2018"}],
+            url="https://pems.dot.ca.gov/?report_form=1&dnode=VDS&content=sta_cfg&station_id=410756"
+        )
+        report = pems_interface.format_lane_config_report(details)
+        self.assertIn("STATION 410756: EB 12 OC (ML)", report)
+        self.assertIn("Road Width:", report)
+        self.assertIn("48 ft", report)
+        self.assertIn("Dual Loop", report)
+        self.assertIn("04/09/2016", report)
+        self.assertIn("03/14/2017", report)
+
+    def test_format_lane_config_report_with_hpms(self):
+        details = pems_interface.StationLaneConfigDetails(
+            station_id="3411074",
+            station_name="65NB Galleria Blvd",
+            tsn_roadway_info={"Status": "Not Available in PeMS"},
+            lane_table=[{"Lane": "1", "Slot": "1", "ID": "34110717", "Type": "Mainline"}]
+        )
+        hpms_info = {
+            "sections_count": 41,
+            "predominant_lanes_2024": 6,
+            "avg_lanes_2024": 5.93,
+            "facility_type": "Two-Way Divided (Freeway/Expressway)",
+            "access_control": "Full Access Control (Freeway)",
+            "surface_type": "Concrete",
+            "functional_system": "Principal Arterial",
+            "avg_aadt_2024": 123594,
+            "future_aadt": 137007,
+            "future_aadt_year": "2044"
+        }
+        report = pems_interface.format_lane_config_report(details, hpms_summary=hpms_info)
+        self.assertIn("HPMS Ground-Truth Roadway Attributes", report)
+        self.assertIn("Through Lanes (2024):         6 (Corridor length-weighted avg: 5.93)", report)
+        self.assertIn("Two-Way Divided (Freeway/Expressway)", report)
+        self.assertIn("Full Access Control (Freeway)", report)
+        self.assertIn("123,594 vehicles/day", report)
+        self.assertIn("137,007 vehicles/day (Year 2044)", report)
+        self.assertIn("Not Available in PeMS for this station", report)
+
+    def test_parser_lane_config_cli_flags(self):
+        parser = pems_interface.build_parser()
+
+        # -p PID --lane-config
+        args = parser.parse_args(["-p", "400000680", "--lane-config"])
+        self.assertEqual(args.project, "400000680")
+        self.assertTrue(args.lane_config)
+
+        # --lanes PID
+        args = parser.parse_args(["--lanes", "400000680"])
+        self.assertEqual(args.lane_config, "400000680")
+
+        # -s STATION_ID --lanes
+        args = parser.parse_args(["-s", "410756", "--lanes"])
+        self.assertEqual(args.download_station, "410756")
+        self.assertTrue(args.lane_config)
+
+    def test_fetch_station_lane_configuration_mock(self):
+        from unittest.mock import MagicMock
+        mock_client = MagicMock()
+        mock_client.get_text_content.return_value = """
+        <html>
+        <head><title>Caltrans PeMS > Mainline VDS 123456 - Test Station > Change Log</title></head>
+        <body>
+          <table>
+            <tr><th colspan="2">Roadway Information (from TSN)</th></tr>
+            <tr><td>Road Width</td><td>36 ft</td></tr>
+          </table>
+          <table>
+            <tr><th>Lane</th><th>Slot</th><th>Sensor Tech</th><th>Type</th></tr>
+            <tr><td>1</td><td>1</td><td>Dual Loop</td><td>Mainline</td></tr>
+          </table>
+        </body>
+        </html>
+        """
+        details = pems_interface.fetch_station_lane_configuration("123456", client=mock_client)
+        self.assertEqual(details.station_id, "123456")
+        self.assertEqual(details.tsn_roadway_info.get("Road Width"), "36 ft")
+        self.assertEqual(len(details.lane_table), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

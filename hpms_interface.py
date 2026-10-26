@@ -308,6 +308,118 @@ class HPMSClient:
         return []
 
 
+def resolve_absolute_postmiles(
+    route: Any,
+    county: str,
+    begin_pm: Any,
+    end_pm: Any,
+    ref_df: Optional[pd.DataFrame] = None,
+    ref_path: Optional[str] = None
+) -> Tuple[Optional[float], Optional[float]]:
+    """Converts County Postmiles (CA PM) to Absolute / Continuous Postmiles (Abs PM)
+    using the Caltrans Geo Postmile reference table.
+
+    Robust to numeric or string routes (e.g. 5, '5', '005') and postmile alignment
+    prefixes (e.g. 'R11.7', '39.0').
+
+    Returns (abs_begin_pm, abs_end_pm) or (None, None) if matching fails or
+    if cross-county inversion is detected.
+    """
+    if ref_df is None or ref_df.empty:
+        target_path = ref_path or DEFAULT_REF_PATH
+        if os.path.exists(target_path):
+            try:
+                for sep in (",", "\t"):
+                    try:
+                        df_cand = pd.read_csv(target_path, sep=sep, low_memory=False)
+                        if "Route" in df_cand.columns or "Fwy" in df_cand.columns:
+                            ref_df = df_cand
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                return None, None
+        else:
+            return None, None
+
+    if ref_df is None or ref_df.empty:
+        return None, None
+
+    if route is None or not str(route).strip():
+        return None, None
+    if not county or not str(county).strip():
+        return None, None
+
+    # Parse postmiles to float
+    if isinstance(begin_pm, (int, float)) and not pd.isna(begin_pm):
+        b_num = float(begin_pm)
+    else:
+        b_num, _ = parse_postmile(begin_pm)
+
+    if isinstance(end_pm, (int, float)) and not pd.isna(end_pm):
+        e_num = float(end_pm)
+    else:
+        e_num, _ = parse_postmile(end_pm)
+
+    if b_num is None or e_num is None:
+        return None, None
+
+    # Match route (supporting int or str)
+    rt_str = str(route).strip().lstrip("0") or "0"
+    route_col = "Route" if "Route" in ref_df.columns else "Fwy"
+    if route_col not in ref_df.columns or "County" not in ref_df.columns:
+        return None, None
+
+    route_mask = (ref_df[route_col].astype(str).str.strip().str.lstrip("0") == rt_str)
+    county_clean = str(county).strip().lower()
+    county_mask = (ref_df["County"].astype(str).str.strip().str.lower() == county_clean)
+
+    sub = ref_df[route_mask & county_mask]
+    if sub.empty:
+        return None, None
+
+    # Clean numeric CA PM
+    def to_float(val):
+        try:
+            if isinstance(val, (int, float)):
+                return float(val)
+            val_str = str(val).strip().lstrip("RMLCGE")
+            return float(val_str)
+        except Exception:
+            return None
+
+    sub_clean = sub.copy()
+    sub_clean["clean_ca_pm"] = sub_clean["CA PM"].apply(to_float)
+    sub_clean["clean_abs_pm"] = pd.to_numeric(sub_clean["Abs PM"], errors="coerce")
+    sub_valid = sub_clean.dropna(subset=["clean_ca_pm", "clean_abs_pm"])
+
+    if sub_valid.empty:
+        return None, None
+
+    # Sort by CA PM
+    sub_valid = sub_valid.sort_values(by="clean_ca_pm")
+
+    # Guard against cross-county boundary inversion: if begin_pm > end_pm,
+    # snapping both against the same county produces an inverted, false corridor.
+    if b_num > e_num:
+        return None, None
+
+    # Find closest Abs PM for begin_pm and end_pm
+    idx_b = (sub_valid["clean_ca_pm"] - b_num).abs().idxmin()
+    idx_e = (sub_valid["clean_ca_pm"] - e_num).abs().idxmin()
+
+    delta_b = abs(sub_valid.loc[idx_b, "clean_ca_pm"] - b_num)
+    delta_e = abs(sub_valid.loc[idx_e, "clean_ca_pm"] - e_num)
+    if delta_b > 2.0 or delta_e > 2.0:
+        # Distance too large to snap safely
+        return None, None
+
+    abs_begin = float(sub_valid.loc[idx_b, "clean_abs_pm"])
+    abs_end = float(sub_valid.loc[idx_e, "clean_abs_pm"])
+
+    return min(abs_begin, abs_end), max(abs_begin, abs_end)
+
+
 class HPMSCorridorEngine:
     """Matches highway projects against HPMS corridor data, calculates lane metrics,
 
@@ -340,59 +452,12 @@ class HPMSCorridorEngine:
                 self._master_df = pd.DataFrame()
         return self._master_df
 
-    def resolve_absolute_postmiles(self, route: int, county: str,
-                                   begin_pm: float, end_pm: float) -> Tuple[Optional[float], Optional[float]]:
+    def resolve_absolute_postmiles(self, route: Any, county: str,
+                                   begin_pm: Any, end_pm: Any) -> Tuple[Optional[float], Optional[float]]:
         """Converts County Postmiles (CA PM) to Absolute / Continuous Postmiles (Abs PM)
         matching HPMS begin_point / end_point linear referencing.
         """
-        if self.ref_df.empty:
-            return None, None
-
-        sub = self.ref_df[(self.ref_df["Route"] == route) &
-                          (self.ref_df["County"].str.strip().str.lower() == county.strip().lower())]
-        if sub.empty:
-            return None, None
-
-        # Clean numeric CA PM
-        def to_float(val):
-            try:
-                if isinstance(val, (int, float)):
-                    return float(val)
-                val_str = str(val).strip().lstrip("RMLCGE")
-                return float(val_str)
-            except Exception:
-                return None
-
-        sub_clean = sub.copy()
-        sub_clean["clean_ca_pm"] = sub_clean["CA PM"].apply(to_float)
-        sub_clean["clean_abs_pm"] = pd.to_numeric(sub_clean["Abs PM"], errors="coerce")
-        sub_valid = sub_clean.dropna(subset=["clean_ca_pm", "clean_abs_pm"])
-
-        if sub_valid.empty:
-            return None, None
-
-        # Sort by CA PM
-        sub_valid = sub_valid.sort_values(by="clean_ca_pm")
-
-        # Guard against cross-county boundary inversion: if begin_pm > end_pm,
-        # snapping both against the same county produces an inverted, false corridor.
-        if begin_pm > end_pm:
-            return None, None
-
-        # Find closest Abs PM for begin_pm and end_pm
-        idx_b = (sub_valid["clean_ca_pm"] - begin_pm).abs().idxmin()
-        idx_e = (sub_valid["clean_ca_pm"] - end_pm).abs().idxmin()
-
-        delta_b = abs(sub_valid.loc[idx_b, "clean_ca_pm"] - begin_pm)
-        delta_e = abs(sub_valid.loc[idx_e, "clean_ca_pm"] - end_pm)
-        if delta_b > 2.0 or delta_e > 2.0:
-            # Distance too large to snap safely
-            return None, None
-
-        abs_begin = float(sub_valid.loc[idx_b, "clean_abs_pm"])
-        abs_end = float(sub_valid.loc[idx_e, "clean_abs_pm"])
-
-        return min(abs_begin, abs_end), max(abs_begin, abs_end)
+        return resolve_absolute_postmiles(route, county, begin_pm, end_pm, ref_df=self.ref_df)
 
     def inspect_project(self, project_id: Any, direction: Optional[str] = None) -> Dict[str, Any]:
         """Inspects a highway project, resolving its HPMS corridor data, ground-truth lane counts,
@@ -506,9 +571,17 @@ class HPMSCorridorEngine:
                     "through_lanes": tl,
                     "dir_through_lanes": dtl,
                     "facility_type": s.get("facility_type"),
+                    "access_control": s.get("access_control"),
+                    "surface_type": s.get("surface_type"),
+                    "f_system": s.get("f_system"),
                     "aadt": aadt,
                     "future_aadt": s.get("future_aadt"),
                     "future_aadt_year": s.get("future_aadt_year"),
+                    "aadt_combination": s.get("aadt_combination"),
+                    "aadt_single_unit": s.get("aadt_single_unit"),
+                    "iri": s.get("iri"),
+                    "rutting": s.get("rutting"),
+                    "cracking_percent": s.get("cracking_percent"),
                     "year_last_construction": s.get("year_last_construction"),
                     "year_last_improvement": s.get("year_last_improvement"),
                     "line": s.get("line")

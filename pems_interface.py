@@ -27,11 +27,14 @@ EXAMPLE USAGE
       build_station_flow_url,
       find_closest_census_stations,
       get_project_imagery,
+      resolve_absolute_postmiles,
   )
 
-  # A. Postmile to Coordinate Conversion (O(1) indexed lookup):
+  # A. Postmile to Coordinate Conversion & Absolute PM Resolution:
   coords = pm_to_coordinates(route="80", direction="E", pm="11.4", county="Solano")
   # Returns: (38.201952, -122.156967)
+  abs_b, abs_e = resolve_absolute_postmiles(route="5", county="Shasta", begin_pm="39", end_pm="41.2")
+  # Returns: (700.0, 702.2)
 
   # B. Generate PeMS Download URLs:
   lane_url = build_lane_config_url(
@@ -136,7 +139,7 @@ import html
 import urllib.parse
 import textwrap
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 import pandas as pd
 import numpy as np
@@ -145,6 +148,8 @@ import webbrowser
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+from hpms_interface import resolve_absolute_postmiles, parse_postmile
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION & PATHS
@@ -348,19 +353,19 @@ class PeMSClient:
         has_logout = ("Logout" in resp.text or "logout" in resp.text)
         return has_form and not has_logout
 
-    def get_url(self, url: str, stream: bool = False) -> requests.Response:
+    def get_url(self, url: str, stream: bool = False, timeout: float = 20.0) -> requests.Response:
         """Make an authenticated GET request, re-authenticating if session expired."""
         if not self.logged_in:
             self.login()
 
         full_url = url if url.startswith("http") else urllib.parse.urljoin(BASE_URL, url)
-        resp = self.session.get(full_url, stream=stream)
+        resp = self.session.get(full_url, stream=stream, timeout=timeout)
         resp.raise_for_status()
 
         if not stream and self._is_login_page(resp):
             LOGGER.warning("PeMS session appears expired; re-authenticating...")
             self.login()
-            resp = self.session.get(full_url, stream=stream)
+            resp = self.session.get(full_url, stream=stream, timeout=timeout)
             resp.raise_for_status()
 
         return resp
@@ -586,6 +591,12 @@ def build_station_summary_url(station_id: str) -> str:
     """Construct PeMS VDS Summary / Metadata URL."""
     st_id = str(station_id).strip()
     return f"{BASE_URL}/?report_form=1&dnode=VDS&content=summary&tab=summary&station_id={st_id}"
+
+
+def build_station_config_url(station_id: str) -> str:
+    """Construct PeMS VDS Configuration URL (lane configuration table and TSN roadway metrics)."""
+    st_id = str(station_id).strip()
+    return f"{BASE_URL}/?report_form=1&dnode=VDS&content=sta_cfg&station_id={st_id}"
 
 
 def build_clearinghouse_url(district: Any, year: int, file_type: str = "station_aadt") -> str:
@@ -1333,10 +1344,32 @@ class ProjectPeMSQueryBuilder:
             self.idx_ref = get_indexed_geo_ref()
             self.ref_df = self.idx_ref.raw_df
 
+    def resolve_absolute_postmiles(self, force_recalculate: bool = False) -> Tuple[Optional[float], Optional[float]]:
+        """Calculate and resolve absolute postmiles from California postmiles if not already present,
+        or if force_recalculate is True.
+        """
+        if force_recalculate or self.project.abs_begin_pm is None or self.project.abs_end_pm is None:
+            calc_b, calc_e = resolve_absolute_postmiles(
+                self.project.route,
+                self.project.county,
+                self.project.begin_pm,
+                self.project.end_pm,
+                ref_df=self.ref_df
+            )
+            if calc_b is not None and calc_e is not None:
+                if force_recalculate or self.project.abs_begin_pm is None:
+                    self.project.abs_begin_pm = calc_b
+                if force_recalculate or self.project.abs_end_pm is None:
+                    self.project.abs_end_pm = calc_e
+        return self.project.abs_begin_pm, self.project.abs_end_pm
+
     def resolve_geometry(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
         """Resolve start and end coordinates from postmiles if not already present."""
         start = self.project.start_coords
         end = self.project.end_coords
+
+        # Ensure absolute postmiles are calculated from CA PMs if missing
+        self.resolve_absolute_postmiles()
 
         is_abs = (
             self.project.abs_begin_pm is not None
@@ -1422,6 +1455,7 @@ class ProjectPeMSQueryBuilder:
         station_aadt_urls = {}
         station_flow_urls = {}
         station_summary_urls = {}
+        station_config_urls = {}
 
         for st_id in self.project.sensor_stations:
             station_aadt_urls[st_id] = [
@@ -1433,6 +1467,7 @@ class ProjectPeMSQueryBuilder:
                 for y in range(s_yr, e_yr + 1)
             ]
             station_summary_urls[st_id] = build_station_summary_url(st_id)
+            station_config_urls[st_id] = build_station_config_url(st_id)
 
         return {
             "project_id": self.project.project_id,
@@ -1445,7 +1480,8 @@ class ProjectPeMSQueryBuilder:
             "sensor_stations": self.project.sensor_stations,
             "station_aadt_urls": station_aadt_urls,
             "station_flow_urls": station_flow_urls,
-            "station_summary_urls": station_summary_urls
+            "station_summary_urls": station_summary_urls,
+            "station_config_urls": station_config_urls
         }
 
 
@@ -2199,6 +2235,1475 @@ def run_station_comparison_pipeline(
         print("To apply these corridor stations to the master CSV, run with: --match-stations --apply")
 
     return results
+
+
+# ===========================================================================
+# OPTION 1: OPEN-TO-TRAFFIC INFERENCE VIA PEMS CONFIGURATION & TELEMETRY
+# ===========================================================================
+
+def parse_any_date(val: Any) -> Optional[datetime.date]:
+    """
+    Parse a date from any string or numeric representation encountered across
+    Caltrans datasets, including 5-digit Excel serial numbers, ISO strings,
+    month-name strings ('April 30th, 2018', 'December, 2019'), and 4-digit years.
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat", ""):
+        return None
+
+    # Check 5-digit Excel serial (e.g. 43488 -> 2019-01-23)
+    if s.isdigit() and len(s) == 5:
+        try:
+            return datetime.date(1899, 12, 30) + datetime.timedelta(days=int(s))
+        except Exception:
+            pass
+
+    # Check 4-digit year (e.g. 2019 -> 2019-01-01)
+    if s.isdigit() and len(s) == 4 and 1980 <= int(s) <= 2035:
+        return datetime.date(int(s), 1, 1)
+
+    # Check ISO format YYYY-MM-DD
+    m_iso = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
+    if m_iso:
+        try:
+            return datetime.date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+        except ValueError:
+            pass
+
+    # Check YYYY/MM/DD or YYYY/MM
+    m_slash = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
+    if m_slash:
+        try:
+            return datetime.date(int(m_slash.group(1)), int(m_slash.group(2)), int(m_slash.group(3)))
+        except ValueError:
+            pass
+    m_ym = re.match(r"^(\d{4})/(\d{1,2})$", s)
+    if m_ym:
+        try:
+            return datetime.date(int(m_ym.group(1)), int(m_ym.group(2)), 1)
+        except ValueError:
+            pass
+    m_my = re.match(r"^(\d{1,2})/(\d{4})$", s)
+    if m_my:
+        try:
+            return datetime.date(int(m_my.group(2)), int(m_my.group(1)), 1)
+        except ValueError:
+            pass
+
+    # Clean ordinal suffixes (e.g. 30th -> 30)
+    s_clean = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%B, %Y", "%B %Y"):
+        try:
+            return datetime.datetime.strptime(s_clean, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+@dataclass
+class StationConfigRecord:
+    """Historical configuration state of a PeMS detector station."""
+    date: datetime.date
+    date_str: str
+    status: str
+    name: str
+    lanes_str: str
+    lane_count: int
+    ca_pm: str
+    abs_pm: str
+    length: Optional[float] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+@dataclass
+class StationConfigChange:
+    """A detected configuration event on a PeMS detector station."""
+    station_id: str
+    change_date: datetime.date
+    change_type: str  # 'LANE_CONFIG_INCREMENT', 'DETECTOR_COMMISSIONED', 'STATUS_CHANGE'
+    lanes_before: Optional[int]
+    lanes_after: Optional[int]
+    lanes_str_before: Optional[str]
+    lanes_str_after: Optional[str]
+    status: str
+    name: str
+    ca_pm: str
+    abs_pm: str
+    evidence: str
+
+
+@dataclass
+class FlowActivationResult:
+    """Telemetry activation result from PeMS daily flow data."""
+    station_id: str
+    activation_date: datetime.date
+    activation_type: str  # 'LANE_POINTS_STEP_CHANGE', 'SUSTAINED_FLOW_START'
+    lane_points_before: int
+    lane_points_after: int
+    flow_before: float
+    flow_after: float
+    obs_percent: float
+    evidence: str
+
+
+@dataclass
+class OpenToTrafficInference:
+    """Inferred Open to Traffic date and corroborating telemetry evidence for a project."""
+    project_id: str
+    route: str
+    direction: str
+    district: str
+    county: str
+    current_open_date: Optional[str]
+    inferred_date: Optional[str]  # ISO 'YYYY-MM-DD'
+    inferred_year: Optional[int]
+    confidence: str  # 'HIGH', 'MEDIUM', 'LOW', 'NONE'
+    method: str  # 'LANE_CONFIG_INCREMENT', 'DETECTOR_COMMISSIONED', 'CORROBORATED_TELEMETRY', 'FLOW_TELEMETRY_STEP', 'NONE'
+    evidence: str
+    station_id: Optional[str] = None
+    station_name: Optional[str] = None
+    candidate_events: List[Dict[str, Any]] = field(default_factory=list)
+    stations_checked: List[str] = field(default_factory=list)
+
+
+def parse_station_summary_configuration(html_content: str) -> List[StationConfigRecord]:
+    """
+    Parse historical configuration table from PeMS Station Summary HTML
+    (dnode=VDS&content=summary&tab=summary&station_id={st_id}).
+    Extracts chronological records of date, status, name, lanes string, lane count, CA PM, Abs PM.
+    """
+    if not html_content:
+        return []
+    soup = BeautifulSoup(html_content, "html.parser")
+    records: List[StationConfigRecord] = []
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        if any("lanes" in h for h in headers) and any("status" in h for h in headers):
+            for tr in table.find_all("tr")[1:]:
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if len(cells) >= 4 and "/" in cells[0]:
+                    d_str = cells[0].strip()
+                    status = cells[1].strip()
+                    name = cells[2].strip() if len(cells) > 2 else ""
+                    lanes_str = cells[3].strip()
+                    ca_pm = cells[4].strip() if len(cells) > 4 else ""
+                    abs_pm = cells[5].strip() if len(cells) > 5 else ""
+
+                    length_val = None
+                    if len(cells) > 6:
+                        try:
+                            length_val = float(cells[6].strip())
+                        except ValueError:
+                            pass
+
+                    lat_val = None
+                    if len(cells) > 7:
+                        try:
+                            lat_val = float(cells[7].strip())
+                        except ValueError:
+                            pass
+
+                    lng_val = None
+                    if len(cells) > 8:
+                        try:
+                            lng_val = float(cells[8].strip())
+                        except ValueError:
+                            pass
+
+                    try:
+                        dt = datetime.datetime.strptime(d_str, "%m/%d/%Y").date()
+                        digits = re.findall(r"\d", lanes_str)
+                        if digits:
+                            lane_count = int(lanes_str) if (lanes_str.isdigit() and len(lanes_str) == 1) else len(digits)
+                        else:
+                            lane_count = 0
+
+                        records.append(StationConfigRecord(
+                            date=dt,
+                            date_str=dt.strftime("%Y-%m-%d"),
+                            status=status,
+                            name=name,
+                            lanes_str=lanes_str,
+                            lane_count=lane_count,
+                            ca_pm=ca_pm,
+                            abs_pm=abs_pm,
+                            length=length_val,
+                            lat=lat_val,
+                            lng=lng_val,
+                        ))
+                    except Exception:
+                        pass
+    records.sort(key=lambda x: x.date)
+    return records
+
+
+def detect_lane_config_step_changes(
+    config_records: List[StationConfigRecord],
+    station_id: str = "",
+    min_date: Optional[datetime.date] = None,
+    max_date: Optional[datetime.date] = None
+) -> List[StationConfigChange]:
+    """
+    Analyze chronological station configuration records to identify:
+    1. LANE_CONFIG_INCREMENT: lane count increments (e.g. 2 -> 3 lanes, or 3 -> 4 lanes).
+    2. DETECTOR_COMMISSIONED: station is first commissioned as 'Active' (for newly built detectors).
+    3. STATUS_CHANGE: station changes from Inactive/Disabled to Active.
+    Filters within min_date / max_date window if provided.
+    """
+    events: List[StationConfigChange] = []
+    prev_lane_count: Optional[int] = None
+    prev_status: Optional[str] = None
+    prev_lanes_str: Optional[str] = None
+    first_active_seen: bool = False
+
+    for r in config_records:
+        dt = r.date
+        d_str = r.date_str
+        lc = r.lane_count
+        ls = r.lanes_str
+
+        # If before min_date, update baseline without emitting event
+        if min_date and dt < min_date:
+            prev_lane_count = lc
+            prev_status = r.status
+            prev_lanes_str = ls
+            if r.status.lower() == "active":
+                first_active_seen = True
+            continue
+
+        if max_date and dt > max_date:
+            continue
+
+        # 1. Detector Commissioning: First appearance as Active
+        if r.status.lower() == "active" and not first_active_seen:
+            first_active_seen = True
+            events.append(StationConfigChange(
+                station_id=station_id,
+                change_date=dt,
+                change_type="DETECTOR_COMMISSIONED",
+                lanes_before=0,
+                lanes_after=lc,
+                lanes_str_before="",
+                lanes_str_after=ls,
+                status=r.status,
+                name=r.name,
+                ca_pm=r.ca_pm,
+                abs_pm=r.abs_pm,
+                evidence=f"Detector station {station_id} commissioned as Active on {d_str} with {lc} lanes (mask: '{ls}')",
+            ))
+
+        # 2. Lane Configuration Increment: lane count increases while active
+        elif prev_lane_count is not None and lc > prev_lane_count and r.status.lower() == "active":
+            events.append(StationConfigChange(
+                station_id=station_id,
+                change_date=dt,
+                change_type="LANE_CONFIG_INCREMENT",
+                lanes_before=prev_lane_count,
+                lanes_after=lc,
+                lanes_str_before=prev_lanes_str,
+                lanes_str_after=ls,
+                status=r.status,
+                name=r.name,
+                ca_pm=r.ca_pm,
+                abs_pm=r.abs_pm,
+                evidence=f"Station {station_id} lane configuration incremented from {prev_lane_count} to {lc} lanes on {d_str} (mask: '{ls}')",
+            ))
+
+        # 3. Status change to Active after being Disabled/Inactive
+        elif prev_status and prev_status.lower() in ("disabled", "inactive") and r.status.lower() == "active":
+            events.append(StationConfigChange(
+                station_id=station_id,
+                change_date=dt,
+                change_type="STATUS_CHANGE",
+                lanes_before=prev_lane_count,
+                lanes_after=lc,
+                lanes_str_before=prev_lanes_str,
+                lanes_str_after=ls,
+                status=r.status,
+                name=r.name,
+                ca_pm=r.ca_pm,
+                abs_pm=r.abs_pm,
+                evidence=f"Station {station_id} transitioned from {prev_status} to Active on {d_str} with {lc} lanes",
+            ))
+
+        prev_lane_count = lc
+        prev_status = r.status
+        prev_lanes_str = ls
+
+    return events
+
+
+def parse_daily_flow_telemetry(tsv_text: str) -> List[Dict[str, Any]]:
+    """
+    Parse PeMS daily flow telemetry export text.
+    Format: Day \\t Flow (Veh/Day) \\t # Lane Points \\t % Observed
+    Returns list of dicts:
+      {'date': dt, 'date_str': 'YYYY-MM-DD', 'flow': float, 'lane_points': int, 'obs_pct': float}
+    """
+    records: List[Dict[str, Any]] = []
+    if not tsv_text:
+        return records
+    lines = tsv_text.strip().splitlines()
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 4 and "/" in parts[0]:
+            d_str = parts[0].strip()
+            try:
+                dt = datetime.datetime.strptime(d_str, "%m/%d/%Y").date()
+                flow = float(parts[1].replace(",", "").strip())
+                lp = int(float(parts[2].replace(",", "").strip()))
+                obs = float(parts[3].replace(",", "").replace("%", "").strip())
+                records.append({
+                    "date": dt,
+                    "date_str": dt.strftime("%Y-%m-%d"),
+                    "flow": flow,
+                    "lane_points": lp,
+                    "obs_pct": obs,
+                })
+            except (ValueError, TypeError):
+                continue
+    records.sort(key=lambda x: x["date"])
+    return records
+
+
+def detect_flow_telemetry_activation(
+    client: PeMSClient,
+    station_id: str,
+    target_year: int,
+    candidate_date: Optional[datetime.date] = None,
+    min_date: Optional[datetime.date] = None,
+    max_date: Optional[datetime.date] = None,
+    flow_threshold: float = 500.0,
+    consecutive_days: int = 3
+) -> Optional[FlowActivationResult]:
+    """
+    Examine PeMS daily flow telemetry (tab=det_timeseries&q=flow&gn=day)
+    to corroborate or pinpoint when traffic commenced on new lanes or detectors:
+    1. LANE_POINTS_STEP_CHANGE: # Lane Points permanently jumps (e.g. 576 -> 864 = 2 to 3 lanes).
+    2. SUSTAINED_FLOW_START: Daily flow transitions from 0/unobserved to steady mainline traffic (>500 veh/day)
+       for >= consecutive_days with positive % Observed.
+    """
+    url = build_station_timeseries_url(station_id, start_year=target_year, end_year=target_year, quantity="flow", granularity="day")
+    try:
+        tsv_text = client.get_text_content(url)
+    except Exception as exc:
+        LOGGER.debug(f"Failed to fetch flow telemetry for station {station_id} in {target_year}: {exc}")
+        return None
+
+    records = parse_daily_flow_telemetry(tsv_text)
+    if not records:
+        return None
+
+    # Check 1: Lane Points step-change (288 intervals/day per lane)
+    for i in range(1, len(records)):
+        curr = records[i]
+        prev = records[i - 1]
+
+        if candidate_date is not None:
+            delta = abs((curr["date"] - candidate_date).days)
+            if delta > 14:
+                continue
+
+        # A jump of >= 200 lane points indicates an additional lane added to daily sampling
+        if curr["lane_points"] >= prev["lane_points"] + 200:
+            subsequent = records[i:i + 5]
+            if len(subsequent) >= 3:
+                median_sub = np.median([r["lane_points"] for r in subsequent])
+                if median_sub >= prev["lane_points"] + 200:
+                    lp_prev = prev["lane_points"]
+                    lp_curr = curr["lane_points"]
+                    lanes_b = round(lp_prev / 288.0)
+                    lanes_a = round(lp_curr / 288.0)
+                    ev_msg = (
+                        f"Daily detector telemetry at station {station_id} showed # Lane Points stepping from "
+                        f"{lp_prev} (~{lanes_b} lanes) to {lp_curr} (~{lanes_a} lanes) on {curr['date_str']} "
+                        f"(flow: {curr['flow']:,.0f} veh/day, {curr['obs_pct']:.1f}% observed)"
+                    )
+                    return FlowActivationResult(
+                        station_id=station_id,
+                        activation_date=curr["date"],
+                        activation_type="LANE_POINTS_STEP_CHANGE",
+                        lane_points_before=lp_prev,
+                        lane_points_after=lp_curr,
+                        flow_before=prev["flow"],
+                        flow_after=curr["flow"],
+                        obs_percent=curr["obs_pct"],
+                        evidence=ev_msg,
+                    )
+
+    # Check 2: Sustained flow start (new detector commissioning)
+    for i in range(len(records) - consecutive_days + 1):
+        window = records[i:i + consecutive_days]
+        first = window[0]
+        dt = first["date"]
+        if min_date and dt < min_date:
+            continue
+        if max_date and dt > max_date:
+            continue
+
+        if all(r["flow"] >= flow_threshold and r["obs_pct"] > 0 for r in window):
+            prior = records[max(0, i - 7):i]
+            if not prior or any(r["flow"] < flow_threshold or r["obs_pct"] == 0 for r in prior):
+                ev_msg = (
+                    f"Detector {station_id} recorded initial sustained mainline flow starting {first['date_str']} "
+                    f"({first['flow']:,.0f} veh/day, {first['obs_pct']:.1f}% observed, {first['lane_points']} lane points)"
+                )
+                return FlowActivationResult(
+                    station_id=station_id,
+                    activation_date=dt,
+                    activation_type="SUSTAINED_FLOW_START",
+                    lane_points_before=0,
+                    lane_points_after=first["lane_points"],
+                    flow_before=0.0,
+                    flow_after=first["flow"],
+                    obs_percent=first["obs_pct"],
+                    evidence=ev_msg,
+                )
+
+    return None
+
+
+def infer_project_open_to_traffic(
+    project_or_id: Any,
+    client: Optional[PeMSClient] = None,
+    master_csv_path: Optional[str] = None,
+    vds_meta: Optional[IndexedVDSMetadata] = None,
+    check_telemetry: bool = True,
+    buffer_mi: float = 0.1,
+    verbose: bool = True
+) -> OpenToTrafficInference:
+    """
+    Infer the exact Open to Traffic Date for a highway project using PeMS
+    Option 1: Lane Configuration Step-Change & Detector Telemetry Activation.
+
+    Parameters:
+      project_or_id: ProjectRecord or PID string.
+      client: Optional authenticated PeMSClient instance.
+      master_csv_path: Path to master CSV if looking up by PID string.
+      vds_meta: Preloaded IndexedVDSMetadata instance for corridor lookups.
+      check_telemetry: If True, queries daily flow telemetry to corroborate config step-changes.
+      buffer_mi: Postmile buffer in miles for corridor station discovery.
+      verbose: If True, logs progress.
+
+    Returns:
+      OpenToTrafficInference object containing inferred date, year, confidence, method, and evidence.
+    """
+    # 1. Resolve project record
+    if isinstance(project_or_id, ProjectRecord):
+        proj = project_or_id
+    else:
+        pid_str = str(project_or_id).strip()
+        all_projs = load_master_csv(master_csv_path)
+        matching = [p for p in all_projs if str(p.project_id).strip() == pid_str]
+        if not matching:
+            return OpenToTrafficInference(
+                project_id=pid_str,
+                route="",
+                direction="",
+                district="",
+                county="",
+                current_open_date=None,
+                inferred_date=None,
+                inferred_year=None,
+                confidence="NONE",
+                method="NONE",
+                evidence=f"Project ID '{pid_str}' not found in master project CSV.",
+            )
+        proj = matching[0]
+
+    # 2. Determine candidate detector stations
+    candidate_stations: List[str] = []
+    # Primary: Spreadsheet sensors
+    for sid in proj.sensor_stations:
+        s_clean = str(sid).strip()
+        if s_clean and s_clean not in candidate_stations:
+            candidate_stations.append(s_clean)
+
+    # Secondary: Corridor sensors from VDS metadata if spreadsheet has no sensors
+    if not candidate_stations:
+        meta = vds_meta or get_indexed_vds_metadata()
+        if meta:
+            try:
+                corr_recs = meta.find_corridor_stations(
+                    district=proj.dist,
+                    route=proj.route,
+                    direction=proj.pems_direction,
+                    begin_pm=proj.begin_pm,
+                    end_pm=proj.end_pm,
+                    abs_begin_pm=proj.abs_begin_pm,
+                    abs_end_pm=proj.abs_end_pm,
+                    county=proj.county,
+                    buffer_mi=buffer_mi,
+                    station_types=("ML", "HV"),
+                )
+                for cr in corr_recs[:6]:  # Prioritize up to 6 corridor stations
+                    if str(cr.id) not in candidate_stations:
+                        candidate_stations.append(str(cr.id))
+            except Exception as exc:
+                LOGGER.debug(f"Error querying corridor stations for PID {proj.project_id}: {exc}")
+
+    if not candidate_stations:
+        return OpenToTrafficInference(
+            project_id=proj.project_id,
+            route=proj.route,
+            direction=proj.direction,
+            district=proj.dist,
+            county=proj.county,
+            current_open_date=proj.open_to_traffic_date,
+            inferred_date=None,
+            inferred_year=None,
+            confidence="NONE",
+            method="NONE",
+            evidence=f"No PeMS detector stations found on Route {proj.route} {proj.direction} ({proj.county}) corridor (uninstrumented corridor).",
+            stations_checked=[],
+        )
+
+    # 3. Establish project construction timeframe bounds
+    c_begin_parsed = parse_any_date(proj.construction_begin_date)
+    min_date = c_begin_parsed - datetime.timedelta(days=60) if c_begin_parsed else datetime.date(2000, 1, 1)
+    max_date = datetime.date.today() + datetime.timedelta(days=180)
+
+    # 4. Authenticate client
+    pems_client = client or PeMSClient()
+    if not pems_client.logged_in:
+        pems_client.login()
+
+    # 5. Evaluate stations for configuration changes and telemetry
+    all_events: List[Dict[str, Any]] = []
+    stations_checked: List[str] = []
+
+    for sid in candidate_stations:
+        stations_checked.append(sid)
+        summary_url = build_station_summary_url(sid)
+        try:
+            html_txt = pems_client.get_text_content(summary_url)
+        except Exception as exc:
+            LOGGER.debug(f"Failed to fetch summary HTML for station {sid}: {exc}")
+            continue
+
+        configs = parse_station_summary_configuration(html_txt)
+        if not configs:
+            continue
+
+        step_changes = detect_lane_config_step_changes(configs, station_id=sid, min_date=min_date, max_date=max_date)
+        for sc in step_changes:
+            all_events.append({
+                "station_id": sid,
+                "station_name": sc.name,
+                "event_type": sc.change_type,
+                "date": sc.change_date,
+                "date_str": sc.change_date.strftime("%Y-%m-%d"),
+                "lanes_before": sc.lanes_before,
+                "lanes_after": sc.lanes_after,
+                "lanes_str_before": sc.lanes_str_before,
+                "lanes_str_after": sc.lanes_str_after,
+                "evidence": sc.evidence,
+                "telemetry": None,
+            })
+
+    if not all_events:
+        return OpenToTrafficInference(
+            project_id=proj.project_id,
+            route=proj.route,
+            direction=proj.direction,
+            district=proj.dist,
+            county=proj.county,
+            current_open_date=proj.open_to_traffic_date,
+            inferred_date=None,
+            inferred_year=None,
+            confidence="NONE",
+            method="NONE",
+            evidence=f"Checked {len(stations_checked)} corridor stations ({', '.join(stations_checked[:5])}); no configuration changes or detector activation events identified.",
+            stations_checked=stations_checked,
+        )
+
+    # 6. Corroborate candidate events with daily flow telemetry if requested
+    if check_telemetry:
+        for ev in all_events:
+            sid = ev["station_id"]
+            cand_dt = ev["date"]
+            tel_res = detect_flow_telemetry_activation(
+                client=pems_client,
+                station_id=sid,
+                target_year=cand_dt.year,
+                candidate_date=cand_dt,
+                min_date=min_date,
+                max_date=max_date,
+            )
+            if tel_res is not None:
+                ev["telemetry"] = tel_res
+
+    # 7. Select best candidate event & assign confidence
+    best_event = None
+    best_score = -1
+
+    # Check for date consensus across multiple stations
+    date_counts: Dict[datetime.date, int] = {}
+    for ev in all_events:
+        d = ev["date"]
+        date_counts[d] = date_counts.get(d, 0) + 1
+
+    for ev in all_events:
+        score = 0
+        ev_type = ev["event_type"]
+        has_tel = ev.get("telemetry") is not None
+        consensus = date_counts.get(ev["date"], 1)
+
+        if ev_type == "LANE_CONFIG_INCREMENT":
+            score = 100
+            if has_tel:
+                score += 50
+        elif ev_type == "DETECTOR_COMMISSIONED":
+            score = 70
+            if has_tel:
+                score += 40
+        elif ev_type == "STATUS_CHANGE":
+            score = 40
+
+        if consensus > 1:
+            score += 25 * (consensus - 1)
+
+        # Proximity to construction window
+        if c_begin_parsed:
+            days_after_const = (ev["date"] - c_begin_parsed).days
+            if 60 <= days_after_const <= 1825:  # 2 months to 5 years after const begin
+                score += 30
+            elif days_after_const < 0:
+                score -= 40
+
+        if score > best_score:
+            best_score = score
+            best_event = ev
+
+    if not best_event:
+        return OpenToTrafficInference(
+            project_id=proj.project_id,
+            route=proj.route,
+            direction=proj.direction,
+            district=proj.dist,
+            county=proj.county,
+            current_open_date=proj.open_to_traffic_date,
+            inferred_date=None,
+            inferred_year=None,
+            confidence="NONE",
+            method="NONE",
+            evidence="Unable to score candidate events.",
+            candidate_events=all_events,
+            stations_checked=stations_checked,
+        )
+
+    # Determine confidence level
+    conf = "LOW"
+    method = best_event["event_type"]
+    if best_score >= 120:
+        conf = "HIGH"
+        if best_event.get("telemetry"):
+            method = "CORROBORATED_TELEMETRY"
+    elif best_score >= 70:
+        conf = "MEDIUM"
+
+    # Assemble comprehensive evidence narrative
+    narrative_parts = [best_event["evidence"]]
+    if best_event.get("telemetry"):
+        narrative_parts.append(best_event["telemetry"].evidence)
+    if date_counts.get(best_event["date"], 1) > 1:
+        narrative_parts.append(f"Corroborated across {date_counts[best_event['date']]} distinct stations along the corridor on {best_event['date_str']}.")
+
+    full_evidence = " | ".join(narrative_parts)
+
+    return OpenToTrafficInference(
+        project_id=proj.project_id,
+        route=proj.route,
+        direction=proj.direction,
+        district=proj.dist,
+        county=proj.county,
+        current_open_date=proj.open_to_traffic_date,
+        inferred_date=best_event["date_str"],
+        inferred_year=best_event["date"].year,
+        confidence=conf,
+        method=method,
+        evidence=full_evidence,
+        station_id=best_event["station_id"],
+        station_name=best_event.get("station_name"),
+        candidate_events=all_events,
+        stations_checked=stations_checked,
+    )
+
+
+def apply_open_date_updates_to_dataframe(
+    df: pd.DataFrame,
+    inferences: List[OpenToTrafficInference],
+    allowed_confidences: Tuple[str, ...] = ("HIGH", "MEDIUM")
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Apply inferred open-to-traffic dates to master dataframe columns:
+      - 'Open to Traffic Date'
+      - 'Open to Traffic Date (formatted YYYY-MM-DD)'
+      - 'open_traffic_year'
+      - 'open_traffic_month'
+      - 'open_traffic_day'
+      - 'Sensor 1 Activation Date for New Lane' (if blank or matching sensor 1)
+    Returns updated dataframe and count of updated rows.
+    """
+    updated = df.copy()
+    col_pid = _find_column(updated, "Project ID")
+    col_dir = _find_column(updated, "Direction")
+    col_open = _find_column(updated, "Open to Traffic Date")
+    col_open_fmt = _find_column(updated, "Open to Traffic Date (formatted YYYY-MM-DD)")
+    col_yr = _find_column(updated, "open_traffic_year")
+    col_mo = _find_column(updated, "open_traffic_month")
+    col_day = _find_column(updated, "open_traffic_day")
+    col_s1_act = _find_column(updated, "Sensor 1 Activation Date for New Lane")
+    col_s1_id = _find_column(updated, "Sensor Station 1 ID")
+
+    allowed_set = {c.upper().strip() for c in allowed_confidences}
+    update_count = 0
+
+    # Ensure target columns allow string/object types to avoid pandas dtype downcasting warnings
+    for c in (col_open, col_open_fmt, col_yr, col_mo, col_day, col_s1_act):
+        if c and c in updated.columns:
+            updated[c] = updated[c].astype(object)
+
+    for inf in inferences:
+        if not inf.inferred_date or inf.confidence.upper() not in allowed_set:
+            continue
+
+        mask = (updated[col_pid].astype(str).str.strip() == str(inf.project_id).strip())
+        if col_dir and inf.direction:
+            mask = mask & (updated[col_dir].astype(str).str.strip().str.upper() == inf.direction.strip().upper())
+
+        matching_indices = updated[mask].index
+        if matching_indices.empty:
+            continue
+
+        try:
+            dt = datetime.datetime.strptime(inf.inferred_date, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        for idx in matching_indices:
+            update_count += 1
+            if col_open:
+                updated.at[idx, col_open] = inf.inferred_date
+            if col_open_fmt:
+                updated.at[idx, col_open_fmt] = inf.inferred_date
+            if col_yr:
+                updated.at[idx, col_yr] = str(dt.year)
+            if col_mo:
+                updated.at[idx, col_mo] = str(dt.month)
+            if col_day:
+                updated.at[idx, col_day] = str(dt.day)
+
+            # Also update Sensor 1 activation date if empty or if station matches
+            if col_s1_act:
+                curr_act = str(updated.at[idx, col_s1_act]).strip()
+                s1_id_val = str(updated.at[idx, col_s1_id]).strip() if col_s1_id else ""
+                if not curr_act or curr_act.lower() in ("nan", "none", "") or (inf.station_id and inf.station_id in s1_id_val):
+                    updated.at[idx, col_s1_act] = inf.inferred_date
+
+    return updated, update_count
+
+
+def apply_open_date_to_master_csv(
+    inferences: List[OpenToTrafficInference],
+    master_csv_path: Optional[str] = None,
+    output_csv_path: Optional[str] = None,
+    allowed_confidences: Tuple[str, ...] = ("HIGH", "MEDIUM")
+) -> Tuple[str, str, int]:
+    """
+    Commit inferred open dates to the master CSV file.
+    Creates an automated timestamped backup (.bak_YYYYMMDD_HHMMSS) before writing.
+    Returns (backup_path, target_out_path, updated_rows_count).
+    """
+    target_in = master_csv_path or DEFAULT_MASTER_CSV
+    target_out = output_csv_path or target_in
+
+    raw_df = pd.read_csv(target_in, low_memory=False)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{target_in}.bak_{timestamp}"
+    shutil.copyfile(target_in, backup_path)
+    LOGGER.info(f"Created safety backup of input master CSV at: {backup_path}")
+
+    updated_df, count = apply_open_date_updates_to_dataframe(
+        raw_df, inferences, allowed_confidences=allowed_confidences
+    )
+    updated_df.to_csv(target_out, index=False)
+    return backup_path, target_out, count
+
+
+def run_open_to_traffic_inference_pipeline(
+    projects: Optional[List[ProjectRecord]] = None,
+    master_csv_path: Optional[str] = None,
+    project_id_filter: Optional[str] = None,
+    dist_filter: Optional[str] = None,
+    check_telemetry: bool = True,
+    apply_updates: bool = False,
+    output_report_path: Optional[str] = None,
+    output_csv_path: Optional[str] = None,
+    client: Optional[PeMSClient] = None,
+    verbose: bool = True
+) -> List[OpenToTrafficInference]:
+    """
+    Execute end-to-end Open-to-Traffic Date inference pipeline across highway projects.
+    Uses PeMS Lane Configuration & Detector Telemetry (Option 1).
+    """
+    csv_file = master_csv_path or DEFAULT_MASTER_CSV
+    all_projects = projects if projects is not None else load_master_csv(csv_file)
+
+    target_projects = all_projects
+    if project_id_filter:
+        pid_clean = str(project_id_filter).strip()
+        target_projects = [p for p in target_projects if str(p.project_id).strip() == pid_clean]
+    elif dist_filter:
+        d_clean = str(dist_filter).strip()
+        target_projects = [p for p in target_projects if str(p.dist).strip() == d_clean]
+    else:
+        # Default: evaluate projects missing an Open to Traffic Date, or where it is year-only
+        missing_or_vague = []
+        for p in target_projects:
+            o_date = str(p.open_to_traffic_date).strip() if p.open_to_traffic_date else ""
+            if not o_date or o_date.lower() in ("nan", "none", "") or (len(o_date) <= 4 and o_date.isdigit()):
+                missing_or_vague.append(p)
+        if missing_or_vague:
+            target_projects = missing_or_vague
+
+    if not target_projects:
+        print("No projects matched the specified criteria for Open-to-Traffic date inference.")
+        return []
+
+    pems_client = client or PeMSClient()
+    if not pems_client.logged_in:
+        pems_client.login()
+
+    vds_meta = get_indexed_vds_metadata()
+    inferences: List[OpenToTrafficInference] = []
+
+    mode_label = "APPLY UPDATES (Active Write)" if apply_updates else "DRY RUN (Read-Only) [Pass --apply to commit updates]"
+    print("=" * 80)
+    print("PEMS OPEN-TO-TRAFFIC DATE INFERENCE PIPELINE (OPTION 1)")
+    print(f"Mode: {mode_label}")
+    print(f"Telemetry Corroboration: {'Enabled (Daily Flow)' if check_telemetry else 'Disabled'}")
+    print(f"Target Projects: {len(target_projects)}")
+    print("=" * 80)
+
+    for i, p in enumerate(target_projects):
+        if verbose:
+            print(f"[{i+1}/{len(target_projects)}] Evaluating Project {p.project_id} (Route {p.route} {p.direction})...", end="", flush=True)
+        inf = infer_project_open_to_traffic(
+            p,
+            client=pems_client,
+            master_csv_path=csv_file,
+            vds_meta=vds_meta,
+            check_telemetry=check_telemetry,
+            verbose=False
+        )
+        inferences.append(inf)
+        if verbose:
+            status_text = f" -> Inferred: {inf.inferred_date} ({inf.confidence})" if inf.inferred_date else f" -> {inf.confidence}"
+            print(status_text)
+
+    # Print summary table
+    print("\n" + "=" * 80)
+    print("INFERENCE RESULTS SUMMARY")
+    print("=" * 80)
+    print(f"{'PID':<11} {'Route':<7} {'Dir':<4} {'Sheet Open':<12} {'Inferred Open':<14} {'Conf':<8} {'Method':<22} {'Station':<8}")
+    print("-" * 80)
+    for inf in inferences:
+        sheet_d = str(inf.current_open_date or 'None')[:10]
+        inf_d = str(inf.inferred_date or 'None')
+        st_id = str(inf.station_id or '-')
+        print(f"{inf.project_id:<11} {inf.route:<7} {inf.direction:<4} {sheet_d:<12} {inf_d:<14} {inf.confidence:<8} {inf.method:<22} {st_id:<8}")
+    print("=" * 80)
+
+    # Detailed evidence breakdown for resolved projects
+    resolved = [inf for inf in inferences if inf.inferred_date]
+    if resolved:
+        print("\nDETAILED EVIDENCE LOG:")
+        for inf in resolved:
+            print(f"  • Project {inf.project_id} (Route {inf.route} {inf.direction}):")
+            print(f"    Inferred Open Date: {inf.inferred_date} [Confidence: {inf.confidence}]")
+            print(f"    Primary Station:    {inf.station_id} ({inf.station_name or 'VDS'})")
+            print(f"    Evidence:           {inf.evidence}")
+
+    # Output report file if requested
+    if output_report_path:
+        out_ext = os.path.splitext(output_report_path)[1].lower()
+        if out_ext == ".csv":
+            report_data = []
+            for inf in inferences:
+                report_data.append({
+                    "project_id": inf.project_id,
+                    "route": inf.route,
+                    "direction": inf.direction,
+                    "district": inf.district,
+                    "county": inf.county,
+                    "sheet_open_date": inf.current_open_date,
+                    "inferred_open_date": inf.inferred_date,
+                    "inferred_year": inf.inferred_year,
+                    "confidence": inf.confidence,
+                    "method": inf.method,
+                    "station_id": inf.station_id,
+                    "evidence": inf.evidence,
+                })
+            pd.DataFrame(report_data).to_csv(output_report_path, index=False)
+            print(f"\n✓ Exported inference report CSV -> {output_report_path}")
+        else:
+            md_lines = [
+                "# PeMS Open-to-Traffic Date Inference Report",
+                f"**Generated:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
+                f"**Method:** PeMS Lane Configuration Step-Change & Detector Telemetry (Option 1)  ",
+                f"**Telemetry Verification:** {'Enabled' if check_telemetry else 'Disabled'}  \n",
+                "| Project ID | Route | Dir | Sheet Date | Inferred Date | Confidence | Method | Station | Evidence |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+            ]
+            for inf in inferences:
+                md_lines.append(
+                    f"| {inf.project_id} | {inf.route} | {inf.direction} | {inf.current_open_date or 'N/A'} | "
+                    f"**{inf.inferred_date or 'N/A'}** | {inf.confidence} | {inf.method} | {inf.station_id or 'N/A'} | {inf.evidence} |"
+                )
+            with open(output_report_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(md_lines))
+            print(f"\n✓ Exported inference report Markdown -> {output_report_path}")
+
+    # Commit updates if requested
+    if apply_updates:
+        backup_p, target_p, count = apply_open_date_to_master_csv(
+            inferences=inferences,
+            master_csv_path=csv_file,
+            output_csv_path=output_csv_path,
+        )
+        print(f"\n✓ Successfully updated {count} project dates in master CSV at: {target_p}")
+        print(f"  Safety backup preserved at: {backup_p}")
+    else:
+        print("\n[DRY RUN COMPLETE]: No changes have been written to the spreadsheet.")
+        print("To commit these inferred dates to the master CSV, run with: --find-open-date --apply")
+
+    return inferences
+
+
+
+# ---------------------------------------------------------------------------
+# RAW PEMS STATION LANE CONFIGURATION & TSN ROADWAY METRICS ENGINE
+# ---------------------------------------------------------------------------
+@dataclass
+class StationLaneConfigDetails:
+    """Raw PeMS station lane configuration, change log, and Caltrans TSN roadway metrics."""
+    station_id: str
+    station_name: str = ""
+    district: Optional[str] = None
+    route: Optional[str] = None
+    direction: Optional[str] = None
+    county: Optional[str] = None
+    station_type: Optional[str] = None
+    ca_pm: Optional[str] = None
+    abs_pm: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    tsn_roadway_info: Dict[str, str] = field(default_factory=dict)
+    lane_table: List[Dict[str, str]] = field(default_factory=list)
+    change_log: List[Dict[str, str]] = field(default_factory=list)
+    construction_history: List[Dict[str, str]] = field(default_factory=list)
+    url: str = ""
+    error: Optional[str] = None
+
+
+def parse_station_configuration_page(
+    html_content: str,
+    station_id: str = "",
+    vds_record: Optional[VDSStationRecord] = None
+) -> StationLaneConfigDetails:
+    """
+    Parse raw PeMS station configuration HTML (content=sta_cfg).
+    Extracts:
+      1. Caltrans TSN Roadway Information key-value dictionary (Road Width, Lane Width,
+         Inner/Outer Shoulder Width, Design Speed Limit, Functional Class, Median Type, etc.)
+      2. PeMS Lane Configuration Table (Lane, Slot, Sensor Tech, Type)
+      3. PeMS Change Log / Configuration history (Date, Status, Name, Lanes, CA PM, Abs PM, Length, etc.)
+      4. PeMS Construction History (Start Date, End Date)
+    """
+    st_id = str(station_id).strip()
+    details = StationLaneConfigDetails(
+        station_id=st_id,
+        url=build_station_config_url(st_id) if st_id else "",
+    )
+
+    if vds_record:
+        details.station_name = vds_record.name
+        details.district = str(vds_record.district)
+        details.route = str(vds_record.fwy)
+        details.direction = vds_record.dir
+        details.county = str(vds_record.county)
+        details.station_type = vds_record.type
+        details.ca_pm = str(vds_record.state_pm)
+        details.abs_pm = vds_record.abs_pm
+        details.latitude = vds_record.latitude
+        details.longitude = vds_record.longitude
+
+    if not html_content:
+        details.error = "Empty response from PeMS"
+        return details
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    page_text = soup.get_text()
+
+    if "Application Halted" in page_text or "Missing numeric segment identifier" in page_text:
+        details.error = "PeMS internal error: station uninstrumented or missing numeric segment identifier"
+        return details
+
+    # Extract title metadata if vds_record wasn't present
+    if soup.title and soup.title.string:
+        t_str = soup.title.string.strip()
+        m_title = re.search(r">\s*(.*?VDS)\s*(\d+)\s*-\s*(.*?)\s*>", t_str)
+        if m_title:
+            if not details.station_type:
+                details.station_type = m_title.group(1).strip()
+            if not details.station_name:
+                details.station_name = m_title.group(3).strip()
+
+    for table in soup.find_all("table"):
+        full_text = table.get_text(separator=" ", strip=True)
+        th_cells_lower = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+
+        # 1. TSN Roadway Information
+        if "roadway information" in full_text.lower():
+            tsn_parsed_count = 0
+            for tr in table.find_all("tr"):
+                cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+                if len(cells) == 2 and cells[0]:
+                    k, v = cells[0].strip(), cells[1].strip()
+                    if "roadway information" not in k.lower():
+                        details.tsn_roadway_info[k] = v
+                        tsn_parsed_count += 1
+                elif len(cells) == 1 and "not available" in cells[0].lower():
+                    details.tsn_roadway_info["Status"] = "Not Available in PeMS"
+            if tsn_parsed_count == 0 and "Status" not in details.tsn_roadway_info:
+                if "not available" in full_text.lower():
+                    details.tsn_roadway_info["Status"] = "Not Available in PeMS"
+
+        # 2. Lane Configuration Table
+        elif (
+            any(h == "lane" for h in th_cells_lower)
+            and not any(h in ("status", "date", "start date", "lanes") for h in th_cells_lower)
+        ):
+            col_names: List[str] = []
+            for tr in table.find_all("tr"):
+                th_cells = [th.get_text(strip=True) for th in tr.find_all("th")]
+                if any(h.lower() == "lane" for h in th_cells):
+                    col_names = th_cells
+                    continue
+                if col_names:
+                    td_cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                    if len(td_cells) == len(col_names):
+                        details.lane_table.append(dict(zip(col_names, td_cells)))
+
+        # 3. Change Log
+        elif any("status" in h for h in th_cells_lower) and any("lanes" in h for h in th_cells_lower):
+            col_names: List[str] = []
+            for tr in table.find_all("tr"):
+                th_cells = [th.get_text(strip=True) for th in tr.find_all("th")]
+                if any("status" in h.lower() for h in th_cells) and any("lanes" in h.lower() for h in th_cells):
+                    col_names = th_cells
+                    continue
+                if col_names:
+                    td_cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                    if len(td_cells) == len(col_names):
+                        details.change_log.append(dict(zip(col_names, td_cells)))
+
+        # 4. Construction History
+        elif any("start date" in h for h in th_cells_lower) and any("end date" in h for h in th_cells_lower):
+            col_names: List[str] = []
+            for tr in table.find_all("tr"):
+                th_cells = [th.get_text(strip=True) for th in tr.find_all("th")]
+                if any("start date" in h.lower() for h in th_cells):
+                    col_names = th_cells
+                    continue
+                if col_names:
+                    td_cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                    if len(td_cells) == len(col_names):
+                        details.construction_history.append(dict(zip(col_names, td_cells)))
+
+    return details
+
+
+def fetch_station_lane_configuration(
+    station_id: str,
+    client: Optional[PeMSClient] = None,
+    vds_record: Optional[VDSStationRecord] = None
+) -> StationLaneConfigDetails:
+    """
+    Fetch and parse raw PeMS station lane configuration, change log, and TSN roadway metrics for a single station.
+    """
+    st_id = str(station_id).strip()
+    if client is None:
+        client = PeMSClient()
+        client.login()
+
+    url = build_station_config_url(st_id)
+    try:
+        html_txt = client.get_text_content(url)
+        return parse_station_configuration_page(html_txt, station_id=st_id, vds_record=vds_record)
+    except Exception as exc:
+        LOGGER.warning(f"Failed to fetch configuration for station {st_id}: {exc}")
+        details = StationLaneConfigDetails(
+            station_id=st_id,
+            url=url,
+            error=str(exc)
+        )
+        if vds_record:
+            details.station_name = vds_record.name
+            details.district = str(vds_record.district)
+            details.route = str(vds_record.fwy)
+            details.direction = vds_record.dir
+            details.county = str(vds_record.county)
+            details.station_type = vds_record.type
+            details.ca_pm = str(vds_record.state_pm)
+            details.abs_pm = vds_record.abs_pm
+            details.latitude = vds_record.latitude
+            details.longitude = vds_record.longitude
+        return details
+
+
+def fetch_project_lane_configurations(
+    project_id: str,
+    master_csv_path: Optional[str] = None,
+    client: Optional[PeMSClient] = None,
+    metadata_dir: Optional[str] = None,
+    buffer_mi: float = 0.2,
+    include_corridor_vds: bool = True
+) -> Dict[str, Any]:
+    """
+    Fetch raw PeMS station lane configuration tables and TSN roadway metrics for all stations associated with a project.
+    Combines stations listed in the spreadsheet with active corridor VDS stations along the project corridor.
+    """
+    csv_file = master_csv_path or DEFAULT_MASTER_CSV
+    projects = load_master_csv(csv_file)
+    pid_clean = str(project_id).strip()
+    matched_projects = [p for p in projects if str(p.project_id).strip() == pid_clean]
+
+    if not matched_projects:
+        return {
+            "project_id": pid_clean,
+            "projects": [],
+            "stations": [],
+            "spreadsheet_stations": [],
+            "corridor_stations": [],
+            "error": f"Project ID '{pid_clean}' not found in {csv_file}"
+        }
+
+    if client is None:
+        client = PeMSClient()
+        client.login()
+
+    vds_meta: Optional[IndexedVDSMetadata] = None
+    try:
+        vds_meta = load_vds_metadata(metadata_dir)
+    except Exception as exc:
+        LOGGER.debug(f"Could not load VDS metadata: {exc}")
+
+    # Gather spreadsheet sensor IDs
+    spreadsheet_sids: List[str] = []
+    for p in matched_projects:
+        for sid in p.sensor_stations:
+            s_clean = str(sid).strip()
+            if s_clean and s_clean not in spreadsheet_sids:
+                spreadsheet_sids.append(s_clean)
+
+    # Gather corridor active VDS stations
+    corridor_sids: List[str] = []
+    if include_corridor_vds and vds_meta is not None:
+        for p in matched_projects:
+            comp = compare_project_stations(p, vds_meta=vds_meta, buffer_mi=buffer_mi, station_types=("ML", "HV"))
+            for s in comp.found_stations:
+                s_clean = str(s.id).strip()
+                if s_clean and s_clean not in corridor_sids and s_clean not in spreadsheet_sids:
+                    corridor_sids.append(s_clean)
+
+    # Combined station list: spreadsheet stations first, followed by additional corridor stations
+    ordered_sids = spreadsheet_sids + [s for s in corridor_sids if s not in spreadsheet_sids]
+
+    results: List[StationLaneConfigDetails] = []
+    for sid in ordered_sids:
+        vds_rec = vds_meta.by_id.get(sid) if vds_meta else None
+        st_details = fetch_station_lane_configuration(sid, client=client, vds_record=vds_rec)
+        results.append(st_details)
+
+    # HPMS Ground-Truth Roadway Attributes
+    hpms_summary: Optional[Dict[str, Any]] = None
+    try:
+        from hpms_interface import HPMSCorridorEngine
+        engine = HPMSCorridorEngine(master_csv_path=csv_file)
+        hpms_res = engine.inspect_project(pid_clean)
+        if hpms_res and hpms_res.get("sections"):
+            secs = hpms_res["sections"]
+            facility_code_map = {
+                "1": "One-Way Roadway",
+                "2": "Two-Way Divided (Freeway/Expressway)",
+                "4": "Two-Way Undivided",
+                "5": "Others / Ramps"
+            }
+            access_code_map = {
+                "1": "Full Access Control (Freeway)",
+                "2": "Partial Access Control (Expressway)",
+                "3": "No Access Control (Conventional Highway)"
+            }
+            surface_code_map = {
+                "1": "Unpaved",
+                "2": "Bituminous (Asphalt)",
+                "3": "JPCP (Jointed Plain Concrete)",
+                "4": "JRCP (Jointed Reinforced Concrete)",
+                "5": "CRCP (Continuously Reinforced Concrete)",
+                "6": "AC Overlay on AC",
+                "7": "AC Overlay on PCC",
+                "8": "PCC Overlay on PCC",
+                "9": "Other"
+            }
+            fsystem_code_map = {
+                "1": "Interstate",
+                "2": "Principal Arterial - Other Freeways & Expressways",
+                "3": "Principal Arterial - Other",
+                "4": "Minor Arterial",
+                "5": "Major Collector",
+                "6": "Minor Collector",
+                "7": "Local"
+            }
+
+            fac_vals = [facility_code_map.get(str(s.get("facility_type")), str(s.get("facility_type"))) for s in secs if s.get("facility_type") is not None]
+            acc_vals = [access_code_map.get(str(s.get("access_control")), str(s.get("access_control"))) for s in secs if s.get("access_control") is not None]
+            surf_vals = [surface_code_map.get(str(s.get("surface_type")), str(s.get("surface_type"))) for s in secs if s.get("surface_type") is not None]
+            fsys_vals = [fsystem_code_map.get(str(s.get("f_system")), str(s.get("f_system"))) for s in secs if s.get("f_system") is not None]
+
+            fa_vals = [s.get("future_aadt") for s in secs if s.get("future_aadt")]
+            fa_yr_vals = [str(s.get("future_aadt_year"))[:4] for s in secs if s.get("future_aadt_year")]
+
+            hpms_summary = {
+                "sections_count": hpms_res.get("hpms_sections_count", len(secs)),
+                "predominant_lanes_2024": hpms_res.get("hpms_predominant_lanes_2024"),
+                "avg_lanes_2024": hpms_res.get("hpms_avg_lanes_2024"),
+                "lane_distribution_mi": hpms_res.get("hpms_lane_distribution_mi"),
+                "avg_aadt_2024": hpms_res.get("hpms_avg_aadt_2024"),
+                "facility_type": ", ".join(dict.fromkeys(fac_vals)) if fac_vals else None,
+                "access_control": ", ".join(dict.fromkeys(acc_vals)) if acc_vals else None,
+                "surface_type": ", ".join(dict.fromkeys(surf_vals)) if surf_vals else None,
+                "functional_system": ", ".join(dict.fromkeys(fsys_vals)) if fsys_vals else None,
+                "future_aadt": fa_vals[0] if fa_vals else None,
+                "future_aadt_year": fa_yr_vals[0] if fa_yr_vals else None,
+            }
+    except Exception as exc:
+        LOGGER.debug(f"HPMS corridor lookup failed: {exc}")
+
+    return {
+        "project_id": pid_clean,
+        "projects": matched_projects,
+        "stations": results,
+        "spreadsheet_stations": spreadsheet_sids,
+        "corridor_stations": corridor_sids,
+        "hpms_summary": hpms_summary,
+    }
+
+
+def format_lane_config_report(
+    details: Union[StationLaneConfigDetails, List[StationLaneConfigDetails]],
+    project: Optional[ProjectRecord] = None,
+    hpms_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Format station lane tables, change logs, and TSN roadway metrics into a clean human-readable report.
+    Also incorporates HPMS certified roadway cross-section metrics when available.
+    """
+    if isinstance(details, StationLaneConfigDetails):
+        station_list = [details]
+    else:
+        station_list = details
+
+    lines: List[str] = []
+    lines.append("=" * 80)
+    lines.append("CALTRANS PEMS STATION LANE CONFIGURATION & ROADWAY METRICS")
+    if project:
+        lines.append(f"Project ID: {project.project_id} | Route {project.route} {project.direction} | Dist {project.dist}, {project.county} County")
+        lines.append(f"Limits: PM {project.begin_pm} - {project.end_pm} (Abs: {project.abs_begin_pm} - {project.abs_end_pm})")
+    lines.append("=" * 80)
+
+    # HPMS Ground-Truth Roadway Attributes Section
+    if hpms_summary:
+        lines.append("\n[FHWA / Caltrans HPMS Ground-Truth Roadway Attributes]")
+        pred_lanes = hpms_summary.get("predominant_lanes_2024")
+        avg_lanes = hpms_summary.get("avg_lanes_2024")
+        lane_str = f"{pred_lanes}" if pred_lanes is not None else "N/A"
+        if avg_lanes is not None and avg_lanes != pred_lanes:
+            lane_str += f" (Corridor length-weighted avg: {avg_lanes:.2f})"
+        lines.append(f"  • Through Lanes (2024):         {lane_str}")
+        if hpms_summary.get("facility_type"):
+            lines.append(f"  • Facility Type:                {hpms_summary['facility_type']}")
+        if hpms_summary.get("access_control"):
+            lines.append(f"  • Access Control:               {hpms_summary['access_control']}")
+        if hpms_summary.get("surface_type"):
+            lines.append(f"  • Surface Type:                 {hpms_summary['surface_type']}")
+        if hpms_summary.get("functional_system"):
+            lines.append(f"  • Functional System:            {hpms_summary['functional_system']}")
+        if hpms_summary.get("avg_aadt_2024"):
+            lines.append(f"  • Certified AADT (2024):        {hpms_summary['avg_aadt_2024']:,} vehicles/day")
+        if hpms_summary.get("future_aadt"):
+            yr_str = f" (Year {hpms_summary['future_aadt_year']})" if hpms_summary.get('future_aadt_year') else ""
+            try:
+                fa = int(float(hpms_summary['future_aadt']))
+                lines.append(f"  • Forecast Future AADT:         {fa:,} vehicles/day{yr_str}")
+            except Exception:
+                lines.append(f"  • Forecast Future AADT:         {hpms_summary['future_aadt']}{yr_str}")
+        if hpms_summary.get("sections_count"):
+            lines.append(f"  • HPMS Corridor Sections:       {hpms_summary['sections_count']} sections analyzed")
+        lines.append("-" * 80)
+
+    if not station_list:
+        lines.append("\nNo station configurations found.")
+        return "\n".join(lines)
+
+    for idx, st in enumerate(station_list, start=1):
+        lines.append("")
+        lines.append("-" * 80)
+        st_type_str = f" ({st.station_type})" if st.station_type else ""
+        st_name_str = f": {st.station_name}" if st.station_name else ""
+        lines.append(f"STATION {st.station_id}{st_name_str}{st_type_str} [Station {idx}/{len(station_list)}]")
+        loc_parts = []
+        if st.route:
+            loc_parts.append(f"Route: {st.route} {st.direction or ''}".strip())
+        if st.district:
+            loc_parts.append(f"Dist: {st.district}")
+        if st.county:
+            loc_parts.append(f"County: {st.county}")
+        if loc_parts:
+            lines.append(" | ".join(loc_parts))
+
+        pm_parts = []
+        if st.ca_pm:
+            pm_parts.append(f"CA PM: {st.ca_pm}")
+        if st.abs_pm is not None:
+            pm_parts.append(f"Abs PM: {st.abs_pm:.2f}")
+        if st.latitude and st.longitude:
+            pm_parts.append(f"Coordinates: ({st.latitude:.5f}, {st.longitude:.5f})")
+        if pm_parts:
+            lines.append(" | ".join(pm_parts))
+
+        if st.url:
+            lines.append(f"PeMS URL: {st.url}")
+        lines.append("-" * 80)
+
+        if st.error:
+            lines.append(f"  [ERROR / STATUS]: {st.error}")
+            continue
+
+        # 1. TSN Roadway Metrics
+        lines.append("\n  [Caltrans TSN Roadway Metrics]")
+        if st.tsn_roadway_info:
+            if st.tsn_roadway_info.get("Status") == "Not Available in PeMS":
+                lines.append("    • Status:                          Not Available in PeMS for this station")
+                lines.append("      (Caltrans PeMS has not linked TSN roadway data for this station/corridor;")
+                lines.append("       see HPMS Ground-Truth Roadway Attributes above for official cross-section metrics)")
+            else:
+                for k, v in st.tsn_roadway_info.items():
+                    lines.append(f"    • {k + ':':<32} {v}")
+        else:
+            lines.append("    (No TSN roadway metrics recorded for this station)")
+
+        # 2. Lane Configuration Table
+        lines.append("\n  [PeMS Station Lane Configuration Table]")
+        if st.lane_table:
+            cols = list(st.lane_table[0].keys())
+            # Format table with aligned widths
+            col_widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in st.lane_table)) for c in cols}
+            hdr_str = "    " + "  ".join(f"{c:<{col_widths[c]}}" for c in cols)
+            sep_str = "    " + "  ".join("-" * col_widths[c] for c in cols)
+            lines.append(hdr_str)
+            lines.append(sep_str)
+            for r in st.lane_table:
+                row_str = "    " + "  ".join(f"{str(r.get(c, '')):<{col_widths[c]}}" for c in cols)
+                lines.append(row_str)
+            lines.append("    [Note: Lane types reflect raw PeMS definitions ('Mainline', 'HOV', etc.).")
+            lines.append("     PeMS does not track granular types like climbing lanes, auxiliary lanes, or turn pockets.]")
+        else:
+            lines.append("    (No lane configuration records found)")
+
+        # 3. Change Log
+        lines.append("\n  [PeMS Configuration History / Change Log]")
+        if st.change_log:
+            cols = list(st.change_log[0].keys())
+            col_widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in st.change_log)) for c in cols}
+            hdr_str = "    " + "  ".join(f"{c:<{col_widths[c]}}" for c in cols)
+            sep_str = "    " + "  ".join("-" * col_widths[c] for c in cols)
+            lines.append(hdr_str)
+            lines.append(sep_str)
+            for r in st.change_log:
+                row_str = "    " + "  ".join(f"{str(r.get(c, '')):<{col_widths[c]}}" for c in cols)
+                lines.append(row_str)
+        else:
+            lines.append("    (No configuration changes recorded in PeMS change log)")
+
+        # 4. Construction History
+        if st.construction_history:
+            lines.append("\n  [PeMS Construction History]")
+            cols = list(st.construction_history[0].keys())
+            col_widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in st.construction_history)) for c in cols}
+            hdr_str = "    " + "  ".join(f"{c:<{col_widths[c]}}" for c in cols)
+            sep_str = "    " + "  ".join("-" * col_widths[c] for c in cols)
+            lines.append(hdr_str)
+            lines.append(sep_str)
+            for r in st.construction_history:
+                row_str = "    " + "  ".join(f"{str(r.get(c, '')):<{col_widths[c]}}" for c in cols)
+                lines.append(row_str)
+
+    lines.append("\n" + "=" * 80)
+    return "\n".join(lines)
+
+
+def _save_lane_config_report(
+    output_path: str,
+    stations: List[StationLaneConfigDetails],
+    project: Optional[ProjectRecord] = None,
+    hpms_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Save lane configuration and TSN roadway metrics report to file (JSON, Markdown, or text)."""
+    out_ext = os.path.splitext(output_path)[1].lower()
+    if out_ext == ".json":
+        data = {
+            "project_id": project.project_id if project else None,
+            "project_description": project.project_description if project else None,
+            "route": project.route if project else None,
+            "direction": project.direction if project else None,
+            "hpms_summary": hpms_summary,
+            "stations": [
+                {
+                    "station_id": s.station_id,
+                    "station_name": s.station_name,
+                    "district": s.district,
+                    "route": s.route,
+                    "direction": s.direction,
+                    "county": s.county,
+                    "station_type": s.station_type,
+                    "ca_pm": s.ca_pm,
+                    "abs_pm": s.abs_pm,
+                    "latitude": s.latitude,
+                    "longitude": s.longitude,
+                    "url": s.url,
+                    "error": s.error,
+                    "tsn_roadway_info": s.tsn_roadway_info,
+                    "lane_table": s.lane_table,
+                    "change_log": s.change_log,
+                    "construction_history": s.construction_history,
+                }
+                for s in stations
+            ]
+        }
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"\n✓ Exported station lane configuration JSON -> {output_path}")
+    else:
+        report_text = format_lane_config_report(stations, project=project, hpms_summary=hpms_summary)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(report_text)
+        print(f"\n✓ Exported station lane configuration report -> {output_path}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -4650,6 +6155,28 @@ Examples:
         help="Audit and match active PeMS VDS stations along corridors against spreadsheet sensors."
     )
     act_group.add_argument(
+        "--find-open-date", "--open-date",
+        dest="find_open_date",
+        action="store_true",
+        help="Automatically infer Open-to-Traffic date from PeMS lane configuration & detector telemetry (Option 1)."
+    )
+    act_group.add_argument(
+        "--no-telemetry",
+        dest="check_telemetry",
+        action="store_false",
+        default=True,
+        help="Disable daily flow telemetry corroboration during open-to-traffic date inference."
+    )
+    act_group.add_argument(
+        "--lane-config", "--lanes", "--show-lanes",
+        dest="lane_config",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PID_OR_STATION",
+        help="Fetch and display raw PeMS station lane tables and Caltrans TSN roadway metrics for a project ID or station ID (e.g. -p <PID> --lanes or -s <STATION_ID> --lanes)."
+    )
+    act_group.add_argument(
         "--list-urls",
         action="store_true",
         help="List generated PeMS URLs for projects."
@@ -4882,7 +6409,7 @@ def main(argv: Optional[List[str]] = None):
         return
 
     # 3. Station download (by single Station ID)
-    if args.download_station:
+    if args.download_station and not args.lane_config:
         download_station_data(
             station_id=args.download_station,
             data_type=args.data_type,
@@ -4904,8 +6431,9 @@ def main(argv: Optional[List[str]] = None):
 
     projects = load_master_csv(args.input)
 
-    # Resolve target project ID from any argument that provided one
+    # Resolve target project ID or station ID from any argument that provided one
     target_pid = None
+    target_station = None
     if isinstance(args.slices, str):
         target_pid = args.slices.strip()
     elif isinstance(args.imagery, str):
@@ -4914,8 +6442,33 @@ def main(argv: Optional[List[str]] = None):
         target_pid = args.map.strip()
     elif isinstance(args.download_project, str):
         target_pid = args.download_project.strip()
+    elif isinstance(args.lane_config, str):
+        val = args.lane_config.strip()
+        if any(p.project_id == val for p in projects):
+            target_pid = val
+        elif len(val) <= 7 and val.isdigit():
+            target_station = val
+        else:
+            target_pid = val
     elif args.project:
         target_pid = str(args.project).strip()
+
+    if args.download_station:
+        target_station = str(args.download_station).strip()
+
+    # Pre-resolve absolute postmiles from CA postmiles for target project if needed
+    if target_pid:
+        for p in projects:
+            if p.project_id == target_pid:
+                if p.abs_begin_pm is None or p.abs_end_pm is None:
+                    calc_b, calc_e = resolve_absolute_postmiles(
+                        p.route, p.county, p.begin_pm, p.end_pm
+                    )
+                    if calc_b is not None and calc_e is not None:
+                        if p.abs_begin_pm is None:
+                            p.abs_begin_pm = calc_b
+                        if p.abs_end_pm is None:
+                            p.abs_end_pm = calc_e
 
     # 4. Multi-project map
     if args.map_all:
@@ -4957,6 +6510,65 @@ def main(argv: Optional[List[str]] = None):
             project_id_filter=target_pid,
             verbose=True
         )
+        return
+
+    # 5b. Open to Traffic Date inference pipeline (Option 1: Lane Config & Telemetry)
+    if args.find_open_date:
+        run_open_to_traffic_inference_pipeline(
+            projects=projects,
+            master_csv_path=args.input,
+            project_id_filter=target_pid,
+            dist_filter=args.dist,
+            check_telemetry=args.check_telemetry,
+            apply_updates=args.apply,
+            output_report_path=args.output_report,
+            output_csv_path=args.output_csv,
+            verbose=True,
+        )
+        return
+
+    # 5c. Station Lane Configuration & TSN Roadway Metrics Inspection
+    if args.lane_config:
+        if target_station:
+            client = PeMSClient()
+            client.login()
+            vds_meta = None
+            try:
+                vds_meta = get_indexed_vds_metadata()
+            except Exception:
+                pass
+            vds_rec = vds_meta.by_id.get(target_station) if vds_meta else None
+            details = fetch_station_lane_configuration(target_station, client=client, vds_record=vds_rec)
+            report = format_lane_config_report(details)
+            print(report)
+
+            if args.output_report:
+                _save_lane_config_report(args.output_report, [details])
+            return
+
+        if not target_pid:
+            print("Error: Please specify a Project ID or Station ID to fetch lane configurations (e.g. -p <PID> --lanes or -s <STATION_ID> --lanes).")
+            sys.exit(1)
+
+        client = PeMSClient()
+        client.login()
+        res = fetch_project_lane_configurations(
+            project_id=target_pid,
+            master_csv_path=args.input,
+            client=client,
+            metadata_dir=args.metadata_dir,
+            buffer_mi=args.buffer,
+        )
+        if not res["stations"]:
+            print(f"\n[Project {target_pid}]: No PeMS stations found in spreadsheet or corridor within buffer {args.buffer} mi.")
+            return
+
+        matched_p = res["projects"][0] if res["projects"] else None
+        report = format_lane_config_report(res["stations"], project=matched_p, hpms_summary=res.get("hpms_summary"))
+        print(report)
+
+        if args.output_report:
+            _save_lane_config_report(args.output_report, res["stations"], project=matched_p, hpms_summary=res.get("hpms_summary"))
         return
 
     # 6. Corridor Slices (high-resolution Zoom 19 with interactive report)
@@ -5057,6 +6669,7 @@ def main(argv: Optional[List[str]] = None):
 
         for idx, proj in enumerate(matched):
             builder = ProjectPeMSQueryBuilder(proj)
+            builder.resolve_absolute_postmiles()
             start_c, end_c = builder.resolve_geometry()
             urls = builder.generate_all_urls()
 
@@ -5074,10 +6687,14 @@ def main(argv: Optional[List[str]] = None):
             print(f"  Route & Dir:        Route {proj.route} {proj.direction} (PeMS dir: {proj.pems_direction})")
             print(f"  District & County:  Dist {proj.dist}, {proj.county} ({proj.state})")
             print(f"  Postmiles:          Begin: {proj.begin_pm} | End: {proj.end_pm}")
-            if proj.abs_begin_pm or proj.abs_end_pm:
+            if proj.abs_begin_pm is not None or proj.abs_end_pm is not None:
                 print(f"  Absolute PMs:       Begin: {proj.abs_begin_pm} | End: {proj.abs_end_pm}")
             print(f"  Coordinates:        Start: {start_c} | End: {end_c}")
-            print(f"  Dates:              Const: {proj.construction_begin_date} | Open: {proj.open_to_traffic_date}")
+            open_d_disp = proj.open_to_traffic_date if proj.open_to_traffic_date else "(None recorded)"
+            print(f"  Dates:              Const: {proj.construction_begin_date} | Open: {open_d_disp}")
+            if not proj.open_to_traffic_date:
+                print(f"                      [Tip: Run with --find-open-date to automatically infer open date from PeMS telemetry]")
+            print(f"                      [Tip: Run with --lanes to inspect raw PeMS station lane tables and TSN roadway metrics]")
             print(f"  Sensor Stations:    {proj.sensor_stations if proj.sensor_stations else '(None listed)'}")
             print("\n  GENERATED PEMS URLS:")
             print(f"  Lane Config URL:    {urls['lane_config_url']}")
@@ -5086,6 +6703,8 @@ def main(argv: Optional[List[str]] = None):
             for st_id in proj.sensor_stations:
                 print(f"\n  Station {st_id}:")
                 print(f"    Summary URL: {urls['station_summary_urls'][st_id]}")
+                if "station_config_urls" in urls and st_id in urls["station_config_urls"]:
+                    print(f"    Config URL:  {urls['station_config_urls'][st_id]}")
                 sample_aadt = urls['station_aadt_urls'][st_id][0]
                 print(f"    AADT {sample_aadt[0]} URL: {sample_aadt[1]}")
                 sample_flow = urls['station_flow_urls'][st_id][0]
@@ -5165,6 +6784,8 @@ def main(argv: Optional[List[str]] = None):
     print(df_p.groupby("Dist").agg(projects=("PID", "count"), routes=("Route", "nunique"), sensors=("Sensors", "sum")))
     print("\nQuick Start Guide:")
     print("  Inspect a project:              python pems_interface.py -p <PID>")
+    print("  Station lane & TSN metrics:     python pems_interface.py -p <PID> --lanes")
+    print("  Infer open to traffic date:     python pems_interface.py -p <PID> --find-open-date")
     print("  High-res corridor slices:       python pems_interface.py -p <PID> --slices")
     print("  Satellite imagery:              python pems_interface.py -p <PID> --imagery")
     print("  Interactive map:                python pems_interface.py -p <PID> --map")
