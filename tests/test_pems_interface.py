@@ -492,7 +492,7 @@ class TestProjectMapping(unittest.TestCase):
             html = m.get_root().render()
             self.assertIn("District 4 (1 projects)", html)
             self.assertIn("PID 418000244", html)
-            self.assertIn("Georgia", html)
+            self.assertIn("Andale Mono", html)
             self.assertIn("Stations: Mainline (ML)", html)
             self.assertIn("Stations: Carpool/HOV (HV)", html)
 
@@ -583,9 +583,9 @@ class TestFormattingAndSensors(unittest.TestCase):
         popup = pems_interface.make_project_popup_html(rec, builder, length_mi=2.5)
         tooltip = pems_interface.make_project_tooltip_html(rec, length_mi=2.5)
 
-        # Basic serif typography check
-        self.assertIn("font-family: Georgia, 'Times New Roman', Times, serif", popup)
-        self.assertIn("font-family: Georgia, 'Times New Roman', Times, serif", tooltip)
+        # Monospaced typography check
+        self.assertIn("Andale Mono", popup)
+        self.assertIn("Andale Mono", tooltip)
 
         # Postmile clean formatting check
         self.assertIn("PM 6.2 &rarr; 8.7 (2.50 mi)", popup)
@@ -1280,18 +1280,30 @@ class TestBatchDownloadEngine(unittest.TestCase):
 
 
 class TestProjectImagery(unittest.TestCase):
-    def test_parse_project_date(self):
-        # Full ISO string
-        self.assertEqual(pems_interface._parse_project_date("2020-06-01"), datetime.date(2020, 6, 1))
-        # Year only
-        self.assertEqual(pems_interface._parse_project_date("2019", 1, 1), datetime.date(2019, 1, 1))
-        self.assertEqual(pems_interface._parse_project_date("2019", 12, 31), datetime.date(2019, 12, 31))
-        # Slash format
-        self.assertEqual(pems_interface._parse_project_date("04/15/2018"), datetime.date(2018, 4, 15))
+    def test_build_date_from_parts(self):
+        # 3 explicit numeric parts
+        self.assertEqual(pems_interface.build_date_from_parts(2020, 6, 1), datetime.date(2020, 6, 1))
+        self.assertEqual(pems_interface.build_date_from_parts("2019", "2", "1"), datetime.date(2019, 2, 1))
+        # Float strings from pandas
+        self.assertEqual(pems_interface.build_date_from_parts("2019.0", "2.0", "1.0"), datetime.date(2019, 2, 1))
+        # Year only with defaults
+        self.assertEqual(pems_interface.build_date_from_parts(2019, default_month=1, default_day=1), datetime.date(2019, 1, 1))
+        self.assertEqual(pems_interface.build_date_from_parts(2019, default_month=12, default_day=31), datetime.date(2019, 12, 31))
         # Empty / None
-        self.assertIsNone(pems_interface._parse_project_date(None))
-        self.assertIsNone(pems_interface._parse_project_date(""))
-        self.assertIsNone(pems_interface._parse_project_date("nan"))
+        self.assertIsNone(pems_interface.build_date_from_parts(None))
+        self.assertIsNone(pems_interface.build_date_from_parts(""))
+        self.assertIsNone(pems_interface.build_date_from_parts("nan"))
+
+    def test_parse_iso_date(self):
+        # Full ISO string
+        self.assertEqual(pems_interface.parse_iso_date("2020-06-01"), datetime.date(2020, 6, 1))
+        # Year only
+        self.assertEqual(pems_interface.parse_iso_date("2019", 1, 1), datetime.date(2019, 1, 1))
+        self.assertEqual(pems_interface.parse_iso_date("2019", 12, 31), datetime.date(2019, 12, 31))
+        # Empty / None
+        self.assertIsNone(pems_interface.parse_iso_date(None))
+        self.assertIsNone(pems_interface.parse_iso_date(""))
+        self.assertIsNone(pems_interface.parse_iso_date("nan"))
 
     def test_get_project_imagery_invalid_pid(self):
         with self.assertRaises(ValueError):
@@ -1482,6 +1494,101 @@ class TestCLIAndProjectDescription(unittest.TestCase):
             self.assertIn("Project Description:", content)
             self.assertIn("Add aux lane and ramp metering on Route 101.", content)
 
+    def test_curvature_deviation_calculation(self):
+        """Test calculation of lateral curvature deviation from chord."""
+        # Straight line along latitude
+        p0 = (37.0, -122.0)
+        p1 = (37.0, -121.9)
+        mid_on_line = [(37.0, -121.95)]
+        dev_straight = pems_interface.calculate_corridor_curvature_deviation(p0, p1, [p0, mid_on_line[0], p1])
+        self.assertAlmostEqual(dev_straight, 0.0, places=3)
+
+        # Curved road (lateral offset of 0.001 deg lat ~ 111 meters)
+        mid_curved = [(37.001, -121.95)]
+        dev_curved = pems_interface.calculate_corridor_curvature_deviation(p0, p1, [p0, mid_curved[0], p1])
+        self.assertGreater(dev_curved, 100.0)
+        self.assertLess(dev_curved, 120.0)
+
+        # Bounds and lateral shift calculation
+        min_d, max_d, max_abs, shift, hspan = pems_interface.calculate_corridor_curvature_bounds(p0, p1, [p0, mid_curved[0], p1])
+        self.assertAlmostEqual(max_abs, dev_curved, places=4)
+        self.assertAlmostEqual(shift, max_d / 2.0, places=4)
+        self.assertAlmostEqual(hspan, max_d / 2.0, places=4)
+
+    def test_slices_curtain_view_and_utilitarian_html(self):
+        """Verify utilitarian monospaced HTML report styling and removal of distracting badges and buttons."""
+        proj = pems_interface.ProjectRecord(
+            project_id="TEST_UTIL_01",
+            dist="4",
+            county="San Mateo",
+            state="CA",
+            route="101",
+            direction="NB",
+            begin_pm="1.4",
+            end_pm="2.4",
+            construction_begin_date="2018-01-01",
+            open_to_traffic_date="2020-01-01",
+            project_description="Widen aux lane."
+        )
+        sample_slice = {
+            "index": 1,
+            "start_pm": 1.4,
+            "end_pm": 1.65,
+            "length_mi": 0.25,
+            "bearing": 45.0,
+            "before_image": "downloads/imagery/test/slice_01_before.png",
+            "after_image": "downloads/imagery/test/slice_01_after.png",
+            "stacked_image": "downloads/imagery/test/slice_01_stacked.png",
+            "before_capture_date": "2017-06-15",
+            "after_capture_date": "2021-08-20",
+            "zoom": 19,
+            "width": 1200,
+            "height": 550,
+            "sensors": [{"id": "404534", "type": "ML", "pm": 1.5, "lanes": "4"}]
+        }
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            before_meta = {"release": {"release_id": "r1"}, "capture_date": "2017-06-15"}
+            after_meta = {"release": {"release_id": "r2"}, "capture_date": "2021-08-20"}
+            html_out = pems_interface.generate_slices_html_report(
+                project=proj,
+                slices_data=[sample_slice],
+                before_meta=before_meta,
+                after_meta=after_meta,
+                output_dir=tmp_dir
+            )
+            with open(html_out, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Monospaced font family
+            self.assertIn("Andale Mono", content)
+            self.assertIn("Menlo", content)
+
+            # Pure white background and utilitarian contrast
+            self.assertIn("background: #ffffff", content)
+            self.assertIn("color: #000000", content)
+
+            # Basic tables instead of info-grid cards
+            self.assertIn("class=\"project-info-table\"", content)
+            self.assertIn("<table", content)
+            self.assertNotIn("info-grid", content)
+            self.assertNotIn("info-card", content)
+
+            # Separate segments with a line, no rounded cards
+            self.assertIn("class=\"segment-section\"", content)
+            self.assertNotIn("segment-card", content)
+            self.assertIn("border-radius: 0", content)
+
+            # Curtain slider view: NO confusing before/after date badges overlaid on compare-box
+            self.assertNotIn("badge-overlay", content)
+            self.assertNotIn("badge-left", content)
+            self.assertNotIn("badge-right", content)
+
+            # No unnecessary action buttons or global controls buttons
+            self.assertNotIn("global-controls", content)
+            self.assertNotIn("btn-all-slider", content)
+            self.assertNotIn("class=\"actions\"", content)
+
 
     def test_lane_counts_accuracy_713000217_and_twltl(self):
         """Proof: Projects with shared median turn lanes (like 713000217 and 800000609) have correct 2 dir / 4 total lanes."""
@@ -1514,8 +1621,12 @@ class TestCLIAndProjectDescription(unittest.TestCase):
         # PID 300020420 (Excel date serial 44748 -> 2022-07-06)
         r3 = df[df["Project ID"].str.strip() == "300020420"]
         self.assertFalse(r3.empty)
-        act_date = r3.iloc[0]["Sensor 1 Activation Date for New Lane"]
-        self.assertEqual(act_date, "2022-07-06")
+        s1_date = pems_interface.build_date_from_parts(
+            r3.iloc[0]["s1_new_lane_year"],
+            r3.iloc[0]["s1_new_lane_month"],
+            r3.iloc[0]["s1_new_lane_day"]
+        )
+        self.assertEqual(s1_date, datetime.date(2022, 7, 6))
 
         # Verify no 5-digit Excel serial numbers remain in Sensor 1 Activation Date column
         for idx, row in df.iterrows():
@@ -1619,39 +1730,29 @@ class TestAbsolutePostmileCalculation(unittest.TestCase):
 class TestOpenToTrafficInference(unittest.TestCase):
     """Unit tests for Option 1: Open to Traffic Date inference via PeMS configuration & telemetry."""
 
-    def test_parse_any_date_formats(self):
-        # 5-digit Excel serial
-        d_excel = pems_interface.parse_any_date("43488")
-        self.assertEqual(d_excel, datetime.date(2019, 1, 23))
+    def test_build_date_from_parts(self):
+        # 3 separate numeric columns
+        d_full = pems_interface.build_date_from_parts(2019, 2, 1)
+        self.assertEqual(d_full, datetime.date(2019, 2, 1))
 
-        # Year only
-        d_yr = pems_interface.parse_any_date("2019")
-        self.assertEqual(d_yr, datetime.date(2019, 1, 1))
+        # Year only with default month/day
+        d_yr = pems_interface.build_date_from_parts("2020", None, None, default_month=1, default_day=1)
+        self.assertEqual(d_yr, datetime.date(2020, 1, 1))
 
-        # YYYY/MM and MM/YYYY
-        d_ym = pems_interface.parse_any_date("2022/10")
-        self.assertEqual(d_ym, datetime.date(2022, 10, 1))
-        d_my = pems_interface.parse_any_date("10/2022")
-        self.assertEqual(d_my, datetime.date(2022, 10, 1))
+        # Floats as read by pandas
+        d_float = pems_interface.build_date_from_parts(2022.0, 7.0, 6.0)
+        self.assertEqual(d_float, datetime.date(2022, 7, 6))
 
-        # Textual date formats
-        d_text1 = pems_interface.parse_any_date("April 30th, 2018")
-        self.assertEqual(d_text1, datetime.date(2018, 4, 30))
-        d_text2 = pems_interface.parse_any_date("December, 2019")
-        self.assertEqual(d_text2, datetime.date(2019, 12, 1))
-        d_text3 = pems_interface.parse_any_date("May 22 2020")
-        self.assertEqual(d_text3, datetime.date(2020, 5, 22))
+        # Empty/nan
+        self.assertIsNone(pems_interface.build_date_from_parts(None, None, None))
+        self.assertIsNone(pems_interface.build_date_from_parts("", "nan", "NaN"))
 
-        # ISO and slash dates
-        d_iso = pems_interface.parse_any_date("2020-02-28")
-        self.assertEqual(d_iso, datetime.date(2020, 2, 28))
-        d_slash = pems_interface.parse_any_date("07/06/2022")
-        self.assertEqual(d_slash, datetime.date(2022, 7, 6))
-
-        # Invalid/empty
-        self.assertIsNone(pems_interface.parse_any_date(""))
-        self.assertIsNone(pems_interface.parse_any_date("nan"))
-        self.assertIsNone(pems_interface.parse_any_date(None))
+    def test_parse_iso_date(self):
+        # Explicit CLI argument parsing (ISO only)
+        self.assertEqual(pems_interface.parse_iso_date("2022-03-01"), datetime.date(2022, 3, 1))
+        self.assertEqual(pems_interface.parse_iso_date("2019", 1, 1), datetime.date(2019, 1, 1))
+        self.assertIsNone(pems_interface.parse_iso_date(None))
+        self.assertIsNone(pems_interface.parse_iso_date(""))
 
     def test_parse_station_summary_configuration(self):
         sample_html = """
@@ -2134,6 +2235,373 @@ class TestStationLaneConfiguration(unittest.TestCase):
         self.assertEqual(details.station_id, "123456")
         self.assertEqual(details.tsn_roadway_info.get("Road Width"), "36 ft")
         self.assertEqual(len(details.lane_table), 1)
+
+
+class TestCoordinateRangeSearch(unittest.TestCase):
+    """Tests for coordinate string parsing, haversine calculation, and coordinate-range corridor search."""
+
+    def test_parse_coordinate_string_decimal(self):
+        c = pems_interface.parse_coordinate_string("38.186164, -122.601642")
+        self.assertIsNotNone(c)
+        self.assertAlmostEqual(c[0], 38.186164)
+        self.assertAlmostEqual(c[1], -122.601642)
+
+    def test_parse_coordinate_string_decimal_parentheses(self):
+        c = pems_interface.parse_coordinate_string("(38.186164, -122.601642)")
+        self.assertIsNotNone(c)
+        self.assertAlmostEqual(c[0], 38.186164)
+        self.assertAlmostEqual(c[1], -122.601642)
+
+    def test_parse_coordinate_string_tuple(self):
+        c = pems_interface.parse_coordinate_string((38.186164, -122.601642))
+        self.assertEqual(c, (38.186164, -122.601642))
+
+    def test_parse_coordinate_string_dms_standard(self):
+        c = pems_interface.parse_coordinate_string("38°11'10.19\"N 122°36'05.91\"W")
+        self.assertIsNotNone(c)
+        self.assertAlmostEqual(c[0], 38.18616388, places=4)
+        self.assertAlmostEqual(c[1], -122.60164166, places=4)
+
+    def test_parse_coordinate_string_dms_double_quotes(self):
+        c = pems_interface.parse_coordinate_string('38°11"10.19"N 122°36"05.91"W')
+        self.assertIsNotNone(c)
+        self.assertAlmostEqual(c[0], 38.18616388, places=4)
+        self.assertAlmostEqual(c[1], -122.60164166, places=4)
+
+    def test_parse_coordinate_string_invalid(self):
+        self.assertIsNone(pems_interface.parse_coordinate_string("invalid string"))
+        self.assertIsNone(pems_interface.parse_coordinate_string(""))
+        self.assertIsNone(pems_interface.parse_coordinate_string(12345))
+
+    def test_haversine_distance_miles(self):
+        d_zero = pems_interface.haversine_distance_miles(38.0, -122.0, 38.0, -122.0)
+        self.assertAlmostEqual(d_zero, 0.0)
+
+        d_1deg = pems_interface.haversine_distance_miles(38.0, -122.0, 39.0, -122.0)
+        self.assertAlmostEqual(d_1deg, 69.05, delta=0.5)
+
+    def test_find_stations_by_coordinate_range_mock(self):
+        mock_ref = MagicMock()
+        mock_ref.raw_df = pd.DataFrame([
+            {"Route": "101", "Direction": "N", "CA PM": "0.0", "Abs PM": 10.0, "Latitude": 38.0, "Longitude": -122.0, "County": "SON", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "2.0", "Abs PM": 12.0, "Latitude": 38.03, "Longitude": -122.02, "County": "SON", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "4.0", "Abs PM": 14.0, "Latitude": 38.06, "Longitude": -122.04, "County": "SON", "District": "4"},
+            {"Route": "80", "Direction": "E", "CA PM": "1.0", "Abs PM": 50.0, "Latitude": 38.5, "Longitude": -121.5, "County": "PLA", "District": "3"},
+        ])
+
+        mock_meta = MagicMock()
+        st1 = pems_interface.VDSStationRecord(
+            id="101001", fwy="101", dir="N", type="ML", abs_pm=11.0, latitude=38.015, longitude=-122.01,
+            name="Test St 1", state_pm="1.0", district="4", county="SON", city="Petaluma", length=0.5, lanes=3
+        )
+        st2 = pems_interface.VDSStationRecord(
+            id="101002", fwy="101", dir="N", type="ML", abs_pm=13.0, latitude=38.045, longitude=-122.03,
+            name="Test St 2", state_pm="3.0", district="4", county="SON", city="Petaluma", length=0.5, lanes=3
+        )
+        st_out = pems_interface.VDSStationRecord(
+            id="101003", fwy="101", dir="N", type="ML", abs_pm=25.0, latitude=38.2, longitude=-122.1,
+            name="Outside Corridor St", state_pm="15.0", district="4", county="SON", city="Santa Rosa", length=0.5, lanes=3
+        )
+        mock_meta.by_id = {"101001": st1, "101002": st2, "101003": st_out}
+
+        res = pems_interface.find_stations_by_coordinate_range(
+            route="101",
+            start_coord=(38.0, -122.0),
+            end_coord=(38.06, -122.04),
+            direction="NB",
+            buffer_mi=0.2,
+            station_types=("ML",),
+            idx_ref=mock_ref,
+            vds_meta=mock_meta,
+        )
+
+        self.assertNotIn("error", res)
+        self.assertEqual(res["route"], "101")
+        self.assertEqual(res["direction"], "N")
+        self.assertEqual(res["snapped_start"]["abs_pm"], 10.0)
+        self.assertEqual(res["snapped_end"]["abs_pm"], 14.0)
+        self.assertEqual(len(res["stations"]), 2)
+        found_ids = [s.id for s in res["stations"]]
+        self.assertIn("101001", found_ids)
+        self.assertIn("101002", found_ids)
+        self.assertNotIn("101003", found_ids)
+
+    def test_cli_coords_parsing(self):
+        parser = pems_interface.build_parser()
+
+        args = parser.parse_args(["-r", "101", "-d", "NB", "--coords", "38.186, -122.601", "38.220, -122.607"])
+        self.assertEqual(args.route, "101")
+        self.assertEqual(args.dir, "NB")
+        self.assertEqual(len(args.coords), 2)
+        self.assertEqual(args.coords[0], "38.186, -122.601")
+        self.assertEqual(args.coords[1], "38.220, -122.607")
+
+        args2 = parser.parse_args(["-r", "101", "--start-coords", "38.186, -122.601", "--end-coords", "38.220, -122.607"])
+        self.assertEqual(args2.route, "101")
+        self.assertEqual(args2.start_coords, "38.186, -122.601")
+        self.assertEqual(args2.end_coords, "38.220, -122.607")
+
+    def test_build_single_project_map_adhoc_corridor(self):
+        adhoc_proj = pems_interface.ProjectRecord(
+            project_id="CORRIDOR-R101",
+            dist="4",
+            county="Sonoma",
+            state="CA",
+            route="101",
+            direction="NB",
+            begin_pm="0.0",
+            end_pm="2.5",
+            abs_begin_pm=468.8,
+            abs_end_pm=471.2,
+            start_coords=(38.186, -122.601),
+            end_coords=(38.220, -122.607),
+            sensor_stations=["424573", "424571"]
+        )
+        m = pems_interface.build_single_project_map(
+            target_pid=adhoc_proj,
+            projects=[adhoc_proj],
+            output_path=None,
+            open_browser=False,
+            include_stations=False,
+            metadata_dir=None
+        )
+        self.assertIsNotNone(m)
+
+    def test_auto_detect_route_and_travel_vector(self):
+        mock_ref = MagicMock()
+        mock_ref.clean_df = pd.DataFrame([
+            {"_route": "4", "_dir": "E", "_abs_pm": 10.0, "_lat": 38.00, "_lng": -122.10, "_county": "contra costa", "County": "Contra Costa", "District": "4", "CA PM": "10.0", "_ca_num": 10.0},
+            {"_route": "4", "_dir": "E", "_abs_pm": 15.0, "_lat": 38.01, "_lng": -122.02, "_county": "contra costa", "County": "Contra Costa", "District": "4", "CA PM": "15.0", "_ca_num": 15.0},
+        ])
+        mock_ref.lats = mock_ref.clean_df["_lat"]
+        mock_ref.lngs = mock_ref.clean_df["_lng"]
+        mock_ref.valid_directions_for_route.return_value = {"E", "W"}
+        cand_row1 = mock_ref.clean_df.iloc[0]
+        cand_row2 = mock_ref.clean_df.iloc[1]
+        mock_ref.auto_detect_highway_corridor.return_value = ("4", cand_row1, cand_row2, 0.01, 0.01)
+
+        mock_meta = MagicMock()
+        mock_meta.by_id = {}
+
+        res = pems_interface.find_stations_by_coordinate_range(
+            route=None,
+            start_coord=(38.00, -122.10),
+            end_coord=(38.01, -122.02),
+            idx_ref=mock_ref,
+            vds_meta=mock_meta
+        )
+
+        self.assertNotIn("error", res)
+        self.assertEqual(res["route"], "4")
+        self.assertTrue(res["auto_detected_route"])
+        self.assertEqual(res["travel_vector"], "EB")
+
+    def test_route_mismatch_auto_switching(self):
+        mock_ref = MagicMock()
+        mock_ref.clean_df = pd.DataFrame([
+            {"_route": "84", "_dir": "N", "_abs_pm": 5.0, "_lat": 37.48, "_lng": -122.21, "_county": "san mateo", "County": "San Mateo", "District": "4", "CA PM": "5.0", "_ca_num": 5.0},
+            {"_route": "4", "_dir": "E", "_abs_pm": 10.0, "_lat": 38.00, "_lng": -122.10, "_county": "contra costa", "County": "Contra Costa", "District": "4", "CA PM": "10.0", "_ca_num": 10.0},
+            {"_route": "4", "_dir": "E", "_abs_pm": 15.0, "_lat": 38.01, "_lng": -122.02, "_county": "contra costa", "County": "Contra Costa", "District": "4", "CA PM": "15.0", "_ca_num": 15.0},
+        ])
+        mock_ref.lats = mock_ref.clean_df["_lat"]
+        mock_ref.lngs = mock_ref.clean_df["_lng"]
+        mock_ref.valid_directions_for_route.return_value = {"E", "W"}
+        cand_row1 = mock_ref.clean_df.iloc[1]
+        cand_row2 = mock_ref.clean_df.iloc[2]
+        mock_ref.auto_detect_highway_corridor.return_value = ("4", cand_row1, cand_row2, 0.01, 0.01)
+
+        mock_meta = MagicMock()
+        mock_meta.by_id = {}
+
+        # User passes route 84, but coords are on route 4 (38.00, -122.10) which is >35 mi away from 84
+        res = pems_interface.find_stations_by_coordinate_range(
+            route="84",
+            start_coord=(38.00, -122.10),
+            end_coord=(38.01, -122.02),
+            idx_ref=mock_ref,
+            vds_meta=mock_meta
+        )
+
+        self.assertNotIn("error", res)
+        self.assertEqual(res["route"], "4")
+        self.assertIsNotNone(res.get("route_mismatch_notice"))
+        self.assertIn("Auto-switching corridor search to Route 4", res["route_mismatch_notice"])
+
+    def test_direction_mismatch_fallback_on_corridor(self):
+        mock_ref = MagicMock()
+        mock_ref.clean_df = pd.DataFrame([
+            {"_route": "4", "_dir": "E", "_abs_pm": 10.0, "_lat": 38.00, "_lng": -122.10, "_county": "contra costa", "County": "Contra Costa", "District": "4", "CA PM": "10.0", "_ca_num": 10.0},
+            {"_route": "4", "_dir": "W", "_abs_pm": 15.0, "_lat": 38.01, "_lng": -122.02, "_county": "contra costa", "County": "Contra Costa", "District": "4", "CA PM": "15.0", "_ca_num": 15.0},
+        ])
+        mock_ref.lats = mock_ref.clean_df["_lat"]
+        mock_ref.lngs = mock_ref.clean_df["_lng"]
+        mock_ref.valid_directions_for_route.return_value = {"E", "W"}
+
+        mock_meta = MagicMock()
+        mock_meta.by_id = {}
+
+        # User passes direction NB on Route 4 which is E/W
+        res = pems_interface.find_stations_by_coordinate_range(
+            route="4",
+            direction="NB",
+            start_coord=(38.00, -122.10),
+            end_coord=(38.01, -122.02),
+            idx_ref=mock_ref,
+            vds_meta=mock_meta
+        )
+
+        self.assertNotIn("error", res)
+        self.assertIsNotNone(res.get("dir_mismatch_notice"))
+        self.assertIn("Route 4 is an East-West highway", res["dir_mismatch_notice"])
+        self.assertIsNone(res["direction"])  # Normalized to both directions
+
+
+class TestPostmileConversionAndRangeSearch(unittest.TestCase):
+    """Tests for California county postmile normalization, conversion to Abs PM & coordinates, and corridor range search."""
+
+    def test_normalize_ca_county(self):
+        self.assertEqual(pems_interface.normalize_ca_county("sonoma"), "Sonoma")
+        self.assertEqual(pems_interface.normalize_ca_county("SON"), "Sonoma")
+        self.assertEqual(pems_interface.normalize_ca_county("cc"), "Contra Costa")
+        self.assertEqual(pems_interface.normalize_ca_county("MRN"), "Marin")
+        self.assertEqual(pems_interface.normalize_ca_county("55"), "Napa")
+        self.assertEqual(pems_interface.normalize_ca_county("13"), "Contra Costa")
+        self.assertEqual(pems_interface.normalize_ca_county(""), "")
+        self.assertEqual(pems_interface.normalize_ca_county(None), "")
+
+    def test_convert_california_postmile_missing_county(self):
+        res = pems_interface.convert_california_postmile("101", "", "0.21")
+        self.assertIn("error", res)
+        self.assertIn("County must be provided", res["error"])
+
+    def test_convert_california_postmile_mock(self):
+        mock_ref = MagicMock()
+        mock_ref.raw_df = pd.DataFrame([
+            {"Route": "101", "Direction": "N", "CA PM": "0.0", "Abs PM": 468.1, "Latitude": 38.177, "Longitude": -122.595, "County": "Sonoma", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "0.21", "Abs PM": 468.3, "Latitude": 38.179, "Longitude": -122.597, "County": "Sonoma", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "4.5", "Abs PM": 472.5, "Latitude": 38.235, "Longitude": -122.618, "County": "Sonoma", "District": "4"},
+        ])
+
+        res = pems_interface.convert_california_postmile("101", "Sonoma", "0.21", direction="NB", idx_ref=mock_ref)
+        self.assertNotIn("error", res)
+        self.assertEqual(res["route"], "101")
+        self.assertEqual(res["county"], "Sonoma")
+        self.assertEqual(res["district"], "4")
+        self.assertEqual(res["abs_pm"], 468.3)
+        self.assertAlmostEqual(res["coord"][0], 38.179)
+        self.assertAlmostEqual(res["coord"][1], -122.597)
+
+    def test_convert_absolute_postmile_mock(self):
+        mock_ref = MagicMock()
+        mock_ref.raw_df = pd.DataFrame([
+            {"Route": "101", "Direction": "N", "CA PM": "50.56", "Abs PM": 400.2, "Latitude": 37.431, "Longitude": -122.104, "County": "Santa Clara", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "21.8", "Abs PM": 424.0, "Latitude": 37.652, "Longitude": -122.407, "County": "San Mateo", "District": "4"},
+        ])
+
+        res = pems_interface.convert_absolute_postmile("101", 400.2, direction="NB", idx_ref=mock_ref)
+        self.assertNotIn("error", res)
+        self.assertEqual(res["conversion_type"], "ABS_TO_CA")
+        self.assertEqual(res["route"], "101")
+        self.assertEqual(res["county"], "Santa Clara")
+        self.assertEqual(res["ca_pm"], "50.56")
+        self.assertEqual(res["district"], "4")
+        self.assertEqual(res["snapped_abs_pm"], 400.2)
+        self.assertAlmostEqual(res["coord"][0], 37.431)
+        self.assertAlmostEqual(res["coord"][1], -122.104)
+
+        # Single report formatting check
+        report = pems_interface.format_single_postmile_report(res)
+        self.assertIn("Absolute PM -> California County PM", report)
+        self.assertIn("Santa Clara County PM 50.56", report)
+
+    def test_find_stations_by_absolute_postmile_range_mock(self):
+        mock_ref = MagicMock()
+        mock_ref.raw_df = pd.DataFrame([
+            {"Route": "101", "Direction": "N", "CA PM": "50.56", "Abs PM": 400.2, "Latitude": 37.431, "Longitude": -122.104, "County": "Santa Clara", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "21.8", "Abs PM": 424.0, "Latitude": 37.652, "Longitude": -122.407, "County": "San Mateo", "District": "4"},
+        ])
+        mock_meta = MagicMock()
+        st1 = pems_interface.VDSStationRecord(
+            id="402380", fwy="101", dir="N", type="ML", abs_pm=402.04, latitude=37.451, longitude=-122.125,
+            name="LOC 78", state_pm="52.4", district="4", county="Santa Clara", city="Palo Alto", length=0.8, lanes=4
+        )
+        mock_meta.by_id = {"402380": st1}
+
+        res = pems_interface.find_stations_by_postmile_range(
+            route="101",
+            begin_pm=400.2,
+            end_pm=424.0,
+            is_absolute=True,
+            direction="NB",
+            idx_ref=mock_ref,
+            vds_meta=mock_meta
+        )
+        self.assertNotIn("error", res)
+        self.assertEqual(res["begin_county"], "Santa Clara")
+        self.assertEqual(res["end_county"], "San Mateo")
+        self.assertEqual(len(res["stations"]), 1)
+        self.assertEqual(res["stations"][0].id, "402380")
+
+    def test_find_stations_by_postmile_range_mock(self):
+        mock_ref = MagicMock()
+        mock_ref.raw_df = pd.DataFrame([
+            {"Route": "101", "Direction": "N", "CA PM": "0.0", "Abs PM": 468.1, "Latitude": 38.177, "Longitude": -122.595, "County": "Sonoma", "District": "4"},
+            {"Route": "101", "Direction": "N", "CA PM": "4.5", "Abs PM": 472.5, "Latitude": 38.235, "Longitude": -122.618, "County": "Sonoma", "District": "4"},
+        ])
+
+        mock_meta = MagicMock()
+        st1 = pems_interface.VDSStationRecord(
+            id="424573", fwy="101", dir="N", type="ML", abs_pm=468.91, latitude=38.187, longitude=-122.600,
+            name="N of San Antonio Creek", state_pm=".21", district="4", county="Sonoma", city="Petaluma", length=0.8, lanes=3
+        )
+        st_out = pems_interface.VDSStationRecord(
+            id="999999", fwy="101", dir="N", type="ML", abs_pm=490.0, latitude=38.5, longitude=-122.8,
+            name="Far Station", state_pm="20.0", district="4", county="Sonoma", city="Santa Rosa", length=0.5, lanes=3
+        )
+        mock_meta.by_id = {"424573": st1, "999999": st_out}
+
+        res = pems_interface.find_stations_by_postmile_range(
+            route="101",
+            begin_pm="0.0",
+            end_pm="4.5",
+            county="Sonoma",
+            direction="NB",
+            buffer_mi=0.1,
+            station_types=("ML",),
+            idx_ref=mock_ref,
+            vds_meta=mock_meta
+        )
+
+        self.assertNotIn("error", res)
+        self.assertEqual(res["route"], "101")
+        self.assertEqual(res["corridor_range"]["abs_min"], 468.1)
+        self.assertEqual(res["corridor_range"]["abs_max"], 472.5)
+        self.assertEqual(len(res["stations"]), 1)
+        self.assertEqual(res["stations"][0].id, "424573")
+
+    def test_cli_postmile_arguments(self):
+        parser = pems_interface.build_parser()
+
+        # Single postmile
+        args1 = parser.parse_args(["-r", "101", "-c", "Sonoma", "--pm", "0.21", "-d", "NB"])
+        self.assertEqual(args1.route, "101")
+        self.assertEqual(args1.county, "Sonoma")
+        self.assertEqual(args1.pm, "0.21")
+        self.assertEqual(args1.dir, "NB")
+
+        # Range query with cross-county options
+        args2 = parser.parse_args([
+            "-r", "101",
+            "--begin-county", "Marin", "--begin-pm", "25.0",
+            "--end-county", "Sonoma", "--end-pm", "2.0",
+            "--map"
+        ])
+        self.assertEqual(args2.route, "101")
+        self.assertEqual(args2.begin_county, "Marin")
+        self.assertEqual(args2.begin_pm, "25.0")
+        self.assertEqual(args2.end_county, "Sonoma")
+        self.assertEqual(args2.end_pm, "2.0")
+        self.assertTrue(args2.map)
 
 
 if __name__ == "__main__":

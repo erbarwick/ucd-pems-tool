@@ -139,7 +139,7 @@ import html
 import urllib.parse
 import textwrap
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple, Any, Union, Sequence, Set
 
 import pandas as pd
 import numpy as np
@@ -173,6 +173,8 @@ TABLE_MARKERS = (
     "Starting Month", "Month", "Day", "Time", "Station", "VDS", "Hour",
     "ID\t", "ID,", "Latitude\t", "Latitude,", "Fwy\t", "Fwy,", "Abs_PM\t", "State_PM\t"
 )
+
+MONO_FONT = '"Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace'
 
 LOGGER = logging.getLogger("pems_interface")
 logging.basicConfig(
@@ -353,27 +355,47 @@ class PeMSClient:
         has_logout = ("Logout" in resp.text or "logout" in resp.text)
         return has_form and not has_logout
 
-    def get_url(self, url: str, stream: bool = False, timeout: float = 20.0) -> requests.Response:
-        """Make an authenticated GET request, re-authenticating if session expired."""
+    def get_url(self, url: str, stream: bool = False, timeout: float = 60.0, max_retries: int = 2) -> requests.Response:
+        """Make an authenticated GET request, re-authenticating if session expired, with automatic retry on read timeout."""
         if not self.logged_in:
             self.login()
 
         full_url = url if url.startswith("http") else urllib.parse.urljoin(BASE_URL, url)
-        resp = self.session.get(full_url, stream=stream, timeout=timeout)
-        resp.raise_for_status()
 
-        if not stream and self._is_login_page(resp):
-            LOGGER.warning("PeMS session appears expired; re-authenticating...")
-            self.login()
-            resp = self.session.get(full_url, stream=stream, timeout=timeout)
-            resp.raise_for_status()
+        last_exc = None
+        current_timeout = timeout
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = self.session.get(full_url, stream=stream, timeout=current_timeout)
+                resp.raise_for_status()
 
-        return resp
+                if not stream and self._is_login_page(resp):
+                    LOGGER.warning("PeMS session appears expired; re-authenticating...")
+                    self.login()
+                    resp = self.session.get(full_url, stream=stream, timeout=current_timeout)
+                    resp.raise_for_status()
 
-    def get_text_content(self, url: str) -> Optional[str]:
-        """Fetch content as decoded text."""
+                return resp
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    current_timeout = max(current_timeout, 90.0)
+                    LOGGER.warning(
+                        f"PeMS server response slow (timed out after {timeout:.0f}s). Retrying (attempt {attempt + 1}/{max_retries}) with {current_timeout:.0f}s timeout..."
+                    )
+                    time.sleep(1.5)
+                else:
+                    raise
+            except Exception as exc:
+                last_exc = exc
+                raise
+        if last_exc:
+            raise last_exc
+
+    def get_text_content(self, url: str, timeout: float = 60.0) -> Optional[str]:
+        """Fetch content as decoded text with configurable timeout (default 60s)."""
         try:
-            resp = self.get_url(url)
+            resp = self.get_url(url, timeout=timeout)
             return resp.text
         except Exception as exc:
             LOGGER.error(f"Error fetching {url}: {exc}")
@@ -932,6 +954,10 @@ class IndexedGeoReference:
         clean_df["_lat"] = pd.to_numeric(clean_df["Latitude"], errors="coerce")
         clean_df["_lng"] = pd.to_numeric(clean_df["Longitude"], errors="coerce")
 
+        self.clean_df = clean_df
+        self.lats = clean_df["_lat"]
+        self.lngs = clean_df["_lng"]
+
         # Partition by (Route, Direction)
         self.index: Dict[Tuple[str, str], pd.DataFrame] = {}
         for (r, d), grp in clean_df.groupby(["_route", "_dir"]):
@@ -941,6 +967,77 @@ class IndexedGeoReference:
         r_norm = normalize_route(route)
         d_norm = normalize_direction(direction)
         return self.index.get((r_norm, d_norm))
+
+    def valid_directions_for_route(self, route: str) -> Set[str]:
+        """Return all valid Caltrans directions for a highway route."""
+        r_norm = normalize_route(route)
+        return {d for (r, d) in self.index.keys() if r == r_norm and d}
+
+    def find_candidate_highways_for_coords(
+        self,
+        lat: float,
+        lng: float,
+        max_dist_mi: float = 0.5
+    ) -> List[Tuple[pd.Series, float]]:
+        """
+        Find highway segments near a coordinate, grouped by route, ordered by distance to centerline.
+        """
+        delta = 0.15
+        mask = (self.lats >= lat - delta) & (self.lats <= lat + delta) & (self.lngs >= lng - delta) & (self.lngs <= lng + delta)
+        sub = self.clean_df[mask]
+        if sub.empty:
+            delta = 0.8
+            mask = (self.lats >= lat - delta) & (self.lats <= lat + delta) & (self.lngs >= lng - delta) & (self.lngs <= lng + delta)
+            sub = self.clean_df[mask]
+        if sub.empty:
+            sub = self.clean_df
+
+        dists = haversine_distance_miles(lat, lng, self.lats[sub.index], self.lngs[sub.index])
+        close_mask = dists <= max_dist_mi
+        if not close_mask.any():
+            idx = dists.idxmin()
+            return [(sub.loc[idx], float(dists.loc[idx]))]
+
+        res = []
+        close_sub = sub[close_mask]
+        close_dists = dists[close_mask]
+        for r, grp in close_sub.groupby("_route"):
+            grp_dists = close_dists[grp.index]
+            min_idx = grp_dists.idxmin()
+            res.append((grp.loc[min_idx], float(grp_dists.loc[min_idx])))
+        res.sort(key=lambda x: x[1])
+        return res
+
+    def auto_detect_highway_corridor(
+        self,
+        start_coord: Tuple[float, float],
+        end_coord: Tuple[float, float]
+    ) -> Tuple[str, pd.Series, pd.Series, float, float]:
+        """
+        Auto-detect the highway corridor connecting two coordinates.
+        Returns: (route_norm, snap_start_row, snap_end_row, start_dist_mi, end_dist_mi)
+        """
+        cand1 = self.find_candidate_highways_for_coords(start_coord[0], start_coord[1], max_dist_mi=1.0)
+        cand2 = self.find_candidate_highways_for_coords(end_coord[0], end_coord[1], max_dist_mi=1.0)
+
+        r1_map = {normalize_route(c[0]["_route"]): c for c in cand1}
+        r2_map = {normalize_route(c[0]["_route"]): c for c in cand2}
+
+        common_routes = set(r1_map.keys()) & set(r2_map.keys())
+        if common_routes:
+            best_route = min(common_routes, key=lambda r: r1_map[r][1] + r2_map[r][1])
+            s_row, s_dist = r1_map[best_route]
+            e_row, e_dist = r2_map[best_route]
+        else:
+            s_row, s_dist = cand1[0]
+            best_route = normalize_route(s_row["_route"])
+            sub_route = self.clean_df[self.clean_df["_route"] == best_route]
+            e_dists = haversine_distance_miles(end_coord[0], end_coord[1], self.lats[sub_route.index], self.lngs[sub_route.index])
+            e_idx = e_dists.idxmin()
+            e_row = sub_route.loc[e_idx]
+            e_dist = float(e_dists.loc[e_idx])
+
+        return best_route, s_row, e_row, s_dist, e_dist
 
 
 _INDEXED_GEO_REF: Optional[IndexedGeoReference] = None
@@ -1145,9 +1242,1149 @@ def find_closest_census_stations(
     return matched.head(top_n)
 
 
+def parse_coordinate_string(coord_str: Any) -> Optional[Tuple[float, float]]:
+    """
+    Parse a coordinate string into (latitude, longitude) floats.
+    Supports:
+      - Decimal degrees: '38.186164, -122.601642', '(38.186164, -122.601642)', '38.186164 -122.601642'
+      - Degrees Minutes Seconds (DMS) from Google Maps: '38°13\'14.99"N 122°36\'27.10"W', '38°11\'10.19"N, 122°36\'05.91"W'
+      - Tuple or List of two numbers: (38.186, -122.601)
+    """
+    if isinstance(coord_str, (tuple, list)) and len(coord_str) == 2:
+        try:
+            return float(coord_str[0]), float(coord_str[1])
+        except (ValueError, TypeError):
+            return None
+
+    if not isinstance(coord_str, str):
+        return None
+
+    s = coord_str.strip()
+
+    # 1. Decimal format
+    m_dec = re.match(r"^[\(\[]?\s*([+-]?\d+\.?\d*)\s*[,;\s]+\s*([+-]?\d+\.?\d*)\s*[\)\]]?$", s)
+    if m_dec:
+        try:
+            return float(m_dec.group(1)), float(m_dec.group(2))
+        except ValueError:
+            pass
+
+    # 2. DMS format (Google Maps / GIS export)
+    m_dms = re.search(
+        r"(\d+)[°\s]+(\d+)[\'\"\s]+([\d\.]+)[\'\"\s]*([NSns])[\s,;]+"
+        r"(\d+)[°\s]+(\d+)[\'\"\s]+([\d\.]+)[\'\"\s]*([EWew])",
+        s
+    )
+    if m_dms:
+        lat_deg, lat_min, lat_sec, lat_dir, lng_deg, lng_min, lng_sec, lng_dir = m_dms.groups()
+        lat = float(lat_deg) + float(lat_min) / 60.0 + float(lat_sec) / 3600.0
+        if lat_dir.upper() == "S":
+            lat = -lat
+        lng = float(lng_deg) + float(lng_min) / 60.0 + float(lng_sec) / 3600.0
+        if lng_dir.upper() == "W":
+            lng = -lng
+        return lat, lng
+
+    return None
+
+
+def haversine_distance_miles(lat1: float, lon1: float, lat2: Any, lon2: Any) -> Any:
+    """Calculate great-circle distance in miles between coordinates using Haversine formula."""
+    R = 3958.8  # Earth radius in miles
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat / 2.0)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon / 2.0)**2
+    return 2.0 * R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+def fetch_hpms_corridor_summary(
+    route: Union[str, int],
+    abs_begin_pm: float,
+    abs_end_pm: float,
+    county: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch FHWA / Caltrans HPMS ground-truth roadway attributes (through lanes, AADT,
+    facility type, access control, surface type, functional system) for any highway corridor.
+    Works for any state highway segment in California, including non-freeway and rural corridors.
+    """
+    try:
+        from hpms_interface import HPMSClient, CA_COUNTY_FIPS
+        client = HPMSClient()
+        r_num = int(normalize_route(route))
+        county_fips = CA_COUNTY_FIPS.get(str(county).lower().strip()) if county else None
+        min_pm = min(float(abs_begin_pm), float(abs_end_pm))
+        max_pm = max(float(abs_begin_pm), float(abs_end_pm))
+        secs = client.get_spatial_sections(route_number=r_num, begin_pm=min_pm, end_pm=max_pm, county_fips=county_fips)
+        if not secs and county_fips:
+            # Retry without county restriction in case boundaries slightly differ
+            secs = client.get_spatial_sections(route_number=r_num, begin_pm=min_pm, end_pm=max_pm)
+        if not secs:
+            return None
+
+        facility_code_map = {
+            "1": "One-Way Roadway",
+            "2": "Two-Way Divided (Freeway/Expressway)",
+            "4": "Two-Way Undivided",
+            "5": "Others / Ramps"
+        }
+        access_code_map = {
+            "1": "Full Access Control (Freeway)",
+            "2": "Partial Access Control (Expressway)",
+            "3": "No Access Control (Conventional Highway)"
+        }
+        surface_code_map = {
+            "1": "Unpaved",
+            "2": "Bituminous (Asphalt)",
+            "3": "JPCP (Jointed Plain Concrete)",
+            "4": "JRCP (Jointed Reinforced Concrete)",
+            "5": "CRCP (Continuously Reinforced Concrete)",
+            "6": "AC Overlay on AC",
+            "7": "AC Overlay on PCC",
+            "8": "PCC Overlay on PCC",
+            "9": "Other"
+        }
+        fsystem_code_map = {
+            "1": "Interstate",
+            "2": "Principal Arterial - Other Freeways & Expressways",
+            "3": "Principal Arterial - Other",
+            "4": "Minor Arterial",
+            "5": "Major Collector",
+            "6": "Minor Collector",
+            "7": "Local"
+        }
+
+        fac_vals = [facility_code_map.get(str(s.get("facility_type")), str(s.get("facility_type"))) for s in secs if s.get("facility_type") is not None]
+        acc_vals = [access_code_map.get(str(s.get("access_control")), str(s.get("access_control"))) for s in secs if s.get("access_control") is not None]
+        surf_vals = [surface_code_map.get(str(s.get("surface_type")), str(s.get("surface_type"))) for s in secs if s.get("surface_type") is not None]
+        fsys_vals = [fsystem_code_map.get(str(s.get("f_system")), str(s.get("f_system"))) for s in secs if s.get("f_system") is not None]
+
+        lane_weights: Dict[int, float] = {}
+        tot_len = 0.0
+        tot_aadt_len = 0.0
+        weighted_aadt = 0.0
+
+        for s in secs:
+            slen = float(s.get("sectionlength") or 0.0)
+            tl = s.get("through_lanes")
+            if tl and str(tl).isdigit() and int(tl) > 0:
+                lanes_int = int(tl)
+                lane_weights[lanes_int] = lane_weights.get(lanes_int, 0.0) + slen
+                tot_len += slen
+            aadt = s.get("aadt")
+            if aadt and str(aadt).isdigit() and int(aadt) > 0:
+                weighted_aadt += int(aadt) * slen
+                tot_aadt_len += slen
+
+        pred_lanes = max(lane_weights, key=lane_weights.get) if lane_weights else None
+        avg_lanes = round(sum(k * v for k, v in lane_weights.items()) / tot_len, 2) if tot_len > 0 else None
+        avg_aadt = int(round(weighted_aadt / tot_aadt_len)) if tot_aadt_len > 0 else None
+
+        fa_vals = [s.get("future_aadt") for s in secs if s.get("future_aadt")]
+        fa_yr_vals = [str(s.get("future_aadt_year"))[:4] for s in secs if s.get("future_aadt_year")]
+
+        return {
+            "sections_count": len(secs),
+            "predominant_lanes_2024": pred_lanes,
+            "avg_lanes_2024": avg_lanes,
+            "avg_aadt_2024": avg_aadt,
+            "future_aadt": fa_vals[0] if fa_vals else None,
+            "future_aadt_year": fa_yr_vals[0] if fa_yr_vals else None,
+            "facility_type": ", ".join(dict.fromkeys(fac_vals)) if fac_vals else None,
+            "access_control": ", ".join(dict.fromkeys(acc_vals)) if acc_vals else None,
+            "surface_type": ", ".join(dict.fromkeys(surf_vals)) if surf_vals else None,
+            "functional_system": ", ".join(dict.fromkeys(fsys_vals)) if fsys_vals else None,
+        }
+    except Exception as exc:
+        LOGGER.debug(f"HPMS summary error for Route {route}: {exc}")
+        return None
+
+
+def find_stations_by_coordinate_range(
+    route: Optional[Union[str, int]] = None,
+    start_coord: Optional[Union[str, Tuple[float, float]]] = None,
+    end_coord: Optional[Union[str, Tuple[float, float]]] = None,
+    direction: Optional[str] = None,
+    buffer_mi: float = 0.2,
+    station_types: Optional[Tuple[str, ...]] = ("ML", "HV"),
+    metadata_dir: Optional[str] = None,
+    vds_meta: Optional[Any] = None,
+    idx_ref: Optional[IndexedGeoReference] = None,
+    strict_route: bool = False,
+    **kwargs: Any
+) -> Dict[str, Any]:
+    """
+    Search for PeMS detector stations along a highway route corridor bounded by a coordinate range.
+    Snaps start and end coordinates onto the highway centerline to establish corridor limits.
+
+    Intelligent features:
+      - Automatic route detection if route is omitted
+      - Centerline cross-validation: detects and auto-switches if user input route is miles away from coordinates
+      - Highway orientation checking (e.g. notices East-West routes and searches valid directions)
+      - Travel vector determination (EB/WB or NB/SB) based on coordinate sequence
+      - HPMS ground-truth roadway attributes integration
+      - Uninstrumented corridor diagnostics with nearest active station & Caltrans Census stations
+    """
+    # Normalize flexible calling arguments (route as arg 1 or start_coord as arg 1)
+    if start_coord is None and end_coord is None:
+        if route is not None and parse_coordinate_string(route) is not None:
+            start_coord = route
+            route = None
+    if kwargs.get("start_coord"):
+        start_coord = kwargs["start_coord"]
+    if kwargs.get("end_coord"):
+        end_coord = kwargs["end_coord"]
+    if kwargs.get("route"):
+        route = kwargs["route"]
+
+    p_start = parse_coordinate_string(start_coord) if isinstance(start_coord, str) else start_coord
+    p_end = parse_coordinate_string(end_coord) if isinstance(end_coord, str) else end_coord
+
+    if not p_start or not p_end:
+        return {
+            "error": f"Invalid coordinate format. Start: '{start_coord}', End: '{end_coord}'. Expected decimal degrees or DMS (e.g. '38.186, -122.601' or '38°11\'10\"N 122°36\'05\"W')."
+        }
+
+    ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
+    clean_ref = getattr(ref, "clean_df", None)
+    if not isinstance(clean_ref, pd.DataFrame):
+        raw = getattr(ref, "raw_df", None)
+        if isinstance(raw, pd.DataFrame):
+            clean_ref = raw.copy()
+            r_col = "Route" if "Route" in clean_ref.columns else "Fwy"
+            d_col = "Direction" if "Direction" in clean_ref.columns else "Dir"
+            clean_ref["_route"] = clean_ref[r_col].astype(str).str.strip().map(normalize_route)
+            clean_ref["_dir"] = clean_ref[d_col].astype(str).str.strip().map(normalize_direction)
+            clean_ref["_abs_pm"] = pd.to_numeric(clean_ref["Abs PM"], errors="coerce")
+            clean_ref["_county"] = clean_ref["County"].astype(str).str.strip().str.lower()
+            clean_ref["_lat"] = pd.to_numeric(clean_ref["Latitude"], errors="coerce")
+            clean_ref["_lng"] = pd.to_numeric(clean_ref["Longitude"], errors="coerce")
+            ca_splits = clean_ref["CA PM"].astype(str).map(split_ca_pm)
+            clean_ref["_ca_num"] = ca_splits.map(lambda x: x[1])
+        else:
+            clean_ref = get_indexed_geo_ref().clean_df
+
+    ref_lats = getattr(ref, "lats", None)
+    if not isinstance(ref_lats, pd.Series):
+        ref_lats = clean_ref["_lat"]
+    ref_lngs = getattr(ref, "lngs", None)
+    if not isinstance(ref_lngs, pd.Series):
+        ref_lngs = clean_ref["_lng"]
+
+    auto_detected_route = False
+    route_mismatch_notice = None
+
+    # 1. Auto-detect or validate highway route
+    if route is None or str(route).strip() == "":
+        if hasattr(ref, "auto_detect_highway_corridor"):
+            best_route, s_cand_row, e_cand_row, act_s_dist, act_e_dist = ref.auto_detect_highway_corridor(p_start, p_end)
+        else:
+            best_route = "101"
+        route_norm = best_route
+        auto_detected_route = True
+    else:
+        route_norm = normalize_route(route)
+        sub_route_check = clean_ref[clean_ref["_route"] == route_norm]
+        if sub_route_check.empty:
+            return {
+                "error": f"Route '{route_norm}' not found in California highway reference database."
+            }
+        d_s_tmp = haversine_distance_miles(p_start[0], p_start[1], ref_lats[sub_route_check.index], ref_lngs[sub_route_check.index])
+        d_e_tmp = haversine_distance_miles(p_end[0], p_end[1], ref_lats[sub_route_check.index], ref_lngs[sub_route_check.index])
+        s_off_spec = float(d_s_tmp.min())
+        e_off_spec = float(d_e_tmp.min())
+
+        if not strict_route and (s_off_spec > 0.5 or e_off_spec > 0.5) and hasattr(ref, "auto_detect_highway_corridor"):
+            act_route, s_cand_row, e_cand_row, act_s_dist, act_e_dist = ref.auto_detect_highway_corridor(p_start, p_end)
+            if act_s_dist < 0.25 and s_off_spec > (act_s_dist + 0.5):
+                route_mismatch_notice = (
+                    f"Specified Route {route_norm} is {s_off_spec:.2f} mi from input coordinates, "
+                    f"but centerline is on Route {act_route} ({s_cand_row['County']} Co, {act_s_dist:.3f} mi away). "
+                    f"Auto-switching corridor search to Route {act_route} (pass --strict-route to disable)."
+                )
+                route_norm = act_route
+
+    # 2. Check highway orientation & valid directions
+    dir_norm = normalize_direction(direction) if direction else None
+    valid_dirs = None
+    if hasattr(ref, "valid_directions_for_route") and not hasattr(ref, "_mock_return_value"):
+        valid_dirs = ref.valid_directions_for_route(route_norm)
+    if not isinstance(valid_dirs, (set, list, tuple)):
+        valid_dirs = set(clean_ref[clean_ref["_route"] == route_norm]["_dir"].dropna().unique())
+    dir_mismatch_notice = None
+    if dir_norm and valid_dirs and dir_norm not in valid_dirs:
+        cardinal_name = "East-West" if valid_dirs.issubset({"E", "W"}) else ("North-South" if valid_dirs.issubset({"N", "S"}) else "unaligned")
+        dir_mismatch_notice = (
+            f"Route {route_norm} is an {cardinal_name} highway (valid directions: {sorted(valid_dirs)}). "
+            f"Ignoring mismatched direction '{direction}' and searching both directions."
+        )
+        dir_norm = None
+
+    # Filter reference database to Route
+    sub_route = clean_ref[clean_ref["_route"] == route_norm].copy()
+    if dir_norm:
+        sub_dir = sub_route[sub_route["_dir"] == dir_norm]
+        if not sub_dir.empty:
+            sub_route = sub_dir
+
+    sub_route = sub_route.dropna(subset=["_lat", "_lng", "_abs_pm"])
+    if sub_route.empty:
+        return {
+            "error": f"No valid coordinates found for Route {route_norm} in reference database."
+        }
+
+    d_start = haversine_distance_miles(p_start[0], p_start[1], sub_route["_lat"], sub_route["_lng"])
+    d_end = haversine_distance_miles(p_end[0], p_end[1], sub_route["_lat"], sub_route["_lng"])
+
+    snap_start = sub_route.loc[d_start.idxmin()]
+    snap_end = sub_route.loc[d_end.idxmin()]
+
+    start_off_mi = float(d_start.min())
+    end_off_mi = float(d_end.min())
+
+    abs_b = float(snap_start["_abs_pm"])
+    abs_e = float(snap_end["_abs_pm"])
+    min_abs = min(abs_b, abs_e)
+    max_abs = max(abs_b, abs_e)
+    length_mi = round(max_abs - min_abs, 2)
+
+    # 3. Determine travel vector
+    travel_vector = None
+    if valid_dirs.issubset({"E", "W"}):
+        travel_vector = "EB" if abs_b <= abs_e else "WB"
+    elif valid_dirs.issubset({"N", "S"}):
+        travel_vector = "NB" if abs_b <= abs_e else "SB"
+    elif abs(p_end[0] - p_start[0]) > abs(p_end[1] - p_start[1]):
+        travel_vector = "NB" if p_end[0] >= p_start[0] else "SB"
+    else:
+        travel_vector = "EB" if p_end[1] >= p_start[1] else "WB"
+
+    # 4. Load VDS Metadata and match stations
+    meta = vds_meta if vds_meta is not None else load_vds_metadata(metadata_dir)
+    types_set = set(t.strip().upper() for t in station_types) if station_types and "ALL" not in station_types else None
+
+    route_vds = [
+        s for s in meta.by_id.values()
+        if str(s.fwy) == str(route_norm)
+    ]
+    if dir_norm:
+        route_vds = [s for s in route_vds if s.dir == dir_norm]
+    if types_set:
+        route_vds = [s for s in route_vds if s.type in types_set]
+
+    matched_stations: List[VDSStationRecord] = []
+    for s in route_vds:
+        if s.abs_pm is not None:
+            if (min_abs - buffer_mi) <= s.abs_pm <= (max_abs + buffer_mi):
+                matched_stations.append(s)
+        elif s.latitude and s.longitude:
+            d_st = haversine_distance_miles(s.latitude, s.longitude, sub_route["_lat"], sub_route["_lng"])
+            if d_st.min() <= buffer_mi:
+                closest_seg = sub_route.loc[d_st.idxmin()]
+                if min_abs <= closest_seg["_abs_pm"] <= max_abs:
+                    matched_stations.append(s)
+
+    # Deduplicate and sort
+    seen_ids = set()
+    unique_stations = []
+    for s in matched_stations:
+        if s.id not in seen_ids:
+            seen_ids.add(s.id)
+            unique_stations.append(s)
+
+    unique_stations.sort(key=lambda x: (x.dir or "", x.abs_pm if x.abs_pm is not None else 0.0))
+
+    snap_start_dist = str(snap_start.get("District", "")).replace(".0", "").strip() if "District" in snap_start else ""
+    snap_end_dist = str(snap_end.get("District", "")).replace(".0", "").strip() if "District" in snap_end else ""
+    if not snap_start_dist and unique_stations:
+        snap_start_dist = str(unique_stations[0].district or "")
+    if not snap_end_dist and unique_stations:
+        snap_end_dist = str(unique_stations[-1].district or "")
+
+    # 5. FHWA / Caltrans HPMS Ground-Truth Summary
+    hpms_summary = fetch_hpms_corridor_summary(
+        route=route_norm,
+        abs_begin_pm=min_abs,
+        abs_end_pm=max_abs,
+        county=str(snap_start["County"])
+    )
+
+    # 6. Uninstrumented Diagnostics & Census Stations
+    coverage_status = "INSTRUMENTED"
+    coverage_details = None
+    nearest_station = None
+    nearest_station_dist_mi = None
+    census_stations: List[Dict[str, Any]] = []
+
+    all_route_stations = [s for s in meta.by_id.values() if str(s.fwy) == str(route_norm)]
+    if not unique_stations:
+        if not all_route_stations:
+            coverage_status = "UNINSTRUMENTED STATEWIDE"
+            coverage_details = f"Route {route_norm} has no active PeMS detector stations instrumented statewide."
+        else:
+            coverage_status = "UNINSTRUMENTED CORRIDOR SEGMENT"
+            st_counties = sorted(set(normalize_ca_county(s.county) for s in all_route_stations if s.county))
+            st_counties_str = ", ".join(st_counties)
+            nst = min(all_route_stations, key=lambda s: abs((s.abs_pm if s.abs_pm is not None else 9999) - min_abs))
+            nearest_station = nst
+            if nst.abs_pm is not None:
+                nearest_station_dist_mi = abs(nst.abs_pm - min_abs)
+                coverage_details = (
+                    f"Route {route_norm} has {len(all_route_stations)} active PeMS stations located in {st_counties_str} County/Counties. "
+                    f"The {snap_start['County']} County corridor (Abs PM {min_abs:.2f} - {max_abs:.2f}) is not instrumented with PeMS mainline loop detectors."
+                )
+            else:
+                coverage_details = (
+                    f"Route {route_norm} has {len(all_route_stations)} active PeMS stations in {st_counties_str} County/Counties, "
+                    f"but none in the {snap_start['County']} County corridor (Abs PM {min_abs:.2f} - {max_abs:.2f})."
+                )
+
+        dist_val = str(snap_start.get("District", "")).replace(".0", "").strip() or "4"
+        raw_census = find_closest_census_stations(route_norm, dist_val, snap_start["_ca_num"], county=str(snap_start["County"]), top_n=3)
+        if not raw_census.empty:
+            for _, crow in raw_census.iterrows():
+                census_stations.append({
+                    "ID": str(crow["ID"]),
+                    "Name": str(crow["Name"]),
+                    "CA PM": str(crow["CA PM"]),
+                    "Abs PM": f"{float(crow['Abs PM']):.2f}" if pd.notna(crow.get("Abs PM")) else "-",
+                    "pm_diff": float(crow["pm_diff"]) if pd.notna(crow.get("pm_diff")) else 0.0,
+                })
+
+    return {
+        "route": route_norm,
+        "direction": dir_norm,
+        "travel_vector": travel_vector,
+        "auto_detected_route": auto_detected_route,
+        "route_mismatch_notice": route_mismatch_notice,
+        "dir_mismatch_notice": dir_mismatch_notice,
+        "input_start": p_start,
+        "input_end": p_end,
+        "snapped_start": {
+            "abs_pm": abs_b,
+            "ca_pm": str(snap_start.get("CA PM", snap_start.get("_ca_num", ""))),
+            "county": str(snap_start.get("County", snap_start.get("_county", ""))),
+            "district": snap_start_dist or None,
+            "coord": (float(snap_start["_lat"]), float(snap_start["_lng"])),
+            "distance_from_route_mi": start_off_mi,
+        },
+        "snapped_end": {
+            "abs_pm": abs_e,
+            "ca_pm": str(snap_end.get("CA PM", snap_end.get("_ca_num", ""))),
+            "county": str(snap_end.get("County", snap_end.get("_county", ""))),
+            "district": snap_end_dist or None,
+            "coord": (float(snap_end["_lat"]), float(snap_end["_lng"])),
+            "distance_from_route_mi": end_off_mi,
+        },
+        "corridor_range": {
+            "abs_min": min_abs,
+            "abs_max": max_abs,
+            "length_mi": length_mi,
+        },
+        "stations": unique_stations,
+        "hpms_summary": hpms_summary,
+        "coverage_status": coverage_status,
+        "coverage_details": coverage_details,
+        "nearest_station": nearest_station,
+        "nearest_station_dist_mi": nearest_station_dist_mi,
+        "census_stations": census_stations,
+        "buffer_mi": buffer_mi,
+    }
+
+
+def format_coordinate_search_report(res: Dict[str, Any]) -> str:
+    """Format coordinate corridor station search results into a clean, human-readable report."""
+    if "error" in res:
+        return f"\n[ERROR]: {res['error']}"
+
+    lines: List[str] = []
+    lines.append("=" * 80)
+    lines.append("CALTRANS PEMS ROUTE CORRIDOR STATION SEARCH (COORDINATE RANGE)")
+    rt_str = f"Route {res['route']}" + (f" {res['direction']}" if res['direction'] else " (Both Directions)")
+    tv_str = f" | Travel Vector: {res['travel_vector']}" if res.get("travel_vector") else ""
+    lines.append(f"{rt_str}{tv_str} | Buffer: ±{res['buffer_mi']} mi")
+    lines.append("=" * 80)
+
+    # Notices
+    if res.get("route_mismatch_notice"):
+        lines.append(f"\n[Route Notice]: {res['route_mismatch_notice']}")
+    if res.get("dir_mismatch_notice"):
+        lines.append(f"\n[Direction Notice]: {res['dir_mismatch_notice']}")
+    if res.get("auto_detected_route"):
+        lines.append(f"\n[Highway Auto-Detection]: No route specified. Auto-detected Route {res['route']} ({res['snapped_start']['county']} County).")
+
+    # Snap info
+    s_snap = res["snapped_start"]
+    e_snap = res["snapped_end"]
+    lines.append("\nInput & Snapped Coordinates:")
+    lines.append(f"  • Start Coord:     ({res['input_start'][0]:.5f}, {res['input_start'][1]:.5f})")
+    lines.append(f"    Highway Snap:    {s_snap['county']} Co, PM {s_snap['ca_pm']} (Abs PM {s_snap['abs_pm']:.2f}) [{s_snap['distance_from_route_mi']:.3f} mi from centerline]")
+    lines.append(f"  • End Coord:       ({res['input_end'][0]:.5f}, {res['input_end'][1]:.5f})")
+    lines.append(f"    Highway Snap:    {e_snap['county']} Co, PM {e_snap['ca_pm']} (Abs PM {e_snap['abs_pm']:.2f}) [{e_snap['distance_from_route_mi']:.3f} mi from centerline]")
+
+    c_range = res["corridor_range"]
+    lines.append(f"\nCorridor Limits:     Abs PM {c_range['abs_min']:.2f} - {c_range['abs_max']:.2f} (Length: {c_range['length_mi']:.2f} mi)")
+    if res.get("travel_vector"):
+        lines.append(f"  • Travel Vector:   {res['travel_vector']} (Based on start -> end coordinate sequence)")
+
+    # HPMS Ground-Truth Roadway Attributes Section
+    hpms_summary = res.get("hpms_summary")
+    if hpms_summary:
+        lines.append("\n[FHWA / Caltrans HPMS Ground-Truth Roadway Attributes]")
+        pred_lanes = hpms_summary.get("predominant_lanes_2024")
+        avg_lanes = hpms_summary.get("avg_lanes_2024")
+        lane_str = f"{pred_lanes}" if pred_lanes is not None else "N/A"
+        if avg_lanes is not None and avg_lanes != pred_lanes:
+            lane_str += f" (Corridor length-weighted avg: {avg_lanes:.2f})"
+        lines.append(f"  • Through Lanes (2024):         {lane_str}")
+        if hpms_summary.get("facility_type"):
+            lines.append(f"  • Facility Type:                {hpms_summary['facility_type']}")
+        if hpms_summary.get("access_control"):
+            lines.append(f"  • Access Control:               {hpms_summary['access_control']}")
+        if hpms_summary.get("surface_type"):
+            lines.append(f"  • Surface Type:                 {hpms_summary['surface_type']}")
+        if hpms_summary.get("functional_system"):
+            lines.append(f"  • Functional System:            {hpms_summary['functional_system']}")
+        if hpms_summary.get("avg_aadt_2024"):
+            lines.append(f"  • Certified AADT (2024):        {hpms_summary['avg_aadt_2024']:,} vehicles/day")
+        if hpms_summary.get("future_aadt"):
+            yr_str = f" (Year {hpms_summary['future_aadt_year']})" if hpms_summary.get('future_aadt_year') else ""
+            try:
+                fa = int(float(hpms_summary['future_aadt']))
+                lines.append(f"  • Forecast Future AADT:         {fa:,} vehicles/day{yr_str}")
+            except Exception:
+                lines.append(f"  • Forecast Future AADT:         {hpms_summary['future_aadt']}{yr_str}")
+        if hpms_summary.get("sections_count"):
+            lines.append(f"  • HPMS Corridor Sections:       {hpms_summary['sections_count']} sections analyzed")
+        lines.append("-" * 80)
+
+    stations: List[VDSStationRecord] = res["stations"]
+    lines.append(f"Matching Stations:   {len(stations)} found in corridor\n")
+
+    if not stations:
+        lines.append("  (No PeMS detector stations found in this corridor range)")
+        if res.get("coverage_details"):
+            lines.append(f"\n[Corridor Instrumentation & PeMS VDS Status]")
+            lines.append(f"  • Coverage:        {res.get('coverage_status', 'UNINSTRUMENTED')}")
+            lines.append(f"  • Details:         {res['coverage_details']}")
+            if res.get("nearest_station"):
+                nst = res["nearest_station"]
+                nst_pm = f"Abs PM {nst.abs_pm:.2f}" if getattr(nst, "abs_pm", None) is not None else ""
+                dist_str = f", {res['nearest_station_dist_mi']:.2f} mi away." if res.get("nearest_station_dist_mi") is not None else "."
+                lines.append(f"  • Nearest Station: Station {nst.id} ({nst.name}, {nst_pm}){dist_str}")
+        if res.get("census_stations"):
+            lines.append(f"\n[Caltrans Annual Census Traffic Stations]")
+            for c in res["census_stations"]:
+                loc_hint = f"[{c['pm_diff']:.2f} mi from start PM]" if c['pm_diff'] > 0 else "[Inside corridor]"
+                lines.append(f"  • Station {c['ID']}: {c['Name']} (CA PM {c['CA PM']}, Abs PM {c['Abs PM']}) {loc_hint}")
+        lines.append("=" * 80)
+        lines.append("Tip: Pass --lanes to inspect lane configuration tables & TSN metrics for this corridor.")
+        return "\n".join(lines)
+
+    # Station table
+    cols = ["Station ID", "Dir", "Type", "Lanes", "CA PM", "Abs PM", "Name", "Coordinates"]
+    rows = []
+    for s in stations:
+        pm_str = str(s.state_pm) if s.state_pm else "-"
+        abs_str = f"{s.abs_pm:.2f}" if s.abs_pm is not None else "-"
+        coord_str = f"({s.latitude:.5f}, {s.longitude:.5f})" if s.latitude and s.longitude else "-"
+        lanes_str = str(s.lanes) if s.lanes is not None else "-"
+        rows.append([
+            str(s.id),
+            s.dir or "-",
+            s.type or "-",
+            lanes_str,
+            pm_str,
+            abs_str,
+            s.name or "-",
+            coord_str
+        ])
+
+    col_widths = [max(len(cols[i]), max(len(r[i]) for r in rows)) for i in range(len(cols))]
+    hdr_str = "  " + "  ".join(f"{cols[i]:<{col_widths[i]}}" for i in range(len(cols)))
+    sep_str = "  " + "  ".join("-" * col_widths[i] for i in range(len(cols)))
+
+    lines.append(hdr_str)
+    lines.append(sep_str)
+    for r in rows:
+        row_str = "  " + "  ".join(f"{r[i]:<{col_widths[i]}}" for i in range(len(cols)))
+        lines.append(row_str)
+
+    lines.append("=" * 80)
+    lines.append("Tip: Pass --lanes to inspect lane configuration tables & TSN metrics for these stations.")
+    return "\n".join(lines)
+
+
+CALTRANS_COUNTY_ABBREVIATIONS: Dict[str, str] = {
+    "ala": "Alameda", "alp": "Alpine", "ama": "Amador", "but": "Butte", "cal": "Calaveras",
+    "col": "Colusa", "cc": "Contra Costa", "dn": "Del Norte", "ed": "El Dorado", "fre": "Fresno",
+    "gle": "Glenn", "hum": "Humboldt", "imp": "Imperial", "iny": "Inyo", "ker": "Kern",
+    "kin": "Kings", "lak": "Lake", "las": "Lassen", "la": "Los Angeles", "mad": "Madera",
+    "mrn": "Marin", "mpa": "Mariposa", "men": "Mendocino", "mer": "Merced", "mod": "Modoc",
+    "mno": "Mono", "mon": "Monterey", "nap": "Napa", "nev": "Nevada", "ora": "Orange",
+    "pla": "Placer", "plu": "Plumas", "riv": "Riverside", "sac": "Sacramento", "sbt": "San Benito",
+    "sbd": "San Bernardino", "sd": "San Diego", "sf": "San Francisco", "sj": "San Joaquin",
+    "slo": "San Luis Obispo", "sm": "San Mateo", "sba": "Santa Barbara", "scl": "Santa Clara",
+    "scr": "Santa Cruz", "sha": "Shasta", "sie": "Sierra", "sis": "Siskiyou", "sol": "Solano",
+    "son": "Sonoma", "sta": "Stanislaus", "sut": "Sutter", "teh": "Tehama", "tri": "Trinity",
+    "tul": "Tulare", "tuo": "Tuolumne", "ven": "Ventura", "yol": "Yolo", "yub": "Yuba"
+}
+
+
+def normalize_ca_county(county: Optional[str]) -> str:
+    """Normalize California county name, abbreviation, or FIPS code (e.g. 'SON' -> 'Sonoma', 'cc' -> 'Contra Costa', '55' -> 'Napa')."""
+    if not county or not str(county).strip():
+        return ""
+    c_raw = str(county).strip()
+    try:
+        val_int = int(float(c_raw))
+        from hpms_interface import CA_FIPS_TO_COUNTY
+        if val_int in CA_FIPS_TO_COUNTY:
+            return CA_FIPS_TO_COUNTY[val_int]
+    except Exception:
+        pass
+
+    c_lower = c_raw.lower()
+    if c_lower in CALTRANS_COUNTY_ABBREVIATIONS:
+        return CALTRANS_COUNTY_ABBREVIATIONS[c_lower]
+    return c_raw.title()
+
+
+def convert_california_postmile(
+    route: Union[str, int],
+    county: str,
+    ca_pm: Union[str, float, int],
+    direction: Optional[str] = None,
+    ref_df: Optional[Any] = None,
+    idx_ref: Optional[IndexedGeoReference] = None,
+) -> Dict[str, Any]:
+    """
+    Convert a California county postmile (CA PM) to an Absolute Postmile (Abs PM)
+    and geographic centerline coordinates (lat, lng).
+    """
+    if not county or not str(county).strip():
+        return {"error": "County must be provided to convert a California postmile."}
+
+    route_norm = normalize_route(route)
+    dir_norm = normalize_direction(direction) if direction else None
+    county_norm = normalize_ca_county(county)
+
+    ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
+    raw_df = ref.raw_df
+
+    sub = raw_df[(raw_df["Route"].astype(str) == str(route_norm)) & (raw_df["County"].astype(str).str.lower() == county_norm.lower())].copy()
+    if sub.empty:
+        return {"error": f"Route '{route_norm}' in County '{county_norm}' not found in California highway database."}
+
+    pfx, num = split_ca_pm(ca_pm)
+    if np.isnan(num):
+        return {"error": f"Invalid postmile format: '{ca_pm}'"}
+
+    sub["_num"] = pd.to_numeric(sub["CA PM"].astype(str).str.replace(r"^[A-Za-z]+", "", regex=True), errors="coerce")
+    sub["_abs"] = pd.to_numeric(sub["Abs PM"], errors="coerce")
+    sub = sub.dropna(subset=["_num", "_abs"])
+
+    if sub.empty:
+        return {"error": f"No valid postmile numbers found for Route {route_norm} in {county_norm} County."}
+
+    matched = sub
+    if dir_norm:
+        sub_dir = sub[sub["Direction"] == dir_norm]
+        if not sub_dir.empty and (sub_dir["_num"].min() - 1.0 <= num <= sub_dir["_num"].max() + 1.0):
+            matched = sub_dir
+
+    if pfx:
+        pfx_match = matched[matched["CA PM"].astype(str).str.upper().str.startswith(pfx.upper())]
+        if not pfx_match.empty:
+            matched = pfx_match
+
+    diff = (matched["_num"] - num).abs()
+    best_row = matched.loc[diff.idxmin()]
+    abs_pm = float(best_row["_abs"])
+    dist_val = str(best_row.get("District", "")).replace(".0", "").strip()
+
+    # Directional coordinate resolution
+    lat, lng = float(best_row["Latitude"]), float(best_row["Longitude"])
+    if dir_norm:
+        dir_rows = raw_df[(raw_df["Route"].astype(str) == str(route_norm)) & (raw_df["Direction"] == dir_norm)]
+        if not dir_rows.empty:
+            dir_diff = (pd.to_numeric(dir_rows["Abs PM"], errors="coerce") - abs_pm).abs()
+            coord_row = dir_rows.loc[dir_diff.idxmin()]
+            lat, lng = float(coord_row["Latitude"]), float(coord_row["Longitude"])
+
+    return {
+        "conversion_type": "CA_TO_ABS",
+        "route": str(route_norm),
+        "county": county_norm,
+        "district": dist_val,
+        "direction": dir_norm or str(best_row.get("Direction", "")),
+        "ca_pm": str(ca_pm),
+        "ca_pm_snapped": str(best_row["CA PM"]),
+        "ca_pm_num": num,
+        "ca_pm_prefix": pfx,
+        "abs_pm": round(abs_pm, 3),
+        "coord": (lat, lng),
+    }
+
+
+def convert_absolute_postmile(
+    route: Union[str, int],
+    abs_pm: Union[str, float, int],
+    direction: Optional[str] = None,
+    ref_df: Optional[Any] = None,
+    idx_ref: Optional[IndexedGeoReference] = None,
+) -> Dict[str, Any]:
+    """
+    Convert a continuous Absolute Postmile (Abs PM) to a California County Postmile (CA PM),
+    identifying the county, district, and geographic centerline coordinates (lat, lng).
+    """
+    route_norm = normalize_route(route)
+    dir_norm = normalize_direction(direction) if direction else None
+
+    ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
+    raw_df = ref.raw_df
+
+    sub = raw_df[raw_df["Route"].astype(str) == str(route_norm)].copy()
+    if sub.empty:
+        return {"error": f"Route '{route_norm}' not found in California highway database."}
+
+    try:
+        target_abs = float(str(abs_pm).strip())
+    except (TypeError, ValueError):
+        return {"error": f"Invalid Absolute Postmile format: '{abs_pm}'"}
+
+    sub["_abs"] = pd.to_numeric(sub["Abs PM"], errors="coerce")
+    sub = sub.dropna(subset=["_abs"])
+    if sub.empty:
+        return {"error": f"No valid Absolute Postmiles found for Route {route_norm}."}
+
+    matched = sub
+    if dir_norm:
+        sub_dir = sub[sub["Direction"] == dir_norm]
+        if not sub_dir.empty:
+            matched = sub_dir
+
+    diff = (matched["_abs"] - target_abs).abs()
+    best_row = matched.loc[diff.idxmin()]
+    delta_mi = float(diff.loc[best_row.name])
+    snapped_abs = float(best_row["_abs"])
+    county_val = normalize_ca_county(best_row["County"])
+    dist_val = str(best_row.get("District", "")).replace(".0", "").strip()
+    ca_pm_val = str(best_row.get("CA PM", best_row.get("State_PM", "")))
+    pfx, ca_num = split_ca_pm(ca_pm_val)
+
+    # Directional coordinate resolution
+    lat, lng = float(best_row["Latitude"]), float(best_row["Longitude"])
+    if dir_norm and best_row["Direction"] != dir_norm:
+        dir_rows = raw_df[(raw_df["Route"].astype(str) == str(route_norm)) & (raw_df["Direction"] == dir_norm)]
+        if not dir_rows.empty:
+            dir_diff = (pd.to_numeric(dir_rows["Abs PM"], errors="coerce") - snapped_abs).abs()
+            coord_row = dir_rows.loc[dir_diff.idxmin()]
+            lat, lng = float(coord_row["Latitude"]), float(coord_row["Longitude"])
+
+    return {
+        "conversion_type": "ABS_TO_CA",
+        "route": str(route_norm),
+        "county": county_val,
+        "district": dist_val,
+        "direction": dir_norm or str(best_row.get("Direction", "")),
+        "abs_pm": round(target_abs, 3),
+        "snapped_abs_pm": round(snapped_abs, 3),
+        "delta_mi": round(delta_mi, 4),
+        "ca_pm": ca_pm_val,
+        "ca_pm_snapped": ca_pm_val,
+        "ca_pm_num": ca_num,
+        "ca_pm_prefix": pfx,
+        "coord": (lat, lng),
+    }
+
+
+def find_stations_by_postmile_range(
+    route: Union[str, int],
+    begin_pm: Union[str, float, int],
+    end_pm: Union[str, float, int],
+    county: Optional[str] = None,
+    begin_county: Optional[str] = None,
+    end_county: Optional[str] = None,
+    direction: Optional[str] = None,
+    is_absolute: bool = False,
+    buffer_mi: float = 0.1,
+    station_types: Optional[Tuple[str, ...]] = ("ML", "HV"),
+    metadata_dir: Optional[str] = None,
+    idx_ref: Optional[IndexedGeoReference] = None,
+    vds_meta: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Search for PeMS detector stations along a specified California Route corridor bounded by California Postmiles or Absolute Postmiles.
+    Converts postmiles to continuous Absolute Postmiles and coordinates, and matches stations within buffer.
+    """
+    b_co = begin_county or county
+    e_co = end_county or county
+    ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
+
+    if is_absolute or (not b_co and not e_co):
+        start_info = convert_absolute_postmile(route, begin_pm, direction=direction, idx_ref=ref)
+        if "error" in start_info:
+            return start_info
+        end_info = convert_absolute_postmile(route, end_pm, direction=direction, idx_ref=ref)
+        if "error" in end_info:
+            return end_info
+        b_co = start_info["county"]
+        e_co = end_info["county"]
+    else:
+        start_info = convert_california_postmile(route, b_co or e_co, begin_pm, direction=direction, idx_ref=ref)
+        if "error" in start_info:
+            return start_info
+        end_info = convert_california_postmile(route, e_co or b_co, end_pm, direction=direction, idx_ref=ref)
+        if "error" in end_info:
+            return end_info
+
+    route_norm = normalize_route(route)
+    dir_norm = normalize_direction(direction) if direction else None
+
+    # Validate direction against route
+    valid_dirs = ref.valid_directions_for_route(route_norm)
+    dir_mismatch_notice = None
+    if dir_norm and valid_dirs and dir_norm not in valid_dirs:
+        cardinal_name = "East-West" if valid_dirs.issubset({"E", "W"}) else ("North-South" if valid_dirs.issubset({"N", "S"}) else "unaligned")
+        dir_mismatch_notice = (
+            f"Route {route_norm} is an {cardinal_name} highway (valid directions: {sorted(valid_dirs)}). "
+            f"Ignoring mismatched direction '{direction}' and searching both directions."
+        )
+        dir_norm = None
+
+    abs_b = float(start_info["abs_pm"])
+    abs_e = float(end_info["abs_pm"])
+    min_abs = min(abs_b, abs_e)
+    max_abs = max(abs_b, abs_e)
+    length_mi = round(max_abs - min_abs, 2)
+
+    meta = vds_meta if vds_meta is not None else load_vds_metadata(metadata_dir)
+    types_set = set(t.strip().upper() for t in station_types) if station_types and "ALL" not in station_types else None
+
+    route_vds = [
+        s for s in meta.by_id.values()
+        if str(s.fwy) == str(route_norm)
+    ]
+    if dir_norm:
+        route_vds = [s for s in route_vds if s.dir == dir_norm]
+    if types_set:
+        route_vds = [s for s in route_vds if s.type in types_set]
+
+    matched_stations: List[VDSStationRecord] = []
+    for s in route_vds:
+        if s.abs_pm is not None:
+            if (min_abs - buffer_mi) <= s.abs_pm <= (max_abs + buffer_mi):
+                matched_stations.append(s)
+
+    seen_ids = set()
+    unique_stations = []
+    for s in matched_stations:
+        if s.id not in seen_ids:
+            seen_ids.add(s.id)
+            unique_stations.append(s)
+
+    unique_stations.sort(key=lambda x: (x.dir or "", x.abs_pm if x.abs_pm is not None else 0.0))
+
+    co_display = b_co if b_co == e_co else f"{b_co} to {e_co}"
+
+    # Query FHWA / Caltrans HPMS summary
+    hpms_summary = fetch_hpms_corridor_summary(
+        route=route_norm,
+        abs_begin_pm=min_abs,
+        abs_end_pm=max_abs,
+        county=b_co
+    )
+
+    # Uninstrumented diagnostics & census stations
+    coverage_status = "INSTRUMENTED"
+    coverage_details = None
+    nearest_station = None
+    nearest_station_dist_mi = None
+    census_stations: List[Dict[str, Any]] = []
+
+    all_route_stations = [s for s in meta.by_id.values() if str(s.fwy) == str(route_norm)]
+    if not unique_stations:
+        if not all_route_stations:
+            coverage_status = "UNINSTRUMENTED STATEWIDE"
+            coverage_details = f"Route {route_norm} has no active PeMS detector stations instrumented statewide."
+        else:
+            coverage_status = "UNINSTRUMENTED CORRIDOR SEGMENT"
+            st_counties = sorted(set(normalize_ca_county(s.county) for s in all_route_stations if s.county))
+            st_counties_str = ", ".join(st_counties)
+            nst = min(all_route_stations, key=lambda s: abs((s.abs_pm if s.abs_pm is not None else 9999) - min_abs))
+            nearest_station = nst
+            if nst.abs_pm is not None:
+                nearest_station_dist_mi = abs(nst.abs_pm - min_abs)
+                coverage_details = (
+                    f"Route {route_norm} has {len(all_route_stations)} active PeMS stations located in {st_counties_str} County/Counties. "
+                    f"The {b_co} County corridor (Abs PM {min_abs:.2f} - {max_abs:.2f}) is not instrumented with PeMS mainline loop detectors."
+                )
+            else:
+                coverage_details = (
+                    f"Route {route_norm} has {len(all_route_stations)} active PeMS stations in {st_counties_str} County/Counties, "
+                    f"but none in the {b_co} County corridor (Abs PM {min_abs:.2f} - {max_abs:.2f})."
+                )
+
+        dist_val = str(start_info.get("district") or end_info.get("district") or "4")
+        _, b_num = split_ca_pm(begin_pm)
+        raw_census = find_closest_census_stations(route_norm, dist_val, b_num if not np.isnan(b_num) else 0.0, county=b_co, top_n=3)
+        if not raw_census.empty:
+            for _, crow in raw_census.iterrows():
+                census_stations.append({
+                    "ID": str(crow["ID"]),
+                    "Name": str(crow["Name"]),
+                    "CA PM": str(crow["CA PM"]),
+                    "Abs PM": f"{float(crow['Abs PM']):.2f}" if pd.notna(crow.get("Abs PM")) else "-",
+                    "pm_diff": float(crow["pm_diff"]) if pd.notna(crow.get("pm_diff")) else 0.0,
+                })
+
+    return {
+        "route": route_norm,
+        "direction": dir_norm,
+        "dir_mismatch_notice": dir_mismatch_notice,
+        "county": co_display,
+        "begin_county": b_co,
+        "end_county": e_co,
+        "begin_pm": str(begin_pm),
+        "end_pm": str(end_pm),
+        "start": start_info,
+        "end": end_info,
+        "corridor_range": {
+            "abs_min": min_abs,
+            "abs_max": max_abs,
+            "length_mi": length_mi,
+        },
+        "stations": unique_stations,
+        "hpms_summary": hpms_summary,
+        "coverage_status": coverage_status,
+        "coverage_details": coverage_details,
+        "nearest_station": nearest_station,
+        "nearest_station_dist_mi": nearest_station_dist_mi,
+        "census_stations": census_stations,
+        "buffer_mi": buffer_mi,
+    }
+
+
+def format_single_postmile_report(res: Dict[str, Any]) -> str:
+    """Format single postmile conversion results into a clean, human-readable report."""
+    if "error" in res:
+        return f"\n[ERROR]: {res['error']}"
+
+    lines: List[str] = []
+    lines.append("=" * 80)
+    rt_dir = f"Route {res['route']}" + (f" {res['direction']}" if res.get('direction') else "")
+
+    if res.get("conversion_type") == "ABS_TO_CA":
+        lines.append(f"CALIFORNIA POSTMILE CONVERSION: Absolute PM -> California County PM")
+        lines.append(f"{rt_dir} | Target Abs PM: {res['abs_pm']}")
+        lines.append("=" * 80)
+        lines.append(f"  • California County Postmile:   {res['county']} County PM {res['ca_pm']}")
+        lines.append(f"  • Caltrans District:            District {res['district']} ({res['county']} County)")
+        lines.append(f"  • Centerline Coordinates:       ({res['coord'][0]:.5f}, {res['coord'][1]:.5f})")
+        lines.append(f"  • Snapped Reference Postmile:   Abs PM {res['snapped_abs_pm']:.3f} (delta: {res['delta_mi']:.3f} mi)")
+    else:
+        lines.append(f"CALIFORNIA POSTMILE CONVERSION: California County PM -> Absolute PM")
+        lines.append(f"{rt_dir} | County: {res['county']} | CA PM: {res['ca_pm']}")
+        lines.append("=" * 80)
+        lines.append(f"  • Converted Absolute Postmile:  Abs PM {res['abs_pm']:.3f}")
+        lines.append(f"  • Centerline Coordinates:       ({res['coord'][0]:.5f}, {res['coord'][1]:.5f})")
+        lines.append(f"  • Caltrans District:            District {res['district']}")
+        lines.append(f"  • Snapped Centerline Segment:   Route {res['route']} {res.get('direction', '')} {res['county']} PM {res.get('ca_pm_snapped', res['ca_pm'])}")
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def format_postmile_range_report(res: Dict[str, Any]) -> str:
+    """Format postmile range conversion and station search results into a clean, human-readable report."""
+    if "error" in res:
+        return f"\n[ERROR]: {res['error']}"
+
+    lines: List[str] = []
+    lines.append("=" * 80)
+    lines.append("CALTRANS PEMS ROUTE CORRIDOR POSTMILE QUERY & CONVERSION")
+    rt_str = f"Route {res['route']}" + (f" {res['direction']}" if res['direction'] else " (Both Directions)")
+    lines.append(f"{rt_str} | {res['county']} | CA PM {res['begin_pm']} - {res['end_pm']}")
+    lines.append("=" * 80)
+
+    if res.get("dir_mismatch_notice"):
+        lines.append(f"\n[Direction Notice]: {res['dir_mismatch_notice']}")
+
+    s_info = res["start"]
+    e_info = res["end"]
+    c_range = res["corridor_range"]
+
+    lines.append("\nCorridor Conversion & Limits:")
+    lines.append(f"  • Begin Postmile:  {res['begin_county']} Co, PM {res['begin_pm']} -> Abs PM {s_info['abs_pm']:.3f} | Coord: ({s_info['coord'][0]:.5f}, {s_info['coord'][1]:.5f})")
+    lines.append(f"  • End Postmile:    {res['end_county']} Co, PM {res['end_pm']} -> Abs PM {e_info['abs_pm']:.3f} | Coord: ({e_info['coord'][0]:.5f}, {e_info['coord'][1]:.5f})")
+    lines.append(f"  • Corridor Limits: Abs PM {c_range['abs_min']:.2f} - {c_range['abs_max']:.2f} (Length: {c_range['length_mi']:.2f} mi)")
+    dist_val = s_info.get("district") or e_info.get("district") or "N/A"
+    lines.append(f"  • Caltrans District: District {dist_val}")
+
+    # HPMS Ground-Truth Roadway Attributes Section
+    hpms_summary = res.get("hpms_summary")
+    if hpms_summary:
+        lines.append("\n[FHWA / Caltrans HPMS Ground-Truth Roadway Attributes]")
+        pred_lanes = hpms_summary.get("predominant_lanes_2024")
+        avg_lanes = hpms_summary.get("avg_lanes_2024")
+        lane_str = f"{pred_lanes}" if pred_lanes is not None else "N/A"
+        if avg_lanes is not None and avg_lanes != pred_lanes:
+            lane_str += f" (Corridor length-weighted avg: {avg_lanes:.2f})"
+        lines.append(f"  • Through Lanes (2024):         {lane_str}")
+        if hpms_summary.get("facility_type"):
+            lines.append(f"  • Facility Type:                {hpms_summary['facility_type']}")
+        if hpms_summary.get("access_control"):
+            lines.append(f"  • Access Control:               {hpms_summary['access_control']}")
+        if hpms_summary.get("surface_type"):
+            lines.append(f"  • Surface Type:                 {hpms_summary['surface_type']}")
+        if hpms_summary.get("functional_system"):
+            lines.append(f"  • Functional System:            {hpms_summary['functional_system']}")
+        if hpms_summary.get("avg_aadt_2024"):
+            lines.append(f"  • Certified AADT (2024):        {hpms_summary['avg_aadt_2024']:,} vehicles/day")
+        if hpms_summary.get("future_aadt"):
+            yr_str = f" (Year {hpms_summary['future_aadt_year']})" if hpms_summary.get('future_aadt_year') else ""
+            try:
+                fa = int(float(hpms_summary['future_aadt']))
+                lines.append(f"  • Forecast Future AADT:         {fa:,} vehicles/day{yr_str}")
+            except Exception:
+                lines.append(f"  • Forecast Future AADT:         {hpms_summary['future_aadt']}{yr_str}")
+        if hpms_summary.get("sections_count"):
+            lines.append(f"  • HPMS Corridor Sections:       {hpms_summary['sections_count']} sections analyzed")
+        lines.append("-" * 80)
+
+    stations: List[VDSStationRecord] = res["stations"]
+    lines.append(f"Matching Stations:   {len(stations)} found in corridor\n")
+
+    if not stations:
+        lines.append("  (No PeMS detector stations found in this corridor range)")
+        if res.get("coverage_details"):
+            lines.append(f"\n[Corridor Instrumentation & PeMS VDS Status]")
+            lines.append(f"  • Coverage:        {res.get('coverage_status', 'UNINSTRUMENTED')}")
+            lines.append(f"  • Details:         {res['coverage_details']}")
+            if res.get("nearest_station"):
+                nst = res["nearest_station"]
+                nst_pm = f"Abs PM {nst.abs_pm:.2f}" if getattr(nst, "abs_pm", None) is not None else ""
+                dist_str = f", {res['nearest_station_dist_mi']:.2f} mi away." if res.get("nearest_station_dist_mi") is not None else "."
+                lines.append(f"  • Nearest Station: Station {nst.id} ({nst.name}, {nst_pm}){dist_str}")
+        if res.get("census_stations"):
+            lines.append(f"\n[Caltrans Annual Census Traffic Stations]")
+            for c in res["census_stations"]:
+                loc_hint = f"[{c['pm_diff']:.2f} mi from start PM]" if c['pm_diff'] > 0 else "[Inside corridor]"
+                lines.append(f"  • Station {c['ID']}: {c['Name']} (CA PM {c['CA PM']}, Abs PM {c['Abs PM']}) {loc_hint}")
+        lines.append("=" * 80)
+        lines.append("Tip: Pass --map to generate an interactive HTML map, or --lanes to inspect lane tables.")
+        return "\n".join(lines)
+
+    cols = ["Station ID", "Dir", "Type", "Lanes", "CA PM", "Abs PM", "Name", "Coordinates"]
+    rows = []
+    for s in stations:
+        pm_str = str(s.state_pm) if s.state_pm else "-"
+        abs_str = f"{s.abs_pm:.2f}" if s.abs_pm is not None else "-"
+        coord_str = f"({s.latitude:.5f}, {s.longitude:.5f})" if s.latitude and s.longitude else "-"
+        lanes_str = str(s.lanes) if s.lanes is not None else "-"
+        rows.append([
+            str(s.id),
+            s.dir or "-",
+            s.type or "-",
+            lanes_str,
+            pm_str,
+            abs_str,
+            s.name or "-",
+            coord_str
+        ])
+
+    col_widths = [max(len(cols[i]), max(len(r[i]) for r in rows)) for i in range(len(cols))]
+    hdr_str = "  " + "  ".join(f"{cols[i]:<{col_widths[i]}}" for i in range(len(cols)))
+    sep_str = "  " + "  ".join("-" * col_widths[i] for i in range(len(cols)))
+
+    lines.append(hdr_str)
+    lines.append(sep_str)
+    for r in rows:
+        row_str = "  " + "  ".join(f"{r[i]:<{col_widths[i]}}" for i in range(len(cols)))
+        lines.append(row_str)
+
+    lines.append("=" * 80)
+    lines.append("Tip: Pass --map to generate an interactive HTML map, or --lanes to inspect lane tables.")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # PROJECT RECORD & MASTER CSV PARSER
 # ---------------------------------------------------------------------------
+def build_date_from_parts(
+    year: Any,
+    month: Any = None,
+    day: Any = None,
+    default_month: int = 1,
+    default_day: int = 1
+) -> Optional[datetime.date]:
+    """
+    Construct a datetime.date directly from separate numeric year, month, and day columns.
+    Eliminates date string parsing and formatting discrepancies from spreadsheet editors.
+    """
+    if year is None or pd.isna(year):
+        return None
+    try:
+        y_int = int(float(year))
+        if not (1950 <= y_int <= 2040):
+            return None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+    try:
+        m_int = int(float(month)) if month is not None and pd.notna(month) else default_month
+        if not (1 <= m_int <= 12):
+            m_int = default_month
+    except (ValueError, TypeError, OverflowError):
+        m_int = default_month
+
+    try:
+        d_int = int(float(day)) if day is not None and pd.notna(day) else default_day
+        if not (1 <= d_int <= 31):
+            d_int = default_day
+    except (ValueError, TypeError, OverflowError):
+        d_int = default_day
+
+    try:
+        return datetime.date(y_int, m_int, d_int)
+    except ValueError:
+        # Handle invalid day for month (e.g. Feb 30, April 31)
+        if d_int > 28:
+            for fallback_d in (30, 29, 28):
+                try:
+                    return datetime.date(y_int, m_int, fallback_d)
+                except ValueError:
+                    pass
+        return datetime.date(y_int, m_int, 1)
+
+
+def parse_iso_date(val: Any, default_month: int = 1, default_day: int = 1) -> Optional[datetime.date]:
+    """Simple parser for ISO date strings (YYYY-MM-DD) or explicit 4-digit years from CLI/code."""
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val if isinstance(val, datetime.date) else val.date()
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat", ""):
+        return None
+    try:
+        return datetime.date.fromisoformat(s.split()[0])
+    except ValueError:
+        pass
+    try:
+        y = int(float(s))
+        if 1950 <= y <= 2040:
+            return datetime.date(y, default_month, default_day)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _parse_project_date(val: Any, default_month: int = 1, default_day: int = 1) -> Optional[datetime.date]:
+    """Compatibility wrapper that converts ISO string or year number to datetime.date."""
+    return parse_iso_date(val, default_month, default_day)
+
+
 @dataclass
 class ProjectRecord:
     """Structured representation of a highway capacity project row."""
@@ -1176,26 +2413,36 @@ class ProjectRecord:
 
     @property
     def start_year(self) -> int:
-        for val in (self.construction_begin_date, self.raw_row.get("construction_begin_year")):
-            if val and pd.notna(val):
-                try:
-                    y = int(str(val)[:4])
-                    if 1990 <= y <= 2030:
-                        return y
-                except ValueError:
-                    pass
+        val = self.raw_row.get("construction_begin_year")
+        if val is not None and pd.notna(val):
+            try:
+                y = int(float(val))
+                if 1950 <= y <= 2040:
+                    return y
+            except (ValueError, TypeError):
+                pass
+        if self.construction_begin_date:
+            try:
+                return int(str(self.construction_begin_date)[:4])
+            except (ValueError, TypeError):
+                pass
         return 2013
 
     @property
     def end_year(self) -> int:
-        for val in (self.open_to_traffic_date, self.raw_row.get("open_traffic_year")):
-            if val and pd.notna(val):
-                try:
-                    y = int(str(val)[:4])
-                    if 1990 <= y <= 2030:
-                        return min(y + 4, 2026)
-                except ValueError:
-                    pass
+        val = self.raw_row.get("open_traffic_year")
+        if val is not None and pd.notna(val):
+            try:
+                y = int(float(val))
+                if 1950 <= y <= 2040:
+                    return min(y + 4, 2026)
+            except (ValueError, TypeError):
+                pass
+        if self.open_to_traffic_date:
+            try:
+                return min(int(str(self.open_to_traffic_date)[:4]) + 4, 2026)
+            except (ValueError, TypeError):
+                pass
         return 2024
 
 
@@ -1261,20 +2508,38 @@ def parse_master_row(row: Dict[str, Any], row_index: int = -1) -> ProjectRecord:
         except ValueError:
             pass
 
-    # Dates
-    c_begin = None
-    for k in ("Begin Date (formatted YYYY-MM-DD)", "Construction Begin Date"):
-        v = str(row.get(k, "")).strip()
-        if v and v.lower() not in ("nan", "none", "") and not (v.isdigit() and len(v) > 4):
-            c_begin = v
-            break
+    # Dates: construct directly from the 3 separate numeric columns (year, month, day)
+    c_dt = build_date_from_parts(
+        row.get("construction_begin_year"),
+        row.get("construction_begin_month"),
+        row.get("construction_begin_day"),
+        default_month=1, default_day=1
+    )
+    c_begin = c_dt.isoformat() if c_dt else None
+    if not c_begin:
+        # Fallback for synthetic/test rows without separate columns
+        for k in ("Begin Date (formatted YYYY-MM-DD)", "Construction Begin Date"):
+            val = str(row.get(k, "")).strip()
+            dt = parse_iso_date(val, default_month=1, default_day=1)
+            if dt:
+                c_begin = dt.isoformat()
+                break
 
-    o_traffic = None
-    for k in ("Open to Traffic Date (formatted YYYY-MM-DD)", "Open to Traffic Date"):
-        v = str(row.get(k, "")).strip()
-        if v and v.lower() not in ("nan", "none", "") and not (v.isdigit() and len(v) > 4):
-            o_traffic = v
-            break
+    o_dt = build_date_from_parts(
+        row.get("open_traffic_year"),
+        row.get("open_traffic_month"),
+        row.get("open_traffic_day"),
+        default_month=12, default_day=31
+    )
+    o_traffic = o_dt.isoformat() if o_dt else None
+    if not o_traffic:
+        # Fallback for synthetic/test rows without separate columns
+        for k in ("Open to Traffic Date (formatted YYYY-MM-DD)", "Open to Traffic Date"):
+            val = str(row.get(k, "")).strip()
+            dt = parse_iso_date(val, default_month=12, default_day=31)
+            if dt:
+                o_traffic = dt.isoformat()
+                break
 
     # Sensor stations
     sensor_stations = []
@@ -2241,66 +3506,6 @@ def run_station_comparison_pipeline(
 # OPTION 1: OPEN-TO-TRAFFIC INFERENCE VIA PEMS CONFIGURATION & TELEMETRY
 # ===========================================================================
 
-def parse_any_date(val: Any) -> Optional[datetime.date]:
-    """
-    Parse a date from any string or numeric representation encountered across
-    Caltrans datasets, including 5-digit Excel serial numbers, ISO strings,
-    month-name strings ('April 30th, 2018', 'December, 2019'), and 4-digit years.
-    """
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "nat", ""):
-        return None
-
-    # Check 5-digit Excel serial (e.g. 43488 -> 2019-01-23)
-    if s.isdigit() and len(s) == 5:
-        try:
-            return datetime.date(1899, 12, 30) + datetime.timedelta(days=int(s))
-        except Exception:
-            pass
-
-    # Check 4-digit year (e.g. 2019 -> 2019-01-01)
-    if s.isdigit() and len(s) == 4 and 1980 <= int(s) <= 2035:
-        return datetime.date(int(s), 1, 1)
-
-    # Check ISO format YYYY-MM-DD
-    m_iso = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", s)
-    if m_iso:
-        try:
-            return datetime.date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
-        except ValueError:
-            pass
-
-    # Check YYYY/MM/DD or YYYY/MM
-    m_slash = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
-    if m_slash:
-        try:
-            return datetime.date(int(m_slash.group(1)), int(m_slash.group(2)), int(m_slash.group(3)))
-        except ValueError:
-            pass
-    m_ym = re.match(r"^(\d{4})/(\d{1,2})$", s)
-    if m_ym:
-        try:
-            return datetime.date(int(m_ym.group(1)), int(m_ym.group(2)), 1)
-        except ValueError:
-            pass
-    m_my = re.match(r"^(\d{1,2})/(\d{4})$", s)
-    if m_my:
-        try:
-            return datetime.date(int(m_my.group(2)), int(m_my.group(1)), 1)
-        except ValueError:
-            pass
-
-    # Clean ordinal suffixes (e.g. 30th -> 30)
-    s_clean = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", s)
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%B %d, %Y", "%B %d %Y", "%B, %Y", "%B %Y"):
-        try:
-            return datetime.datetime.strptime(s_clean, fmt).date()
-        except ValueError:
-            pass
-    return None
-
 
 @dataclass
 class StationConfigRecord:
@@ -2762,7 +3967,15 @@ def infer_project_open_to_traffic(
         )
 
     # 3. Establish project construction timeframe bounds
-    c_begin_parsed = parse_any_date(proj.construction_begin_date)
+    c_begin_parsed = (
+        build_date_from_parts(
+            proj.raw_row.get("construction_begin_year"),
+            proj.raw_row.get("construction_begin_month"),
+            proj.raw_row.get("construction_begin_day"),
+            default_month=1, default_day=1
+        )
+        or parse_iso_date(proj.construction_begin_date, 1, 1)
+    )
     min_date = c_begin_parsed - datetime.timedelta(days=60) if c_begin_parsed else datetime.date(2000, 1, 1)
     max_date = datetime.date.today() + datetime.timedelta(days=180)
 
@@ -3243,7 +4456,7 @@ def parse_station_configuration_page(
         details.longitude = vds_record.longitude
 
     if not html_content:
-        details.error = "Empty response from PeMS"
+        details.error = "PeMS server timed out or returned no content"
         return details
 
     soup = BeautifulSoup(html_content, "html.parser")
@@ -3331,7 +4544,8 @@ def parse_station_configuration_page(
 def fetch_station_lane_configuration(
     station_id: str,
     client: Optional[PeMSClient] = None,
-    vds_record: Optional[VDSStationRecord] = None
+    vds_record: Optional[VDSStationRecord] = None,
+    timeout: float = 60.0
 ) -> StationLaneConfigDetails:
     """
     Fetch and parse raw PeMS station lane configuration, change log, and TSN roadway metrics for a single station.
@@ -3343,7 +4557,35 @@ def fetch_station_lane_configuration(
 
     url = build_station_config_url(st_id)
     try:
-        html_txt = client.get_text_content(url)
+        html_txt = client.get_text_content(url, timeout=timeout)
+        if not html_txt:
+            # Fallback to direct tab URL without report_form=1 if primary attempt timed out or was empty
+            tab_url = f"{BASE_URL}/?dnode=VDS&content=sta_cfg&tab=sta_cfg&station_id={st_id}"
+            if tab_url != url:
+                LOGGER.info(f"Retrying station {st_id} configuration with browser tab URL ({tab_url})...")
+                html_txt = client.get_text_content(tab_url, timeout=timeout)
+                if html_txt:
+                    url = tab_url
+
+        if not html_txt:
+            details = StationLaneConfigDetails(
+                station_id=st_id,
+                url=url,
+                error=f"PeMS server timed out or returned no content (backend query took > {timeout:.0f}s)"
+            )
+            if vds_record:
+                details.station_name = vds_record.name
+                details.district = str(vds_record.district)
+                details.route = str(vds_record.fwy)
+                details.direction = vds_record.dir
+                details.county = str(vds_record.county)
+                details.station_type = vds_record.type
+                details.ca_pm = str(vds_record.state_pm)
+                details.abs_pm = vds_record.abs_pm
+                details.latitude = vds_record.latitude
+                details.longitude = vds_record.longitude
+            return details
+
         return parse_station_configuration_page(html_txt, station_id=st_id, vds_record=vds_record)
     except Exception as exc:
         LOGGER.warning(f"Failed to fetch configuration for station {st_id}: {exc}")
@@ -3494,6 +4736,61 @@ def fetch_project_lane_configurations(
     except Exception as exc:
         LOGGER.debug(f"HPMS corridor lookup failed: {exc}")
 
+    uninstrumented_info: Optional[Dict[str, Any]] = None
+    if not results and matched_projects:
+        first_p = matched_projects[0]
+        route_norm = normalize_route(first_p.route)
+        all_route_stations = [s for s in vds_meta.by_id.values() if s.fwy == route_norm] if vds_meta else []
+        min_abs = min(first_p.abs_begin_pm or 0.0, first_p.abs_end_pm or 0.0)
+        max_abs = max(first_p.abs_begin_pm or 0.0, first_p.abs_end_pm or 0.0)
+
+        nearest_station = None
+        nearest_station_dist_mi = None
+        if not all_route_stations:
+            coverage_status = "UNINSTRUMENTED STATEWIDE"
+            coverage_details = f"Route {route_norm} has no active PeMS detector stations instrumented statewide."
+        else:
+            coverage_status = "UNINSTRUMENTED CORRIDOR SEGMENT"
+            st_counties = sorted(set(normalize_ca_county(s.county) for s in all_route_stations if s.county))
+            st_counties_str = ", ".join(st_counties)
+            nst = min(all_route_stations, key=lambda s: abs((s.abs_pm if s.abs_pm is not None else 9999) - min_abs))
+            nearest_station = nst
+            if nst.abs_pm is not None:
+                nearest_station_dist_mi = abs(nst.abs_pm - min_abs)
+                coverage_details = (
+                    f"Route {route_norm} has {len(all_route_stations)} active PeMS stations located in {st_counties_str} County/Counties. "
+                    f"The {first_p.county} County corridor (Abs PM {min_abs:.2f} - {max_abs:.2f}) is not instrumented with PeMS mainline loop detectors."
+                )
+            else:
+                coverage_details = (
+                    f"Route {route_norm} has {len(all_route_stations)} active PeMS stations in {st_counties_str} County/Counties, "
+                    f"but none in the {first_p.county} County corridor (Abs PM {min_abs:.2f} - {max_abs:.2f})."
+                )
+
+        census_stations = []
+        try:
+            _, b_num = split_ca_pm(first_p.begin_pm or "0")
+            raw_census = find_closest_census_stations(route_norm, str(first_p.district or "4"), b_num if not np.isnan(b_num) else 0.0, county=str(first_p.county), top_n=3)
+            if not raw_census.empty:
+                for _, crow in raw_census.iterrows():
+                    census_stations.append({
+                        "ID": str(crow["ID"]),
+                        "Name": str(crow["Name"]),
+                        "CA PM": str(crow["CA PM"]),
+                        "Abs PM": f"{crow['Abs PM']:.2f}" if pd.notna(crow.get("Abs PM")) else "-",
+                        "pm_diff": float(crow.get("pm_diff", 0.0))
+                    })
+        except Exception:
+            pass
+
+        uninstrumented_info = {
+            "coverage_status": coverage_status,
+            "coverage_details": coverage_details,
+            "nearest_station": nearest_station,
+            "nearest_station_dist_mi": nearest_station_dist_mi,
+            "census_stations": census_stations,
+        }
+
     return {
         "project_id": pid_clean,
         "projects": matched_projects,
@@ -3501,6 +4798,7 @@ def fetch_project_lane_configurations(
         "spreadsheet_stations": spreadsheet_sids,
         "corridor_stations": corridor_sids,
         "hpms_summary": hpms_summary,
+        "uninstrumented_info": uninstrumented_info,
     }
 
 
@@ -3508,6 +4806,7 @@ def format_lane_config_report(
     details: Union[StationLaneConfigDetails, List[StationLaneConfigDetails]],
     project: Optional[ProjectRecord] = None,
     hpms_summary: Optional[Dict[str, Any]] = None,
+    uninstrumented_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Format station lane tables, change logs, and TSN roadway metrics into a clean human-readable report.
@@ -3557,7 +4856,23 @@ def format_lane_config_report(
         lines.append("-" * 80)
 
     if not station_list:
-        lines.append("\nNo station configurations found.")
+        lines.append("\n[Corridor Instrumentation & PeMS VDS Status]")
+        lines.append("  • PeMS Mainline Detectors:      0 stations found (Uninstrumented corridor segment)")
+        if uninstrumented_info and uninstrumented_info.get("coverage_details"):
+            lines.append(f"  • Coverage Details:             {uninstrumented_info['coverage_details']}")
+        elif project:
+            lines.append(f"  • Coverage Details:             Route {project.route} {project.direction or ''} in {project.county} County (PM {project.begin_pm} - {project.end_pm}) is not instrumented with active mainline PeMS loop detectors.")
+        if uninstrumented_info and uninstrumented_info.get("nearest_station"):
+            nst = uninstrumented_info["nearest_station"]
+            nst_pm = f"Abs PM {nst.abs_pm:.2f}" if getattr(nst, "abs_pm", None) is not None else ""
+            dist_str = f", {uninstrumented_info['nearest_station_dist_mi']:.2f} mi away." if uninstrumented_info.get("nearest_station_dist_mi") is not None else "."
+            lines.append(f"  • Nearest Active Station:       Station {nst.id} ({nst.name}, {nst_pm}){dist_str}")
+        if uninstrumented_info and uninstrumented_info.get("census_stations"):
+            c_sts = uninstrumented_info["census_stations"]
+            lines.append("\n[Caltrans Annual Census Traffic Stations]")
+            for c in c_sts:
+                lines.append(f"  • Station {c['ID']}: {c['Name']} (CA PM {c['CA PM']}, Abs PM {c['Abs PM']})")
+        lines.append("=" * 80)
         return "\n".join(lines)
 
     for idx, st in enumerate(station_list, start=1):
@@ -3662,6 +4977,7 @@ def _save_lane_config_report(
     stations: List[StationLaneConfigDetails],
     project: Optional[ProjectRecord] = None,
     hpms_summary: Optional[Dict[str, Any]] = None,
+    uninstrumented_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Save lane configuration and TSN roadway metrics report to file (JSON, Markdown, or text)."""
     out_ext = os.path.splitext(output_path)[1].lower()
@@ -3672,6 +4988,12 @@ def _save_lane_config_report(
             "route": project.route if project else None,
             "direction": project.direction if project else None,
             "hpms_summary": hpms_summary,
+            "uninstrumented_info": {
+                "coverage_status": uninstrumented_info.get("coverage_status"),
+                "coverage_details": uninstrumented_info.get("coverage_details"),
+                "nearest_station": uninstrumented_info.get("nearest_station").id if uninstrumented_info and uninstrumented_info.get("nearest_station") else None,
+                "census_stations": uninstrumented_info.get("census_stations"),
+            } if uninstrumented_info else None,
             "stations": [
                 {
                     "station_id": s.station_id,
@@ -3699,7 +5021,7 @@ def _save_lane_config_report(
             json.dump(data, f, indent=2)
         print(f"\n✓ Exported station lane configuration JSON -> {output_path}")
     else:
-        report_text = format_lane_config_report(stations, project=project, hpms_summary=hpms_summary)
+        report_text = format_lane_config_report(stations, project=project, hpms_summary=hpms_summary, uninstrumented_info=uninstrumented_info)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(report_text)
         print(f"\n✓ Exported station lane configuration report -> {output_path}")
@@ -3792,8 +5114,8 @@ def make_project_tooltip_html(project: ProjectRecord, length_mi: float = 0.0) ->
     desc = html.escape(raw_desc)
 
     return f"""
-    <div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 13px; line-height: 1.4; min-width: 210px; color: #000; background: #fff; padding: 6px 8px; border: 1px solid #000;">
-      <div style="font-weight: bold; font-size: 13px; color: #000; margin-bottom: 2px;">
+    <div style="font-family: {MONO_FONT}; font-size: 12px; line-height: 1.4; min-width: 210px; color: #000; background: #fff; padding: 6px 8px; border: 1px solid #000;">
+      <div style="font-weight: bold; font-size: 12.5px; color: #000; margin-bottom: 2px;">
         PID {html.escape(project.project_id)} &middot; Route {html.escape(project.route)} {html.escape(project.direction)}
       </div>
       <div><b>Dist {html.escape(project.dist)}</b> &middot; {html.escape(project.county)} County</div>
@@ -3801,13 +5123,13 @@ def make_project_tooltip_html(project: ProjectRecord, length_mi: float = 0.0) ->
       <div><b>Directional Lanes:</b> {b_lanes} &rarr; {a_lanes}</div>
       <div><b>Dates:</b> Const: {html.escape(project.construction_begin_date or 'N/A')} | Open: {html.escape(project.open_to_traffic_date or 'N/A')}</div>
       <div><b>Sensors:</b> {sensors_str}</div>
-      {f'<div style="color: #333; font-size: 12px; margin-top: 4px; border-top: 1px solid #666; padding-top: 3px;">{desc}</div>' if desc else ''}
+      {f'<div style="color: #333; font-size: 11.5px; margin-top: 4px; border-top: 1px solid #666; padding-top: 3px;">{desc}</div>' if desc else ''}
     </div>
     """
 
 
 def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBuilder, length_mi: float = 0.0) -> str:
-    """Generate detailed click popup card HTML with bare-bones serif aesthetic and live links."""
+    """Generate detailed click popup card HTML with utilitarian monospaced aesthetic and live links."""
     urls = builder.generate_all_urls()
     raw = project.raw_row
     tot_b = html.escape(str(raw.get("Total Lanes Before", raw.get("total_lanes_before", "?"))))
@@ -3831,11 +5153,11 @@ def make_project_popup_html(project: ProjectRecord, builder: ProjectPeMSQueryBui
     sensor_html = ", ".join(sensor_links) if sensor_links else "None listed"
 
     return f"""
-    <div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 13px; line-height: 1.45; width: 330px; padding: 6px; color: #000; background: #fff;">
+    <div style="font-family: {MONO_FONT}; font-size: 12px; line-height: 1.45; width: 330px; padding: 6px; color: #000; background: #fff;">
       <div style="border-bottom: 1px solid #000; padding-bottom: 4px; margin-bottom: 6px;">
-        <div style="font-size: 12px; font-weight: bold; text-transform: uppercase;">District {html.escape(project.dist)} &middot; {facility}</div>
-        <h3 style="margin: 4px 0 2px; font-size: 15px; font-weight: bold; color: #000;">PID {html.escape(project.project_id)} &middot; Route {html.escape(project.route)} {html.escape(project.direction)}</h3>
-        <div style="font-size: 12px; color: #333;">{html.escape(project.county)} County &middot; Area: {area_type}</div>
+        <div style="font-size: 11px; font-weight: bold; text-transform: uppercase;">District {html.escape(project.dist)} &middot; {facility}</div>
+        <h3 style="margin: 4px 0 2px; font-size: 14px; font-weight: bold; color: #000;">PID {html.escape(project.project_id)} &middot; Route {html.escape(project.route)} {html.escape(project.direction)}</h3>
+        <div style="font-size: 11px; color: #333;">{html.escape(project.county)} County &middot; Area: {area_type}</div>
       </div>
 
       <table style="width: 100%; font-size: 12px; margin-bottom: 8px; border-collapse: collapse; border: 1px solid #666;">
@@ -3974,8 +5296,8 @@ def make_station_tooltip_html(
     lanes_str = f"{station.lanes}" if station.lanes else "N/A"
     len_str = f"{station.length:.2f} mi" if station.length else "N/A"
 
-    return f"""<div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 12px; line-height: 1.4; padding: 4px; min-width: 240px; color: #000; background: #fff;">
-  <div style="font-weight: bold; font-size: 12.5px; border-bottom: 1px solid #000; padding-bottom: 3px; margin-bottom: 4px;">
+    return f"""<div style="font-family: {MONO_FONT}; font-size: 11.5px; line-height: 1.4; padding: 4px; min-width: 240px; color: #000; background: #fff;">
+  <div style="font-weight: bold; font-size: 12px; border-bottom: 1px solid #000; padding-bottom: 3px; margin-bottom: 4px;">
     {status_badge}
   </div>
   <div><strong>Station ID:</strong> {station.id} &nbsp;({station.type} · {type_name})</div>
@@ -3997,7 +5319,7 @@ def make_station_popup_html(
     is_in_sheet: bool = False,
     delta_mi: Optional[float] = None
 ) -> str:
-    """Build detailed serif click popup HTML with PeMS links and ground-truth corridor context."""
+    """Build detailed click popup HTML with PeMS links and ground-truth corridor context."""
     type_name = STATION_TYPE_NAMES.get(station.type, station.type)
     summary_url = build_station_summary_url(station.id)
 
@@ -4036,7 +5358,7 @@ def make_station_popup_html(
     proj_html = ""
     if project:
         proj_html = f"""
-  <div style="margin-top: 5px; padding: 4px; border: 1px solid #ccc; background: #fdfdfd; font-size: 11.5px;">
+  <div style="margin-top: 5px; padding: 4px; border: 1px solid #ccc; background: #fdfdfd; font-size: 11px;">
     <strong>Corridor Context (PID {project.project_id}):</strong><br>
     Route {project.route} {project.direction} · PM {project.begin_pm} &rarr; {project.end_pm}<br>
     {bound_html}
@@ -4044,8 +5366,8 @@ def make_station_popup_html(
   </div>
 """
 
-    return f"""<div style="font-family: Georgia, 'Times New Roman', Times, serif; font-size: 12px; line-height: 1.4; padding: 6px; min-width: 280px; max-width: 370px; color: #000;">
-  <div style="font-weight: bold; font-size: 13.5px; border-bottom: 1px solid #000; padding-bottom: 4px; margin-bottom: 6px;">
+    return f"""<div style="font-family: {MONO_FONT}; font-size: 11.5px; line-height: 1.4; padding: 6px; min-width: 280px; max-width: 370px; color: #000; background: #fff; border: 1px solid #000;">
+  <div style="font-weight: bold; font-size: 12.5px; border-bottom: 1px solid #000; padding-bottom: 4px; margin-bottom: 6px;">
     Station {station.id} · {station.type} ({type_name})
   </div>
   <div><strong>Location:</strong> {station.name or 'N/A'}</div>
@@ -4055,7 +5377,7 @@ def make_station_popup_html(
   {f'<div><strong>Absolute Postmile:</strong> {station.abs_pm:.3f}</div>' if station.abs_pm is not None else ''}
   <div><strong>Lanes:</strong> {station.lanes or 'N/A'} &nbsp;|&nbsp; <strong>Detector Length:</strong> {f'{station.length:.3f} mi' if station.length else 'N/A'}</div>
   {proj_html}
-  <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #000; font-size: 11.5px;">
+  <div style="margin-top: 6px; padding-top: 4px; border-top: 1px solid #000; font-size: 11px;">
     <a href="{summary_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">[PeMS Station Summary]</a>
     &nbsp;&nbsp;
     <a href="{aadt_url}" target="_blank" style="color: #0000ee; text-decoration: underline;">[AADT Export ({s_yr}-{e_yr})]</a>
@@ -4074,7 +5396,7 @@ def add_ground_truth_control(
     sheet_sensors_verified: int,
     discrepancies_count: int = 0
 ) -> None:
-    """Add a bare-bones serif Ground-Truth Checker toolbar and styling to the Folium map."""
+    """Add a utilitarian monospaced Ground-Truth Checker toolbar and styling to the Folium map."""
     discrepancy_str = f" · <span style='color: #dc2626; font-weight: bold;'>{discrepancies_count} out-of-range</span>" if discrepancies_count > 0 else ""
     gt_box_html = f"""
 <div id="pems-ground-truth-control" style="
@@ -4085,28 +5407,28 @@ def add_ground_truth_control(
   background: #ffffff;
   border: 1px solid #000000;
   padding: 8px 12px;
-  font-family: Georgia, 'Times New Roman', Times, serif;
-  font-size: 12px;
+  font-family: {MONO_FONT};
+  font-size: 11.5px;
   line-height: 1.4;
   color: #000000;
   max-width: 340px;
   box-shadow: none;
 ">
-  <div style="font-weight: bold; font-size: 13px; border-bottom: 1px solid #000; padding-bottom: 3px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+  <div style="font-weight: bold; font-size: 12px; border-bottom: 1px solid #000; padding-bottom: 3px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
     <span>PeMS Ground-Truth Checker</span>
-    <button onclick="toggleGroundTruthPanel(this)" style="font-family: Georgia, serif; font-size: 11px; background: transparent; border: 1px solid #000; padding: 1px 5px; cursor: pointer;">[–]</button>
+    <button onclick="toggleGroundTruthPanel(this)" style="font-family: inherit; font-size: 11px; background: transparent; border: 1px solid #000; padding: 1px 5px; cursor: pointer;">[–]</button>
   </div>
   <div id="pems-gt-content">
-    <div style="margin-bottom: 6px; font-size: 11.5px; color: #222;">
+    <div style="margin-bottom: 6px; font-size: 11px; color: #222;">
       <strong>Project {project.project_id}:</strong> Route {project.route} {project.direction} (PM {project.begin_pm} &rarr; {project.end_pm})<br>
       <strong>Corridor Detectors:</strong> <b>{in_bounds_count}</b> in bounds · {oob_count} buffer<br>
       <strong>Master Sheet:</strong> <b>{sheet_sensors_verified}/{sheet_sensors_total}</b> verified in corridor{discrepancy_str}
     </div>
     <div style="margin-bottom: 6px; padding-top: 4px; border-top: 1px dotted #888;">
-      <button id="pems-oob-btn" onclick="toggleInBoundsOnly(this)" style="font-family: Georgia, serif; background: #f4f4f4; border: 1px solid #000; font-size: 11px; padding: 2px 7px; cursor: pointer; margin-right: 5px;">
+      <button id="pems-oob-btn" onclick="toggleInBoundsOnly(this)" style="font-family: inherit; background: #ffffff; border: 1px solid #000; font-size: 11px; padding: 2px 7px; cursor: pointer; margin-right: 5px;">
         In-Bounds Only: OFF
       </button>
-      <button onclick="toggleAllStationLayers(this)" style="font-family: Georgia, serif; background: #f4f4f4; border: 1px solid #000; font-size: 11px; padding: 2px 7px; cursor: pointer;">
+      <button onclick="toggleAllStationLayers(this)" style="font-family: inherit; background: #ffffff; border: 1px solid #000; font-size: 11px; padding: 2px 7px; cursor: pointer;">
         Toggle All Stations
       </button>
     </div>
@@ -4251,7 +5573,7 @@ def add_standard_basemaps_to_map(
 
 
 def build_single_project_map(
-    target_pid: str,
+    target_pid: Union[str, ProjectRecord],
     projects: Optional[List[ProjectRecord]] = None,
     output_path: Optional[str] = None,
     open_browser: bool = False,
@@ -4260,12 +5582,18 @@ def build_single_project_map(
     station_buffer_mi: float = 3.0,
     station_types: Optional[Tuple[str, ...]] = None,
     vds_metadata: Optional[IndexedVDSMetadata] = None,
+    metadata_dir: Optional[str] = None,
 ) -> Optional[folium.Map]:
     """
     Build a folium map for a single project (or both directions if split) with
     highway path, start/end markers, corridor station detector layers partitioned by type,
     rich hover tooltips, and an interactive ground-truth checker toolbar.
     """
+    if isinstance(target_pid, ProjectRecord):
+        if projects is None:
+            projects = [target_pid]
+        target_pid = target_pid.project_id
+
     projs = projects or load_master_csv()
     matched = [p for p in projs if p.project_id == str(target_pid).strip()]
     if not matched:
@@ -4328,6 +5656,12 @@ def build_single_project_map(
 
     if include_stations:
         vds = vds_metadata
+        if vds is None and metadata_dir is not None:
+            try:
+                vds = load_vds_metadata(metadata_dir)
+            except Exception as exc:
+                LOGGER.warning(f"Could not load PeMS VDS metadata from {metadata_dir}: {exc}")
+                vds = None
         if vds is None:
             try:
                 vds = get_indexed_vds_metadata()
@@ -4482,7 +5816,7 @@ def build_single_project_map(
     m.get_root().header.add_child(folium.Element("""
 <style>
   body, .leaflet-container, .leaflet-popup-content, .leaflet-control-layers, .leaflet-tooltip {
-    font-family: Georgia, 'Times New Roman', Times, serif !important;
+    font-family: "Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace !important;
   }
   .leaflet-popup-content-wrapper {
     border-radius: 0px !important;
@@ -4685,7 +6019,7 @@ def build_multi_project_map(
                     fill_color = STATION_TYPE_COLORS.get(st.type, "#2563eb")
                     pid_str = ", ".join(pids) if pids else "Corridor"
                     type_name = STATION_TYPE_NAMES.get(st.type, st.type)
-                    tt_html = f"""<div style="font-family: Georgia, serif; font-size: 12px; line-height: 1.35; padding: 3px; min-width: 200px; color: #000; background: #fff;">
+                    tt_html = f"""<div style="font-family: {MONO_FONT}; font-size: 11.5px; line-height: 1.35; padding: 3px; min-width: 200px; color: #000; background: #fff;">
   <div style="font-weight: bold; border-bottom: 1px solid #000; padding-bottom: 2px; margin-bottom: 3px;">Station {st.id} ({st.type} - {type_name})</div>
   <div><strong>Name:</strong> {st.name or 'N/A'}</div>
   <div><strong>Route:</strong> Route {st.fwy} {st.dir} · PM {st.state_pm}</div>
@@ -4723,7 +6057,7 @@ def build_multi_project_map(
     m.get_root().header.add_child(folium.Element("""
 <style>
   body, .leaflet-container, .leaflet-popup-content, .leaflet-control-layers, .leaflet-tooltip {
-    font-family: Georgia, 'Times New Roman', Times, serif !important;
+    font-family: "Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace !important;
   }
   .leaflet-popup-content-wrapper {
     border-radius: 0px !important;
@@ -4753,38 +6087,75 @@ def build_multi_project_map(
 # ---------------------------------------------------------------------------
 # HISTORICAL SATELLITE IMAGERY INTEGRATION (WAYBACK)
 # ---------------------------------------------------------------------------
-def _parse_project_date(val: Any, default_month: int = 1, default_day: int = 1) -> Optional[datetime.date]:
-    """Parse a date string, datetime object, or 4-digit year into a datetime.date."""
-    if val is None or pd.isna(val):
-        return None
-    if isinstance(val, (datetime.date, datetime.datetime)):
-        return val if isinstance(val, datetime.date) else val.date()
-    s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "nat"):
-        return None
-    # 1. ISO format YYYY-MM-DD
-    try:
-        return datetime.date.fromisoformat(s)
-    except ValueError:
-        pass
-    # 2. Common formats
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%m-%d-%Y", "%d-%b-%Y"):
-        try:
-            return datetime.datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    # 3. Year only: e.g. "2019" or "2019.0"
-    match = re.match(r"^(\d{4})", s)
-    if match:
-        yr = int(match.group(1))
-        if 1950 <= yr <= 2035:
-            return datetime.date(yr, default_month, default_day)
-    return None
+def calculate_corridor_curvature_bounds(
+    start_coords: Tuple[float, float],
+    end_coords: Tuple[float, float],
+    intermediate_coords: Sequence[Tuple[float, float]]
+) -> Tuple[float, float, float, float, float]:
+    """
+    Calculate lateral (perpendicular) deviation metrics in meters of intermediate roadway
+    centerline points from the straight chord between endpoints.
+    Returns:
+      (min_dev, max_dev, max_abs_dev, lateral_shift, lateral_half_span)
+      where:
+        - min_dev: minimum signed lateral offset (negative = left of travel)
+        - max_dev: maximum signed lateral offset (positive = right of travel)
+        - max_abs_dev: max(abs(min_dev), abs(max_dev))
+        - lateral_shift: (min_dev + max_dev) / 2 (offset to center of roadway curve)
+        - lateral_half_span: (max_dev - min_dev) / 2 (half-width required to encompass curve)
+    """
+    if not intermediate_coords or len(intermediate_coords) <= 2:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    lat0, lon0 = start_coords
+    lat1, lon1 = end_coords
+    mid_lat = (lat0 + lat1) / 2.0
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * math.cos(math.radians(mid_lat))
+
+    vx = (lon1 - lon0) * m_per_deg_lon
+    vy = (lat1 - lat0) * m_per_deg_lat
+    chord_len = math.hypot(vx, vy)
+    if chord_len < 1e-3:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # Perpendicular unit normal vector
+    nx = -vy / chord_len
+    ny = vx / chord_len
+
+    signed_devs = [0.0]  # endpoints have 0 lateral offset
+    for lat_k, lon_k in intermediate_coords:
+        dx = (lon_k - lon0) * m_per_deg_lon
+        dy = (lat_k - lat0) * m_per_deg_lat
+        dev = dx * nx + dy * ny
+        signed_devs.append(dev)
+
+    min_dev = min(signed_devs)
+    max_dev = max(signed_devs)
+    max_abs_dev = max(abs(min_dev), abs(max_dev))
+    lateral_shift = (min_dev + max_dev) / 2.0
+    lateral_half_span = (max_dev - min_dev) / 2.0
+
+    return min_dev, max_dev, max_abs_dev, lateral_shift, lateral_half_span
+
+
+def calculate_corridor_curvature_deviation(
+    start_coords: Tuple[float, float],
+    end_coords: Tuple[float, float],
+    intermediate_coords: Sequence[Tuple[float, float]]
+) -> float:
+    """
+    Calculate the maximum lateral (perpendicular) deviation in meters
+    of intermediate roadway centerline points from the straight chord between endpoints.
+    Used to dynamically expand imagery bounding box swath so curved roads are never cropped out.
+    """
+    _, _, max_abs_dev, _, _ = calculate_corridor_curvature_bounds(start_coords, end_coords, intermediate_coords)
+    return max_abs_dev
 
 
 def slice_project_corridor(
     project: ProjectRecord,
-    slice_mi: float = 0.4,
+    slice_mi: float = 0.25,
     idx_ref: Optional[IndexedGeoReference] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -4796,6 +6167,8 @@ def slice_project_corridor(
       - 'start_coords': (lat, lon)
       - 'end_coords': (lat, lon)
       - 'length_mi': float
+      - 'curvature_dev_m': float
+      - 'coords': list of (lat, lon) points
     """
     ref = idx_ref if idx_ref is not None else get_indexed_geo_ref()
     sub = ref.get_corridor(project.route, project.pems_direction)
@@ -4851,15 +6224,28 @@ def slice_project_corridor(
             length = round(abs(float(p1[pm_col]) - float(p0[pm_col])), 2)
             if length == 0:
                 length = round(0.1 * (j - i), 2)
+
+            sub_pts = pts.iloc[i : j + 1]
+            sub_coords = [(float(r["_lat"]), float(r["_lng"])) for _, r in sub_pts.iterrows()]
+            start_c = (float(p0["_lat"]), float(p0["_lng"]))
+            end_c = (float(p1["_lat"]), float(p1["_lng"]))
+            min_dev, max_dev, max_abs_dev, lat_shift, lat_hspan = calculate_corridor_curvature_bounds(
+                start_c, end_c, sub_coords
+            )
+
             slices.append({
                 "index": len(slices) + 1,
                 "start_pm": round(s_pm, 2),
                 "end_pm": round(e_pm_val, 2),
                 "abs_start_pm": round(float(p0["_abs_pm"]), 2) if "_abs_pm" in p0 and pd.notna(p0["_abs_pm"]) else None,
                 "abs_end_pm": round(float(p1["_abs_pm"]), 2) if "_abs_pm" in p1 and pd.notna(p1["_abs_pm"]) else None,
-                "start_coords": (float(p0["_lat"]), float(p0["_lng"])),
-                "end_coords": (float(p1["_lat"]), float(p1["_lng"])),
-                "length_mi": length
+                "start_coords": start_c,
+                "end_coords": end_c,
+                "length_mi": length,
+                "curvature_dev_m": round(max_abs_dev, 2),
+                "lateral_shift_m": round(lat_shift, 2),
+                "lateral_half_span_m": round(lat_hspan, 2),
+                "coords": sub_coords,
             })
     else:
         # Fallback to endpoints
@@ -4890,7 +6276,9 @@ def slice_project_corridor(
                     "end_pm": round(e_pm_val, 2),
                     "start_coords": s_coords,
                     "end_coords": e_coords,
-                    "length_mi": round(abs(e_pm_val - s_pm), 2)
+                    "length_mi": round(abs(e_pm_val - s_pm), 2),
+                    "curvature_dev_m": 0.0,
+                    "coords": [s_coords, e_coords],
                 })
 
     return slices
@@ -4908,6 +6296,7 @@ def create_stacked_slice_image(
 ) -> str:
     """
     Combine Before and After highway corridor strips into a single pixel-locked, vertically stacked comparison PNG.
+    Utilitarian black-on-white layout with clear roadway metrics and high contrast.
     """
     from PIL import Image, ImageDraw
     import wayback_imagery.core as wayback
@@ -4916,51 +6305,54 @@ def create_stacked_slice_image(
     img_a = Image.open(after_img_path)
 
     w = max(img_b.width, img_a.width)
-    header_h = 76
-    divider_h = 32
-    footer_h = 36
+    header_h = 72
+    divider_h = 28
+    footer_h = 32
     total_h = header_h + img_b.height + divider_h + img_a.height + footer_h
 
-    canvas = Image.new("RGB", (w, total_h), (24, 24, 27))
+    canvas = Image.new("RGB", (w, total_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    font_lg = wayback._load_font(max(15, min(24, w // 80)))
-    font_sm = wayback._load_font(max(11, min(16, w // 120)))
+    font_lg = wayback._load_font(max(14, min(22, w // 80)))
+    font_sm = wayback._load_font(max(11, min(15, w // 120)))
 
     # Header
     title = f"PROJECT {project.project_id} | ROUTE {project.route} {project.direction} | SEGMENT {slice_info['index']}: PM {slice_info['start_pm']:.2f} -> {slice_info['end_pm']:.2f} ({slice_info['length_mi']:.2f} mi)"
-    subtitle = f"County: {project.county} | District: {project.dist} | Native Zoom {zoom} (~0.3m/px resolution) | Highway runs Left to Right"
-    draw.text((24, 16), title, fill=(255, 255, 255), font=font_lg)
-    draw.text((24, 46), subtitle, fill=(161, 161, 170), font=font_sm)
+    subtitle = f"County: {project.county} | District: {project.dist} | Native Zoom {zoom} (~0.3m/px) | Corridor runs Left to Right"
+    draw.text((20, 14), title, fill=(0, 0, 0), font=font_lg)
+    draw.text((20, 42), subtitle, fill=(80, 80, 80), font=font_sm)
+    draw.line([(0, header_h - 1), (w, header_h - 1)], fill=(0, 0, 0), width=1)
 
     # Paste Before
     canvas.paste(img_b, (0, header_h))
 
     # Before Badge
-    b_badge = f"▲ BEFORE (Pre-Construction) | Flight: {before_capture_date or 'Unknown'}"
-    draw.rectangle([(20, header_h + 14), (20 + int(font_sm.getlength(b_badge)) + 20, header_h + 40)], fill=(0, 0, 0))
-    draw.text((30, header_h + 19), b_badge, fill=(56, 189, 248), font=font_sm)
+    b_badge = f"BEFORE (Pre-Construction) | Flight: {before_capture_date or 'Unknown'}"
+    badge_w = int(font_sm.getlength(b_badge)) + 24
+    draw.rectangle([(16, header_h + 12), (16 + badge_w, header_h + 36)], fill=(255, 255, 255), outline=(0, 0, 0), width=1)
+    draw.text((26, header_h + 16), b_badge, fill=(0, 0, 0), font=font_sm)
 
     # Divider bar
     y_div = header_h + img_b.height
-    draw.rectangle([(0, y_div), (w, y_div + divider_h)], fill=(39, 39, 42))
-    div_text = f"▲ BEFORE (Pre-Construction)   |   ▼ AFTER (Post-Opening)   [Aligned Roadway Strip: {slice_info['length_mi']:.2f} mi]"
-    draw.text((24, y_div + 8), div_text, fill=(212, 212, 216), font=font_sm)
+    draw.rectangle([(0, y_div), (w, y_div + divider_h)], fill=(240, 240, 240), outline=(0, 0, 0), width=1)
+    div_text = f"BEFORE (Pre-Construction)  /  AFTER (Post-Opening)  [Roadway Strip: {slice_info['length_mi']:.2f} mi]"
+    draw.text((20, y_div + 6), div_text, fill=(0, 0, 0), font=font_sm)
 
     # Paste After
     canvas.paste(img_a, (0, y_div + divider_h))
 
     # After Badge
     y_after = y_div + divider_h
-    a_badge = f"▼ AFTER (Post-Opening) | Flight: {after_capture_date or 'Unknown'}"
-    draw.rectangle([(20, y_after + 14), (20 + int(font_sm.getlength(a_badge)) + 20, y_after + 40)], fill=(0, 0, 0))
-    draw.text((30, y_after + 19), a_badge, fill=(74, 222, 128), font=font_sm)
+    a_badge = f"AFTER (Post-Opening) | Flight: {after_capture_date or 'Unknown'}"
+    badge_w_a = int(font_sm.getlength(a_badge)) + 24
+    draw.rectangle([(16, y_after + 12), (16 + badge_w_a, y_after + 36)], fill=(255, 255, 255), outline=(0, 0, 0), width=1)
+    draw.text((26, y_after + 16), a_badge, fill=(0, 0, 0), font=font_sm)
 
     # Footer
     y_foot = total_h - footer_h
-    draw.rectangle([(0, y_foot), (w, total_h)], fill=(18, 18, 20))
-    foot_text = "Source: Esri World Imagery Wayback Archive | UCD CERCET Highway Capacity Expansion Project Tool"
-    draw.text((24, y_foot + 10), foot_text, fill=(113, 113, 122), font=font_sm)
+    draw.rectangle([(0, y_foot), (w, total_h)], fill=(248, 248, 248), outline=(0, 0, 0), width=1)
+    foot_text = "Source: Esri World Imagery Wayback Archive | UCD CERCET Highway Capacity Expansion Project Analysis"
+    draw.text((20, y_foot + 8), foot_text, fill=(80, 80, 80), font=font_sm)
 
     canvas.save(out_path, quality=95)
     return out_path
@@ -4976,6 +6368,7 @@ def generate_slices_html_report(
 ) -> str:
     """
     Generate a self-contained, interactive HTML comparison report with Before/After curtain wipe sliders.
+    Utilitarian, monospaced, white-background layout designed for rapid data-first engineering analysis.
     """
     html_path = os.path.join(output_dir, "index.html")
 
@@ -4992,20 +6385,25 @@ def generate_slices_html_report(
 
         sensors_callout = ""
         if s.get("sensors"):
-            sensor_badges = "".join(
-                f'<span class="sensor-pill">&#128205; Sensor #{st["id"]} ({st["type"]}) PM {st["pm"]}</span>'
+            sensor_rows = "".join(
+                f'<tr><td>{html.escape(str(st["id"]))}</td><td>{html.escape(str(st["type"]))}</td><td>PM {st["pm"]}</td><td>{html.escape(str(st["lanes"]))}</td></tr>'
                 for st in s["sensors"]
             )
-            sensors_callout = f'<div class="sensor-row">{sensor_badges}</div>'
+            sensors_callout = f"""
+            <table class="sensor-table">
+              <thead><tr><th>Sensor ID</th><th>Type</th><th>Postmile</th><th>Lanes</th></tr></thead>
+              <tbody>{sensor_rows}</tbody>
+            </table>
+            """
 
         bearing_str = f"{s.get('bearing', 0):.0f}&deg;" if s.get('bearing') is not None else ""
 
         card = f"""
-        <div class="segment-card" id="seg-{idx}">
+        <div class="segment-section" id="seg-{idx}">
           <div class="segment-header">
             <div class="segment-title-group">
-              <span class="seg-badge">Segment {idx} of {len(slices_data)}</span>
-              <h2 class="seg-title">{s_pm_str} ({s['length_mi']:.2f} miles)</h2>
+              <span class="seg-idx">[Segment {idx} of {len(slices_data)}]</span>
+              <span class="seg-title">{s_pm_str} ({s['length_mi']:.2f} mi)</span>
               {f'<span class="seg-bearing">Heading {bearing_str}</span>' if bearing_str else ''}
             </div>
             <div class="view-toggles" data-seg="{idx}">
@@ -5025,10 +6423,8 @@ def generate_slices_html_report(
               <div class="slider-divider">
                 <div class="slider-thumb">&#8596;</div>
               </div>
-              <div class="badge-overlay badge-left">BEFORE: {s['before_capture_date']}</div>
-              <div class="badge-overlay badge-right">AFTER: {s['after_capture_date']}</div>
             </div>
-            <div class="slider-hint">&#9664; Drag slider to wipe between Pre-Construction and Post-Opening imagery &#9654;</div>
+            <div class="slider-hint">&lt; Drag slider to wipe between Pre-Construction and Post-Opening imagery &gt;</div>
           </div>
 
           <!-- View: Vertically Stacked -->
@@ -5040,29 +6436,24 @@ def generate_slices_html_report(
           <div class="view-panel panel-split" id="panel-split-{idx}">
             <div class="split-grid">
               <div class="split-col">
-                <div class="col-tag tag-before">BEFORE: {s['before_capture_date']}</div>
+                <div class="col-tag">BEFORE: {s['before_capture_date']}</div>
                 <img src="{b_fn}" class="split-img" alt="Before" loading="lazy">
               </div>
               <div class="split-col">
-                <div class="col-tag tag-after">AFTER: {s['after_capture_date']}</div>
+                <div class="col-tag">AFTER: {s['after_capture_date']}</div>
                 <img src="{a_fn}" class="split-img" alt="After" loading="lazy">
               </div>
             </div>
           </div>
 
           <div class="segment-footer">
-            <span class="meta-note">Resolution: Native Zoom {s.get('zoom', 19)} (~0.3m/px) | Dimensions: {s.get('width', 0)}&times;{s.get('height', 0)} px</span>
-            <div class="actions">
-              <a href="{st_fn}" target="_blank" class="action-link">&#129125; Open Stacked Image</a>
-              <a href="{b_fn}" target="_blank" class="action-link">&#128065; Before Strip</a>
-              <a href="{a_fn}" target="_blank" class="action-link">&#128065; After Strip</a>
-            </div>
+            <span class="meta-note">Resolution: Native Zoom {s.get('zoom', 19)} (~0.3m/px) | Dimensions: {s.get('width', 0)}&times;{s.get('height', 0)} px | <a href="{st_fn}" target="_blank" style="color: #000; text-decoration: underline;">[View Full Stacked PNG]</a></span>
           </div>
         </div>
         """
         cards_html.append(card)
 
-    nav_chips_html = "".join(nav_links)
+    nav_chips_html = " ".join(nav_links)
     all_cards_html = "\n".join(cards_html)
 
     overview_html = ""
@@ -5081,223 +6472,169 @@ def generate_slices_html_report(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Project {project.project_id} - Roadway Geometry Historical Comparison</title>
   <style>
-    :root {{
-      --bg: #09090b;
-      --card-bg: #18181b;
-      --border: #27272a;
-      --border-focus: #3f3f46;
-      --text: #f4f4f5;
-      --text-muted: #a1a1aa;
-      --before-accent: #38bdf8;
-      --after-accent: #4ade80;
-    }}
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; box-shadow: none !important; }}
     body {{
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      line-height: 1.5;
-      padding-bottom: 80px;
+      background: #ffffff;
+      color: #000000;
+      font-family: "Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      padding-bottom: 60px;
     }}
     header {{
-      background: #111114;
-      border-bottom: 1px solid var(--border);
-      position: sticky;
-      top: 0;
-      z-index: 100;
-      padding: 16px 24px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      background: #ffffff;
+      border-bottom: 2px solid #000000;
+      padding: 14px 20px;
     }}
     .header-content {{
       max-width: 1400px;
       margin: 0 auto;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 16px;
     }}
-    .title-area h1 {{
-      font-size: 1.25rem;
-      font-weight: 700;
-      color: #fff;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }}
-    .badge-pid {{
-      background: #2563eb;
-      color: #fff;
-      font-size: 0.8rem;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-weight: 600;
+    h1 {{
+      font-size: 16px;
+      font-weight: bold;
+      color: #000000;
+      margin-bottom: 4px;
     }}
     .subtitle {{
-      font-size: 0.85rem;
-      color: var(--text-muted);
-      margin-top: 2px;
-    }}
-    .global-controls {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-    }}
-    .global-btn {{
-      background: #27272a;
-      border: 1px solid var(--border-focus);
-      color: var(--text);
-      padding: 6px 12px;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      cursor: pointer;
-      transition: background 0.15s;
-    }}
-    .global-btn:hover {{
-      background: #3f3f46;
+      font-size: 12px;
+      color: #333333;
     }}
     .nav-bar {{
       max-width: 1400px;
-      margin: 16px auto 0 auto;
-      padding: 0 24px;
+      margin: 12px auto 0 auto;
+      padding: 0 20px;
       display: flex;
-      gap: 8px;
+      gap: 6px;
       overflow-x: auto;
-      padding-bottom: 8px;
+      font-size: 11px;
     }}
     .nav-chip {{
-      background: #1f1f23;
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-      padding: 4px 10px;
-      border-radius: 9999px;
-      font-size: 0.75rem;
+      background: #ffffff;
+      border: 1px solid #000000;
+      color: #000000;
+      padding: 2px 6px;
       text-decoration: none;
       white-space: nowrap;
-      transition: color 0.15s, border-color 0.15s;
     }}
     .nav-chip:hover {{
-      color: #fff;
-      border-color: #52525b;
+      background: #000000;
+      color: #ffffff;
     }}
     .container {{
       max-width: 1400px;
-      margin: 24px auto;
-      padding: 0 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 32px;
+      margin: 16px auto;
+      padding: 0 20px;
     }}
-    .info-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px 20px;
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid #000000;
+      margin-bottom: 14px;
+      background: #ffffff;
+      font-size: 12px;
     }}
-    .info-card h4 {{
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
+    th, td {{
+      border: 1px solid #000000;
+      padding: 5px 8px;
+      text-align: left;
     }}
-    .info-card p {{
-      font-size: 0.95rem;
-      font-weight: 600;
-      color: #fff;
-      margin-top: 4px;
+    th {{
+      background: #f0f0f0;
+      font-weight: bold;
     }}
-    .segment-card {{
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      overflow: hidden;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+    .project-desc-box {{
+      border: 1px solid #000000;
+      padding: 8px 12px;
+      margin-bottom: 20px;
+      background: #ffffff;
+      font-size: 12px;
+    }}
+    .overview-section {{
+      border-bottom: 1px solid #000000;
+      padding-bottom: 20px;
+      margin-bottom: 24px;
+    }}
+    .overview-section h3 {{
+      font-size: 13px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }}
+    .overview-img {{
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid #000000;
+    }}
+    .segment-section {{
+      border-bottom: 1px solid #000000;
+      padding-bottom: 24px;
+      margin-bottom: 28px;
     }}
     .segment-header {{
-      padding: 16px 20px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+      margin-bottom: 8px;
+      border-bottom: 1px solid #cccccc;
       flex-wrap: wrap;
-      gap: 12px;
+      gap: 8px;
     }}
     .segment-title-group {{
       display: flex;
       align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }}
-    .seg-badge {{
-      background: #27272a;
-      border: 1px solid var(--border-focus);
-      color: #e4e4e7;
-      font-size: 0.75rem;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-weight: 600;
-    }}
-    .seg-title {{
-      font-size: 1.05rem;
-      font-weight: 600;
-      color: #fff;
-    }}
-    .seg-bearing {{
-      font-size: 0.8rem;
-      color: var(--text-muted);
-    }}
-    .sensor-row {{
-      padding: 10px 20px;
-      background: #121215;
-      border-bottom: 1px solid var(--border);
-      display: flex;
       gap: 10px;
       flex-wrap: wrap;
     }}
-    .sensor-pill {{
-      background: #7c2d12;
-      color: #fed7aa;
-      font-size: 0.75rem;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-weight: 500;
+    .seg-idx {{
+      font-weight: bold;
+    }}
+    .seg-title {{
+      font-weight: bold;
+    }}
+    .seg-bearing {{
+      font-size: 11px;
+      color: #555555;
+    }}
+    .sensor-table {{
+      margin: 8px 0;
+      width: auto;
     }}
     .view-toggles {{
       display: flex;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      overflow: hidden;
+      gap: 4px;
     }}
     .toggle-btn {{
-      background: #18181b;
-      border: none;
-      color: var(--text-muted);
-      padding: 6px 12px;
-      font-size: 0.75rem;
+      background: #ffffff;
+      border: 1px solid #000000;
+      color: #000000;
+      padding: 3px 8px;
+      font-family: inherit;
+      font-size: 11px;
       cursor: pointer;
-      transition: background 0.15s, color 0.15s;
     }}
     .toggle-btn.active {{
-      background: #3f3f46;
-      color: #fff;
-      font-weight: 600;
+      background: #000000;
+      color: #ffffff;
+      font-weight: bold;
     }}
-    .view-panel {{ display: none; padding: 20px; background: #0c0c0e; }}
-    .view-panel.active {{ display: block; }}
-    
-    /* Curtain Slider Component */
+    .view-panel {{
+      display: none;
+      padding: 8px 0;
+      background: #ffffff;
+    }}
+    .view-panel.active {{
+      display: block;
+    }}
     .compare-box {{
       position: relative;
       width: 100%;
       overflow: hidden;
-      border-radius: 6px;
-      border: 1px solid var(--border);
+      border: 1px solid #000000;
       user-select: none;
       cursor: ew-resize;
-      background: #000;
+      background: #ffffff;
       line-height: 0;
     }}
     .img-base {{
@@ -5323,7 +6660,6 @@ def generate_slices_html_report(
       left: 50%;
       width: 2px;
       background: #ffffff;
-      box-shadow: 0 0 8px rgba(0,0,0,0.8);
       pointer-events: none;
     }}
     .slider-thumb {{
@@ -5331,98 +6667,53 @@ def generate_slices_html_report(
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
-      width: 28px;
-      height: 28px;
+      width: 24px;
+      height: 24px;
       background: #ffffff;
-      color: #000;
-      border-radius: 50%;
+      color: #000000;
+      border: 1px solid #000000;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 14px;
-      font-weight: 700;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
-    }}
-    .badge-overlay {{
-      position: absolute;
-      top: 14px;
-      padding: 4px 10px;
-      border-radius: 4px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      pointer-events: none;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.6);
-      line-height: 1.2;
-    }}
-    .badge-left {{
-      left: 14px;
-      background: rgba(14, 165, 233, 0.9);
-      color: #fff;
-    }}
-    .badge-right {{
-      right: 14px;
-      background: rgba(34, 197, 94, 0.9);
-      color: #000;
+      font-size: 12px;
+      font-weight: bold;
     }}
     .slider-hint {{
       text-align: center;
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      margin-top: 10px;
+      font-size: 11px;
+      color: #555555;
+      margin-top: 6px;
     }}
     .full-stacked-img {{
       display: block;
       width: 100%;
       height: auto;
-      border-radius: 6px;
-      border: 1px solid var(--border);
+      border: 1px solid #000000;
     }}
     .split-grid {{
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 16px;
+      gap: 12px;
     }}
     .split-col {{
       position: relative;
     }}
     .col-tag {{
-      font-size: 0.75rem;
-      font-weight: 600;
-      margin-bottom: 6px;
+      font-size: 11px;
+      font-weight: bold;
+      margin-bottom: 4px;
     }}
-    .tag-before {{ color: var(--before-accent); }}
-    .tag-after {{ color: var(--after-accent); }}
     .split-img {{
       display: block;
       width: 100%;
       height: auto;
-      border-radius: 6px;
-      border: 1px solid var(--border);
+      border: 1px solid #000000;
     }}
     .segment-footer {{
-      padding: 12px 20px;
-      background: #141417;
-      border-top: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
+      padding: 8px 0;
+      font-size: 11px;
+      color: #555555;
     }}
-    .meta-note {{
-      font-size: 0.75rem;
-      color: var(--text-muted);
-    }}
-    .actions {{
-      display: flex;
-      gap: 12px;
-    }}
-    .action-link {{
-      color: var(--before-accent);
-      font-size: 0.8rem;
-      text-decoration: none;
-    }}
-    .action-link:hover {{ text-decoration: underline; }}
   </style>
 </head>
 <body>
@@ -5430,14 +6721,8 @@ def generate_slices_html_report(
 <header>
   <div class="header-content">
     <div class="title-area">
-      <h1><span class="badge-pid">PID {project.project_id}</span> Route {project.route} {project.direction} Roadway Geometry Comparison</h1>
+      <h1>[PID {project.project_id}] Route {project.route} {project.direction} Roadway Geometry Comparison</h1>
       <div class="subtitle">{project.county} County (District {project.dist}) | Postmile Range: {project.begin_pm} &rarr; {project.end_pm}</div>
-      {f'<div class="header-desc" style="font-size: 0.82rem; color: #d4d4d8; margin-top: 5px; max-width: 900px; line-height: 1.4;"><strong>Description:</strong> {html.escape(project.project_description)}</div>' if project.project_description else ''}
-    </div>
-    <div class="global-controls">
-      <button class="global-btn" id="btn-all-slider">Wipe View (All)</button>
-      <button class="global-btn" id="btn-all-stacked">Stacked View (All)</button>
-      <button class="global-btn" id="btn-all-split">Side-by-Side (All)</button>
     </div>
   </div>
 </header>
@@ -5447,30 +6732,28 @@ def generate_slices_html_report(
 </div>
 
 <div class="container">
-  <div class="info-grid">
-    <div class="info-card">
-      <h4>Route & Corridor</h4>
-      <p>Route {project.route} {project.direction} ({project.county})</p>
-    </div>
-    <div class="info-card">
-      <h4>Postmile Range</h4>
-      <p>{project.begin_pm} &rarr; {project.end_pm}</p>
-    </div>
-    <div class="info-card">
-      <h4>Pre-Construction Target</h4>
-      <p>{project.construction_begin_date or 'N/A'}</p>
-    </div>
-    <div class="info-card">
-      <h4>Post-Opening Target</h4>
-      <p>{project.open_to_traffic_date or 'N/A'}</p>
-    </div>
-    <div class="info-card">
-      <h4>Total Slices</h4>
-      <p>{len(slices_data)} Segments (Zoom 19)</p>
-    </div>
-  </div>
+  <table class="project-info-table">
+    <thead>
+      <tr>
+        <th>Route &amp; Corridor</th>
+        <th>Postmile Range</th>
+        <th>Pre-Construction Target</th>
+        <th>Post-Opening Target</th>
+        <th>Total Slices</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Route {project.route} {project.direction} ({project.county})</td>
+        <td>{project.begin_pm} &rarr; {project.end_pm}</td>
+        <td>{project.construction_begin_date or 'N/A'}</td>
+        <td>{project.open_to_traffic_date or 'N/A'}</td>
+        <td>{len(slices_data)} Segments (Zoom 19)</td>
+      </tr>
+    </tbody>
+  </table>
 
-  {f'<div class="project-desc-box" style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px 20px; font-size: 0.88rem; color: #e4e4e7; line-height: 1.5;"><strong style="color: #fff;">Project Description:</strong> {html.escape(project.project_description)}</div>' if project.project_description else ''}
+  {f'<div class="project-desc-box"><strong>Project Description:</strong> {html.escape(project.project_description)}</div>' if project.project_description else ''}
 
   {overview_html}
 
@@ -5539,29 +6822,13 @@ def generate_slices_html_report(
         btn.classList.add('active');
         const viewMode = btn.getAttribute('data-view');
 
-        const card = document.getElementById(`seg-${{segIdx}}`);
-        card.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
-        const targetPanel = card.querySelector(`.panel-${{viewMode}}`);
+        const section = document.getElementById(`seg-${{segIdx}}`);
+        section.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
+        const targetPanel = section.querySelector(`.panel-${{viewMode}}`);
         if (targetPanel) targetPanel.classList.add('active');
       }});
     }});
   }});
-
-  // Global Controls
-  function setAllViews(mode) {{
-    document.querySelectorAll('.segment-card').forEach(card => {{
-      card.querySelectorAll('.toggle-btn').forEach(b => {{
-        b.classList.toggle('active', b.getAttribute('data-view') === mode);
-      }});
-      card.querySelectorAll('.view-panel').forEach(p => p.classList.remove('active'));
-      const target = card.querySelector(`.panel-${{mode}}`);
-      if (target) target.classList.add('active');
-    }});
-  }}
-
-  document.getElementById('btn-all-slider').addEventListener('click', () => setAllViews('slider'));
-  document.getElementById('btn-all-stacked').addEventListener('click', () => setAllViews('stacked'));
-  document.getElementById('btn-all-split').addEventListener('click', () => setAllViews('split'));
 </script>
 
 </body>
@@ -5576,9 +6843,9 @@ def generate_slices_html_report(
 
 def generate_corridor_slices(
     project_id: str,
-    slice_mi: float = 0.4,
+    slice_mi: float = 0.25,
     zoom: int = 19,
-    half_width_m: float = 40.0,
+    half_width_m: float = 110.0,
     output_dir: str = "downloads/imagery",
     master_csv_path: Optional[str] = None,
     custom_before_date: Optional[str] = None,
@@ -5631,9 +6898,19 @@ def generate_corridor_slices(
         print(f"  Output Directory:  {proj_dir}")
         print(f"  Target Zoom Level: Native Zoom {zoom} (~0.3m/px resolution)")
 
-    # 4. Resolve Target Dates
-    d_before = _parse_project_date(custom_before_date or proj.construction_begin_date or proj.start_year, 1, 1)
-    d_after = _parse_project_date(custom_after_date or proj.open_to_traffic_date or proj.end_year, 12, 31)
+    # 4. Resolve Target Dates directly from the 3 separate columns (year, month, day)
+    d_before = (
+        parse_iso_date(custom_before_date, 1, 1)
+        or build_date_from_parts(proj.raw_row.get("construction_begin_year"), proj.raw_row.get("construction_begin_month"), proj.raw_row.get("construction_begin_day"), default_month=1, default_day=1)
+        or parse_iso_date(proj.construction_begin_date, 1, 1)
+        or (datetime.date(proj.start_year, 1, 1) if proj.start_year else None)
+    )
+    d_after = (
+        parse_iso_date(custom_after_date, 12, 31)
+        or build_date_from_parts(proj.raw_row.get("open_traffic_year"), proj.raw_row.get("open_traffic_month"), proj.raw_row.get("open_traffic_day"), default_month=12, default_day=31)
+        or parse_iso_date(proj.open_to_traffic_date, 12, 31)
+        or (datetime.date(proj.end_year, 12, 31) if proj.end_year else None)
+    )
 
     if not d_before or not d_after:
         raise ValueError(f"Project {project_id} requires both construction date and open to traffic date.")
@@ -5695,10 +6972,45 @@ def generate_corridor_slices(
     slices_data = []
     for s in slices:
         idx = s["index"]
-        if verbose:
-            print(f"\n  [Slice {idx}/{len(slices)}] PM {s['start_pm']:.2f} -> {s['end_pm']:.2f} ({s['length_mi']:.2f} mi)...")
+        curv_dev = s.get("curvature_dev_m", 0.0)
+        lat_shift = s.get("lateral_shift_m", 0.0)
+        lat_hspan = s.get("lateral_half_span_m", 0.0)
 
-        geom = wayback.corridor_geometry(s["start_coords"], s["end_coords"], half_width_m=half_width_m, pad_m=20.0)
+        # Center bounding box laterally over curved roadway and ensure generous vertical height
+        # Default half_width_m is 110.0m to guarantee adequate vertical height (not too wide/narrow)
+        # and prevent road clipping on curves, ramps, shoulders, and multi-lane freeways.
+        slice_half_width = max(half_width_m, lat_hspan + 85.0)
+
+        # Apply lateral shift to start and end coordinates so corridor box is centered on the road curve
+        s_coords = s["start_coords"]
+        e_coords = s["end_coords"]
+        if abs(lat_shift) > 1.5:
+            lat0, lon0 = s_coords
+            lat1, lon1 = e_coords
+            mid_lat = (lat0 + lat1) / 2.0
+            m_per_deg_lat = 111320.0
+            m_per_deg_lon = 111320.0 * math.cos(math.radians(mid_lat))
+            vx = (lon1 - lon0) * m_per_deg_lon
+            vy = (lat1 - lat0) * m_per_deg_lat
+            chord_len = math.hypot(vx, vy)
+            if chord_len > 1e-3:
+                nx = -vy / chord_len
+                ny = vx / chord_len
+                dlon_shift = (lat_shift * nx) / m_per_deg_lon
+                dlat_shift = (lat_shift * ny) / m_per_deg_lat
+                s_coords = (lat0 + dlat_shift, lon0 + dlon_shift)
+                e_coords = (lat1 + dlat_shift, lon1 + dlon_shift)
+
+        if verbose:
+            curv_note = f" [curve dev: {curv_dev:.1f}m, shift: {lat_shift:.1f}m -> half-width: {slice_half_width:.1f}m]" if curv_dev > 5.0 else ""
+            print(f"\n  [Slice {idx}/{len(slices)}] PM {s['start_pm']:.2f} -> {s['end_pm']:.2f} ({s['length_mi']:.2f} mi){curv_note}...")
+
+        geom = wayback.corridor_geometry(
+            s_coords,
+            e_coords,
+            half_width_m=slice_half_width,
+            pad_m=40.0
+        )
         prefix = f"slice_{idx:02d}_PM{s['start_pm']:.2f}-{s['end_pm']:.2f}"
 
         # Raw Before Strip
@@ -5756,6 +7068,8 @@ def generate_corridor_slices(
             "before_capture_date": before_cap_str,
             "after_capture_date": after_cap_str,
             "zoom": zoom,
+            "half_width_m": slice_half_width,
+            "curvature_dev_m": curv_dev,
             "width": b_res["width"],
             "height": b_res["height"],
             "sensors": sensors_by_slice.get(idx, [])
@@ -5846,7 +7160,7 @@ def get_project_imagery(
     custom_before_date: Optional[str] = None,
     custom_after_date: Optional[str] = None,
     corridor_slices: bool = False,
-    slice_mi: float = 0.4,
+    slice_mi: float = 0.25,
     open_browser: bool = False,
     workers: int = 8,
     verbose: bool = True,
@@ -5871,7 +7185,7 @@ def get_project_imagery(
       custom_before_date: Custom date string for 'before' (overrides spreadsheet).
       custom_after_date: Custom date string for 'after' (overrides spreadsheet).
       corridor_slices: If True, slices corridor into high-resolution (Zoom 19) segments and generates an interactive HTML viewer.
-      slice_mi: Length in miles of each corridor slice (default 0.4 mi).
+      slice_mi: Length in miles of each corridor slice (default 0.25 mi).
       open_browser: Whether to automatically launch the interactive HTML report in browser.
       workers: Number of parallel tile download threads.
       verbose: Whether to print progress to stdout.
@@ -5884,7 +7198,7 @@ def get_project_imagery(
             project_id=project_id,
             slice_mi=slice_mi,
             zoom=zoom or 19,
-            half_width_m=40.0,
+            half_width_m=110.0,
             output_dir=output_dir,
             master_csv_path=master_csv_path,
             custom_before_date=custom_before_date,
@@ -5945,7 +7259,10 @@ def get_project_imagery(
     # 3. Calculate Bounding Box or Aligned Corridor
     corridor = None
     if aligned:
-        corridor = wayback.corridor_geometry(start_pt, end_pt, half_width_m=35.0, pad_m=margin_m * 0.5)
+        polyline = get_project_corridor_geometry(proj)
+        curv_dev = calculate_corridor_curvature_deviation(start_pt, end_pt, polyline) if len(polyline) >= 2 else 0.0
+        corridor_half_width = max(75.0, curv_dev + 65.0)
+        corridor = wayback.corridor_geometry(start_pt, end_pt, half_width_m=corridor_half_width, pad_m=max(45.0, margin_m * 0.5))
         bbox = corridor.envelope
     else:
         polyline = get_project_corridor_geometry(proj)
@@ -5964,23 +7281,43 @@ def get_project_imagery(
     # 4. Determine Target Dates & Selection Modes
     target_tasks = []
     if custom_date:
-        d = _parse_project_date(custom_date)
+        d = parse_iso_date(custom_date)
         if not d:
             raise ValueError(f"Invalid custom date '{custom_date}'. Please use YYYY-MM-DD.")
         target_tasks.append(("custom", d, "nearest"))
     elif period == "before":
-        d = _parse_project_date(custom_before_date or proj.construction_begin_date or proj.start_year, 1, 1)
+        d = (
+            parse_iso_date(custom_before_date, 1, 1)
+            or build_date_from_parts(proj.raw_row.get("construction_begin_year"), proj.raw_row.get("construction_begin_month"), proj.raw_row.get("construction_begin_day"), default_month=1, default_day=1)
+            or parse_iso_date(proj.construction_begin_date, 1, 1)
+            or (datetime.date(proj.start_year, 1, 1) if proj.start_year else None)
+        )
         if not d:
             raise ValueError(f"Project {project_id} has no Construction Begin Date in spreadsheet. Specify --imagery-date.")
         target_tasks.append(("before", d, "before"))
     elif period == "after":
-        d = _parse_project_date(custom_after_date or proj.open_to_traffic_date or proj.end_year, 12, 31)
+        d = (
+            parse_iso_date(custom_after_date, 12, 31)
+            or build_date_from_parts(proj.raw_row.get("open_traffic_year"), proj.raw_row.get("open_traffic_month"), proj.raw_row.get("open_traffic_day"), default_month=12, default_day=31)
+            or parse_iso_date(proj.open_to_traffic_date, 12, 31)
+            or (datetime.date(proj.end_year, 12, 31) if proj.end_year else None)
+        )
         if not d:
             raise ValueError(f"Project {project_id} has no Open to Traffic Date in spreadsheet. Specify --imagery-date.")
         target_tasks.append(("after", d, "after"))
     elif period in ("both", "before_after", "before-after"):
-        d_before = _parse_project_date(custom_before_date or proj.construction_begin_date or proj.start_year, 1, 1)
-        d_after = _parse_project_date(custom_after_date or proj.open_to_traffic_date or proj.end_year, 12, 31)
+        d_before = (
+            parse_iso_date(custom_before_date, 1, 1)
+            or build_date_from_parts(proj.raw_row.get("construction_begin_year"), proj.raw_row.get("construction_begin_month"), proj.raw_row.get("construction_begin_day"), default_month=1, default_day=1)
+            or parse_iso_date(proj.construction_begin_date, 1, 1)
+            or (datetime.date(proj.start_year, 1, 1) if proj.start_year else None)
+        )
+        d_after = (
+            parse_iso_date(custom_after_date, 12, 31)
+            or build_date_from_parts(proj.raw_row.get("open_traffic_year"), proj.raw_row.get("open_traffic_month"), proj.raw_row.get("open_traffic_day"), default_month=12, default_day=31)
+            or parse_iso_date(proj.open_to_traffic_date, 12, 31)
+            or (datetime.date(proj.end_year, 12, 31) if proj.end_year else None)
+        )
         if d_before:
             target_tasks.append(("before", d_before, "before"))
         elif verbose:
@@ -6069,27 +7406,72 @@ def build_parser() -> argparse.ArgumentParser:
     """Build and return the organized CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="pems_interface.py",
-        description="PeMS Interface & Corridor Query Engine for CERCET California Highway Projects.",
+        description="""Caltrans PeMS Interface & Highway Corridor Engine for CERCET Research.
+
+Capabilities:
+  • Project inspection, absolute postmile conversion, and PeMS query building
+  • High-resolution historical satellite imagery (Zoom 19) & corridor curtain sliders
+  • PeMS detector time-series data downloads (flow, speed, occ, aadt) across years
+  • Statewide corridor sensor auditing against spreadsheet records with backups
+  • Open-to-traffic date inference via lane config history & detector telemetry
+  • Raw PeMS station lane tables & Caltrans TSN roadway metrics inspection
+  • Route-locked coordinate range detector searches (decimal & Google Maps DMS)
+  • Bidirectional California postmile conversions (CA PM <-> Abs PM & coords) & cross-county maps""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Inspect a project (description, PMs, dates, detector stations, PeMS URLs):
+  # 1. Inspect a highway project (limits, Abs PMs, dates, sensors, PeMS URLs):
   python pems_interface.py -p 400000680
 
-  # High-resolution (Zoom 19) historical satellite imagery corridor slices & interactive HTML report:
+  # 2. Fetch raw PeMS lane configuration tables & Caltrans TSN roadway metrics:
+  python pems_interface.py -p 400000680 --lanes
+  python pems_interface.py -s 410756 --lanes
+
+  # 3. Search stations along a route corridor by coordinate range (Google Maps DMS or decimal):
+  python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607'
+  python pems_interface.py -r 101 -d NB --coords '38°11'10.19"N 122°36'05.91"W' '38°13'14.99"N 122°36'27.10"W'
+  python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --lanes
+  python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --map
+
+  # 4. Bidirectional Postmile Conversions:
+  # (a) Convert California County PM + County -> Absolute Postmile & Coordinates:
+  python pems_interface.py -r 101 -d NB -c Sonoma --pm 0.21
+  python pems_interface.py -r 101 -d NB -c "Santa Clara" --pm 50.56
+
+  # (b) Convert continuous Absolute Postmile -> California County PM & Coordinates:
+  python pems_interface.py -r 101 -d NB --pm 400.2 --absolute
+  # (or simply omit --county): python pems_interface.py -r 101 -d NB --pm 400.2
+
+  # 5. Query and map custom postmile corridor (County PM or Absolute PM):
+  # By County Postmiles:
+  python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5
+  python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5 --map
+  python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5 --lanes
+  # By Absolute Postmiles across counties:
+  python pems_interface.py -r 101 -d NB --begin-pm 400.2 --end-pm 424.0 --absolute --map
+
+  # 6. Cross-county postmile corridor query & map (e.g. Marin to Sonoma):
+  python pems_interface.py -r 101 -d NB --begin-county Marin --begin-pm 25.0 --end-county Sonoma --end-pm 2.0 --map
+
+  # 7. Generate high-resolution (Zoom 19) corridor slices & curtain slider HTML report:
   python pems_interface.py -p 400000680 --slices
 
-  # Single satellite corridor before/after image:
+  # 8. Download historical satellite before/after imagery:
   python pems_interface.py -p 400000680 --imagery --aligned
 
-  # Interactive Folium map for a project:
+  # 9. Generate interactive Folium map for a project or all projects statewide:
   python pems_interface.py -p 400000680 --map
+  python pems_interface.py --map-all --dist 4 --include-stations
 
-  # Download PeMS detector time-series data for a project across all available years:
+  # 10. Download PeMS detector time-series data for a project across all available years:
   python pems_interface.py -p 400000680 --download --granularity month
 
-  # Audit & compare spreadsheet sensors against active PeMS VDS detectors:
+  # 11. Audit spreadsheet sensors against active PeMS VDS detectors statewide:
   python pems_interface.py --audit --dist 4
+  python pems_interface.py --audit --apply
+
+  # 12. Automatically infer Open-to-Traffic date from lane history & telemetry:
+  python pems_interface.py -p 300020420 --find-open-date
         """
     )
 
@@ -6126,7 +7508,7 @@ Examples:
         const=True,
         default=False,
         metavar="PID",
-        help="Generate interactive HTML map for a project (e.g. --map 400000680 or -p 400000680 --map)."
+        help="Generate interactive HTML map for a project, coordinate range, or postmile corridor (e.g. --map 400000680, or combined with --coords or --begin-pm/--end-pm)."
     )
     act_group.add_argument(
         "--map-all",
@@ -6174,7 +7556,7 @@ Examples:
         const=True,
         default=False,
         metavar="PID_OR_STATION",
-        help="Fetch and display raw PeMS station lane tables and Caltrans TSN roadway metrics for a project ID or station ID (e.g. -p <PID> --lanes or -s <STATION_ID> --lanes)."
+        help="Fetch and display raw PeMS station lane tables and Caltrans TSN roadway metrics for a project ID, station ID, coordinate range, or postmile range (e.g. -p <PID> --lanes, -s <SID> --lanes, or -r 101 -c Sonoma --begin-pm 0.0 --end-pm 4.5 --lanes)."
     )
     act_group.add_argument(
         "--list-urls",
@@ -6207,6 +7589,14 @@ Examples:
         help="Specific custom date (YYYY-MM-DD) for imagery retrieval."
     )
     img_group.add_argument(
+        "--before-date",
+        help="Specific custom before date (YYYY-MM-DD or M/D/YY) for imagery retrieval or corridor slices."
+    )
+    img_group.add_argument(
+        "--after-date",
+        help="Specific custom after date (YYYY-MM-DD or M/D/YY) for imagery retrieval or corridor slices."
+    )
+    img_group.add_argument(
         "--zoom", "--imagery-zoom",
         dest="imagery_zoom",
         type=int,
@@ -6216,8 +7606,15 @@ Examples:
     img_group.add_argument(
         "--slice-mi",
         type=float,
-        default=0.4,
-        help="Corridor slice segment length in miles for --slices (default: 0.4 mi)."
+        default=0.25,
+        help="Corridor slice segment length in miles for --slices (default: 0.25 mi)."
+    )
+    img_group.add_argument(
+        "--half-width", "--imagery-half-width",
+        dest="imagery_half_width",
+        type=float,
+        default=110.0,
+        help="Corridor slice half-width in meters perpendicular to roadway (default: 110m, auto-widened for curves and freeway geometry)."
     )
     img_group.add_argument(
         "--aligned",
@@ -6346,13 +7743,68 @@ Examples:
         help="Custom directory containing PeMS metadata text files."
     )
 
-    # 6. Ad-Hoc Corridor Query Options
-    adhoc_group = parser.add_argument_group("Ad-Hoc Corridor Query Options")
-    adhoc_group.add_argument("--route", "-r", help="Freeway route number for ad-hoc query.")
-    adhoc_group.add_argument("--dir", "-d", help="Freeway direction (N/S/E/W) for ad-hoc query.")
-    adhoc_group.add_argument("--begin-pm", type=float, help="Begin postmile for ad-hoc query.")
-    adhoc_group.add_argument("--end-pm", type=float, help="End postmile for ad-hoc query.")
-    adhoc_group.add_argument("--county", "-c", help="County for ad-hoc query.")
+    # 6. Ad-Hoc Corridor Query & Postmile Conversion Options
+    adhoc_group = parser.add_argument_group("Ad-Hoc Corridor Query & Postmile Conversion Options")
+    adhoc_group.add_argument(
+        "--route", "-r",
+        help="Freeway / highway route number (e.g. 101, 80, 5)."
+    )
+    adhoc_group.add_argument(
+        "--dir", "-d",
+        help="Freeway direction (NB, SB, EB, WB, N, S, E, W)."
+    )
+    adhoc_group.add_argument(
+        "--pm",
+        help="Single postmile to convert and resolve coordinates. Converts California County PM -> Absolute PM if --county is provided, or Absolute PM -> California County PM if --absolute is passed or --county is omitted (e.g. -r 101 --pm 400.2 --absolute or -r 101 -c Sonoma --pm 0.21)."
+    )
+    adhoc_group.add_argument(
+        "--begin-pm",
+        help="Begin postmile for corridor query (California County PM or continuous Absolute PM)."
+    )
+    adhoc_group.add_argument(
+        "--end-pm",
+        help="End postmile for corridor query (California County PM or continuous Absolute PM)."
+    )
+    adhoc_group.add_argument(
+        "--absolute", "--abs",
+        dest="absolute",
+        action="store_true",
+        help="Treat postmile input (--pm or --begin-pm/--end-pm) as continuous Absolute Postmiles (Abs PM). Enables direct Absolute PM -> California County PM conversion and continuous corridor querying across county lines without specifying a county."
+    )
+    adhoc_group.add_argument(
+        "--county", "-c",
+        help="County name or standard abbreviation for ad-hoc query (e.g. Sonoma, Placer, 'Contra Costa', SON, PLA, MRN, CC)."
+    )
+    adhoc_group.add_argument(
+        "--begin-county",
+        help="County for begin postmile if corridor traverses county boundaries (e.g. --begin-county Marin --begin-pm 25.0)."
+    )
+    adhoc_group.add_argument(
+        "--end-county",
+        help="County for end postmile if corridor traverses county boundaries (e.g. --end-county Sonoma --end-pm 2.0)."
+    )
+    adhoc_group.add_argument(
+        "--coords", "--coordinate-range",
+        dest="coords",
+        nargs="+",
+        metavar="COORD",
+        help="Search for detector stations along a route corridor by start/end coordinates. Snaps onto the route centerline to establish corridor limits. Accepts decimal degrees or Google Maps DMS (e.g. -r 101 --coords '38.186, -122.601' '38.220, -122.607' or in DMS '38°11\'10\"N 122°36\'05\"W' '38°13\'14\"N 122°36\'27\"W'). Combine with --lanes or --map."
+    )
+    adhoc_group.add_argument(
+        "--start-coords",
+        dest="start_coords",
+        help="Start coordinate for corridor station search in decimal or DMS (e.g. '38.186, -122.601')."
+    )
+    adhoc_group.add_argument(
+        "--end-coords",
+        dest="end_coords",
+        help="End coordinate for corridor station search in decimal or DMS (e.g. '38.220, -122.607')."
+    )
+    adhoc_group.add_argument(
+        "--strict-route",
+        action="store_true",
+        help="Do not auto-switch highway route if input coordinates are distant from specified route."
+    )
     adhoc_group.add_argument("--census", action="store_true", help="Search closest Census stations.")
 
     # 7. General & Configuration
@@ -6366,6 +7818,12 @@ Examples:
         "--output-dir",
         default=".",
         help="Directory to save downloaded files or imagery (default: '.')."
+    )
+    gen_group.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="HTTP network timeout in seconds for PeMS requests (default: 60s, auto-retried up to 90s)."
     )
     gen_group.add_argument(
         "--no-open",
@@ -6392,20 +7850,265 @@ def main(argv: Optional[List[str]] = None):
             sys.exit(1)
         return
 
-    # 2. Ad-hoc Query
-    if args.route and args.dir and args.begin_pm is not None and args.end_pm is not None:
-        print(f"\n--- Ad-hoc Query: Route {args.route} {args.dir} PM {args.begin_pm} - {args.end_pm} ---")
-        ref_df = load_geo_reference()
-        start = pm_to_coordinates(args.route, args.dir, args.begin_pm, county=args.county, is_absolute=(args.county is None), ref_df=ref_df)
-        end = pm_to_coordinates(args.route, args.dir, args.end_pm, county=args.county, is_absolute=(args.county is None), ref_df=ref_df)
-        print(f"Start coordinates: {start}")
-        print(f"End coordinates:   {end}")
+    # 2. Ad-hoc Coordinate Range Search (Search stations along route by coordinates)
+    has_coord_query = bool(args.coords or (args.start_coords and args.end_coords))
+    if has_coord_query:
+        c1_str, c2_str = None, None
+        if args.start_coords and args.end_coords:
+            c1_str, c2_str = args.start_coords, args.end_coords
+        elif args.coords:
+            if len(args.coords) == 1:
+                parts = re.split(r"\s+to\s+|;\s*", args.coords[0], flags=re.IGNORECASE)
+                if len(parts) >= 2:
+                    c1_str, c2_str = parts[0], parts[1]
+                else:
+                    print("Error: Please provide two coordinates separated by space or 'to' (e.g. --coords '38.186, -122.601' '38.220, -122.607').")
+                    sys.exit(1)
+            elif len(args.coords) == 2:
+                c1_str, c2_str = args.coords[0], args.coords[1]
+            elif len(args.coords) == 4:
+                c1_str = f"{args.coords[0]}, {args.coords[1]}"
+                c2_str = f"{args.coords[2]}, {args.coords[3]}"
+            else:
+                combined = " ".join(args.coords)
+                parts = re.split(r"\s+to\s+|;\s*", combined, flags=re.IGNORECASE)
+                if len(parts) >= 2:
+                    c1_str, c2_str = parts[0], parts[1]
+                else:
+                    matches = list(re.finditer(r"\d+[°\s]+\d+[\'\s]+[\d\.]+[\"\s]*[NSns][\s,;]+\d+[°\s]+\d+[\'\s]+[\d\.]+[\"\s]*[EWew]", combined))
+                    if len(matches) >= 2:
+                        c1_str, c2_str = matches[0].group(0), matches[1].group(0)
+                    else:
+                        print("Error: Unable to parse two coordinates from --coords input. Please quote them (e.g. --coords '38.186, -122.601' '38.220, -122.607').")
+                        sys.exit(1)
 
-        lane_url = build_lane_config_url(args.route, args.dir, "01/01/2015", "12/31/2025")
-        print(f"Lane config URL:   {lane_url}")
+        c_start = parse_coordinate_string(c1_str)
+        c_end = parse_coordinate_string(c2_str)
+        if not c_start or not c_end:
+            print(f"Error: Could not parse coordinates. Start: '{c1_str}', End: '{c2_str}'. Expected decimal degrees or DMS.")
+            sys.exit(1)
 
-        stations = get_corridor_stations(args.route, args.dir, args.begin_pm, args.end_pm, is_absolute=(args.county is None), county=args.county, ref_df=ref_df)
-        print(f"Reference segments in range: {len(stations)}")
+        st_types = tuple(t.strip() for t in args.station_types.split(",")) if args.station_types else ("ML", "HV")
+        res = find_stations_by_coordinate_range(
+            route=args.route,
+            start_coord=c_start,
+            end_coord=c_end,
+            direction=args.dir,
+            buffer_mi=args.buffer,
+            station_types=st_types,
+            metadata_dir=args.metadata_dir,
+            strict_route=args.strict_route,
+        )
+
+        if "error" in res:
+            print(f"\n[Error]: {res['error']}")
+            sys.exit(1)
+
+        s_snap = res["snapped_start"]
+        e_snap = res["snapped_end"]
+        c_range = res["corridor_range"]
+        adhoc_pid = f"CORRIDOR-R{res['route']}"
+        dist_val = str(s_snap.get("district") or ("4" if str(s_snap.get("county")).lower() == "sonoma" else "1"))
+        adhoc_proj = ProjectRecord(
+            project_id=adhoc_pid,
+            dist=dist_val,
+            county=str(s_snap['county']),
+            state="CA",
+            route=str(res["route"]),
+            direction=res["direction"] or (res.get("travel_vector") or "NB"),
+            begin_pm=str(s_snap["ca_pm"]),
+            end_pm=str(e_snap["ca_pm"]),
+            abs_begin_pm=c_range["abs_min"],
+            abs_end_pm=c_range["abs_max"],
+            start_coords=res["input_start"],
+            end_coords=res["input_end"],
+            sensor_stations=[str(s.id) for s in res["stations"]],
+            project_description=f"Corridor: Route {res['route']} from {s_snap['county']} PM {s_snap['ca_pm']} to {e_snap['county']} PM {e_snap['ca_pm']}"
+        )
+
+        if args.lane_config:
+            client = PeMSClient()
+            client.login()
+            meta = load_vds_metadata(args.metadata_dir)
+            st_details = [
+                fetch_station_lane_configuration(s.id, client=client, vds_record=s, timeout=getattr(args, "timeout", 60.0))
+                for s in res["stations"]
+            ]
+            report = format_lane_config_report(
+                st_details,
+                project=adhoc_proj,
+                hpms_summary=res.get("hpms_summary"),
+                uninstrumented_info={
+                    "coverage_status": res.get("coverage_status"),
+                    "coverage_details": res.get("coverage_details"),
+                    "nearest_station": res.get("nearest_station"),
+                    "census_stations": res.get("census_stations"),
+                }
+            )
+            print(report)
+            if args.output_report:
+                _save_lane_config_report(args.output_report, st_details, project=adhoc_proj, hpms_summary=res.get("hpms_summary"))
+        else:
+            report = format_coordinate_search_report(res)
+            print(report)
+            if args.output_report:
+                with open(args.output_report, "w", encoding="utf-8") as f:
+                    f.write(report)
+                print(f"\n✓ Exported search report -> {args.output_report}")
+
+        if args.map or args.output_map:
+            s_snap = res["snapped_start"]
+            e_snap = res["snapped_end"]
+            c_range = res["corridor_range"]
+            adhoc_pid = f"CORRIDOR-R{res['route']}"
+            dist_val = str(s_snap.get("district") or ("4" if str(s_snap.get("county")).lower() == "sonoma" else "1"))
+            adhoc_proj = ProjectRecord(
+                project_id=adhoc_pid,
+                dist=dist_val,
+                county=str(s_snap['county']),
+                state="CA",
+                route=str(res["route"]),
+                direction=res["direction"] or "NB",
+                begin_pm=str(s_snap["ca_pm"]),
+                end_pm=str(e_snap["ca_pm"]),
+                abs_begin_pm=c_range["abs_min"],
+                abs_end_pm=c_range["abs_max"],
+                start_coords=res["input_start"],
+                end_coords=res["input_end"],
+                sensor_stations=[str(s.id) for s in res["stations"]],
+                project_description=f"Ad-hoc Corridor Search: Route {res['route']} from {s_snap['county']} PM {s_snap['ca_pm']} to {e_snap['county']} PM {e_snap['ca_pm']}"
+            )
+            out_p = args.output_map or f"corridor_route_{res['route']}_stations.html"
+            build_single_project_map(
+                target_pid=adhoc_pid,
+                projects=[adhoc_proj],
+                output_path=out_p,
+                open_browser=not args.no_open,
+                include_stations=not args.no_stations,
+                station_buffer_mi=args.buffer,
+                metadata_dir=args.metadata_dir,
+            )
+            print(f"✓ Generated interactive corridor map -> {out_p}")
+
+        return
+
+    # 3. Ad-hoc Postmile Query / Conversion / Mapping
+    if args.pm or (args.begin_pm and not args.end_pm):
+        target_pm = args.pm or args.begin_pm
+        if not args.route:
+            print("Error: Postmile conversion requires a highway route (e.g. -r 101 -c Sonoma --pm 0.21 or -r 101 --pm 400.2 --absolute).")
+            sys.exit(1)
+        
+        is_abs = getattr(args, "absolute", False) or (not args.county and not args.begin_county)
+        if is_abs:
+            res = convert_absolute_postmile(
+                route=args.route,
+                abs_pm=target_pm,
+                direction=args.dir,
+            )
+        else:
+            target_co = args.county or args.begin_county
+            res = convert_california_postmile(
+                route=args.route,
+                county=target_co,
+                ca_pm=target_pm,
+                direction=args.dir,
+            )
+        report = format_single_postmile_report(res)
+        print(report)
+        if args.output_report:
+            with open(args.output_report, "w", encoding="utf-8") as f:
+                f.write(report)
+            print(f"\n✓ Exported conversion report -> {args.output_report}")
+        return
+
+    if args.begin_pm is not None and args.end_pm is not None:
+        if not args.route:
+            print("Error: Corridor query requires a highway route (e.g. -r 101 -c Sonoma --begin-pm 0.0 --end-pm 4.5).")
+            sys.exit(1)
+        
+        is_abs = getattr(args, "absolute", False) or (not args.county and not args.begin_county and not args.end_county)
+        st_types = tuple(t.strip() for t in args.station_types.split(",")) if args.station_types else ("ML", "HV")
+        res = find_stations_by_postmile_range(
+            route=args.route,
+            begin_pm=args.begin_pm,
+            end_pm=args.end_pm,
+            county=args.county,
+            begin_county=args.begin_county,
+            end_county=args.end_county,
+            direction=args.dir,
+            is_absolute=is_abs,
+            buffer_mi=args.buffer,
+            station_types=st_types,
+            metadata_dir=args.metadata_dir,
+        )
+
+        if "error" in res:
+            print(f"\n[Error]: {res['error']}")
+            sys.exit(1)
+
+        adhoc_pid = f"CORRIDOR-R{res['route']}-PM{res['begin_pm']}-{res['end_pm']}"
+        dist_val = str(res["start"].get("district") or res["end"].get("district") or "4")
+        adhoc_proj = ProjectRecord(
+            project_id=adhoc_pid,
+            dist=dist_val,
+            county=str(res["begin_county"]),
+            state="CA",
+            route=str(res["route"]),
+            direction=res["direction"] or "NB",
+            begin_pm=str(res["begin_pm"]),
+            end_pm=str(res["end_pm"]),
+            abs_begin_pm=res["corridor_range"]["abs_min"],
+            abs_end_pm=res["corridor_range"]["abs_max"],
+            start_coords=res["start"]["coord"],
+            end_coords=res["end"]["coord"],
+            sensor_stations=[str(s.id) for s in res["stations"]],
+            project_description=f"Custom Corridor Query: Route {res['route']} {res['direction']} from {res['begin_county']} PM {res['begin_pm']} to {res['end_county']} PM {res['end_pm']}"
+        )
+
+        if args.lane_config:
+            client = PeMSClient()
+            client.login()
+            meta = load_vds_metadata(args.metadata_dir)
+            st_details = [
+                fetch_station_lane_configuration(s.id, client=client, vds_record=s, timeout=getattr(args, "timeout", 60.0))
+                for s in res["stations"]
+            ]
+            report = format_lane_config_report(
+                st_details,
+                project=adhoc_proj,
+                hpms_summary=res.get("hpms_summary"),
+                uninstrumented_info={
+                    "coverage_status": res.get("coverage_status"),
+                    "coverage_details": res.get("coverage_details"),
+                    "nearest_station": res.get("nearest_station"),
+                    "census_stations": res.get("census_stations"),
+                }
+            )
+            print(report)
+            if args.output_report:
+                _save_lane_config_report(args.output_report, st_details, project=adhoc_proj, hpms_summary=res.get("hpms_summary"))
+        else:
+            report = format_postmile_range_report(res)
+            print(report)
+            if args.output_report:
+                with open(args.output_report, "w", encoding="utf-8") as f:
+                    f.write(report)
+                print(f"\n✓ Exported postmile report -> {args.output_report}")
+
+        if args.map or args.output_map:
+            out_p = args.output_map or f"corridor_route_{res['route']}_{str(res['begin_county']).replace(' ', '_')}_PM{res['begin_pm']}_{res['end_pm']}.html"
+            build_single_project_map(
+                target_pid=adhoc_pid,
+                projects=[adhoc_proj],
+                output_path=out_p,
+                open_browser=not args.no_open,
+                include_stations=not args.no_stations,
+                station_buffer_mi=args.buffer,
+                metadata_dir=args.metadata_dir,
+            )
+            print(f"✓ Generated interactive corridor map -> {out_p}")
+
         return
 
     # 3. Station download (by single Station ID)
@@ -6538,7 +8241,12 @@ def main(argv: Optional[List[str]] = None):
             except Exception:
                 pass
             vds_rec = vds_meta.by_id.get(target_station) if vds_meta else None
-            details = fetch_station_lane_configuration(target_station, client=client, vds_record=vds_rec)
+            details = fetch_station_lane_configuration(
+                target_station,
+                client=client,
+                vds_record=vds_rec,
+                timeout=getattr(args, "timeout", 60.0)
+            )
             report = format_lane_config_report(details)
             print(report)
 
@@ -6559,16 +8267,23 @@ def main(argv: Optional[List[str]] = None):
             metadata_dir=args.metadata_dir,
             buffer_mi=args.buffer,
         )
-        if not res["stations"]:
-            print(f"\n[Project {target_pid}]: No PeMS stations found in spreadsheet or corridor within buffer {args.buffer} mi.")
-            return
-
         matched_p = res["projects"][0] if res["projects"] else None
-        report = format_lane_config_report(res["stations"], project=matched_p, hpms_summary=res.get("hpms_summary"))
+        report = format_lane_config_report(
+            res["stations"],
+            project=matched_p,
+            hpms_summary=res.get("hpms_summary"),
+            uninstrumented_info=res.get("uninstrumented_info"),
+        )
         print(report)
 
         if args.output_report:
-            _save_lane_config_report(args.output_report, res["stations"], project=matched_p, hpms_summary=res.get("hpms_summary"))
+            _save_lane_config_report(
+                args.output_report,
+                res["stations"],
+                project=matched_p,
+                hpms_summary=res.get("hpms_summary"),
+                uninstrumented_info=res.get("uninstrumented_info"),
+            )
         return
 
     # 6. Corridor Slices (high-resolution Zoom 19 with interactive report)
@@ -6577,14 +8292,17 @@ def main(argv: Optional[List[str]] = None):
             print("Error: Please specify a Project ID to generate corridor slices (e.g. -p <PID> --slices or --slices <PID>).")
             sys.exit(1)
         out_d = args.output_dir if args.output_dir != "." else os.path.join(WORKSPACE_DIR, "downloads", "imagery")
+        c_before = getattr(args, "before_date", None) or (args.imagery_date if args.imagery_period == "before" else None)
+        c_after = getattr(args, "after_date", None) or (args.imagery_date if args.imagery_period == "after" else None)
         generate_corridor_slices(
             project_id=target_pid,
             slice_mi=args.slice_mi,
             zoom=args.imagery_zoom or 19,
+            half_width_m=args.imagery_half_width,
             output_dir=out_d,
             master_csv_path=args.input if os.path.exists(args.input) else None,
-            custom_before_date=args.imagery_date if args.imagery_period == "before" else None,
-            custom_after_date=args.imagery_date if args.imagery_period == "after" else None,
+            custom_before_date=c_before,
+            custom_after_date=c_after,
             open_browser=not args.no_open,
             verbose=True
         )
@@ -6596,6 +8314,8 @@ def main(argv: Optional[List[str]] = None):
             print("Error: Please specify a Project ID for imagery download (e.g. -p <PID> --imagery or --imagery <PID>).")
             sys.exit(1)
         out_d = args.output_dir if args.output_dir != "." else os.path.join(WORKSPACE_DIR, "downloads", "imagery")
+        c_before = getattr(args, "before_date", None) or (args.imagery_date if args.imagery_period == "before" else None)
+        c_after = getattr(args, "after_date", None) or (args.imagery_date if args.imagery_period == "after" else None)
         get_project_imagery(
             project_id=target_pid,
             period=args.imagery_period,
@@ -6605,6 +8325,8 @@ def main(argv: Optional[List[str]] = None):
             output_dir=out_d,
             master_csv_path=args.input if os.path.exists(args.input) else None,
             custom_date=args.imagery_date,
+            custom_before_date=c_before,
+            custom_after_date=c_after,
             corridor_slices=False,
             slice_mi=args.slice_mi,
             open_browser=not args.no_open,

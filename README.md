@@ -208,6 +208,18 @@ python pems_interface.py --find-open-date --apply               # Commit inferre
 python pems_interface.py -p 400000680 --lanes                 # Fetch lane tables & TSN metrics for all project stations
 python pems_interface.py -s 410756 --lanes                    # Fetch raw lane table & TSN metrics for single station
 python pems_interface.py -p 400000680 --lanes --output-report reports/lanes.json  # Export structured JSON
+
+# 9. SEARCH STATIONS BY COORDINATE RANGE (ROUTE-LOCKED CORRIDOR):
+python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607'
+python pems_interface.py -r 101 -d NB --coords '38°11'\''10.19"N 122°36'\''05.91"W' '38°13'\''14.99"N 122°36'\''27.10"W'
+python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --lanes
+python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --map
+
+# 10. CONVERT & MAP CUSTOM CALIFORNIA POSTMILES (CA PM -> ABS PM & COORDS):
+python pems_interface.py -r 101 -d NB -c Sonoma --pm 0.21                          # Single PM to Abs PM & Coords
+python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5        # Corridor range & stations
+python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5 --map  # Generate interactive map
+python pems_interface.py -r 101 -d NB --begin-county Marin --begin-pm 25.0 --end-county Sonoma --end-pm 2.0 --map  # Cross-county
 ```
 
 > **Note:** All previous commands (such as `--inspect <PID>`, `--download-project <PID>`, `--download-station <SID>`, `--corridor-slices`, and `--match-stations`) remain 100% supported for backward compatibility. Run `python pems_interface.py --help` to see all grouped options and aliases.
@@ -449,6 +461,118 @@ for st in res["stations"]:
 
 # Pretty-print formatted report:
 print(format_lane_config_report(res["stations"], project=res["projects"][0]))
+```
+
+---
+
+## Search Stations by Coordinate Range (Route-Locked Corridor)
+
+When project limits in a spreadsheet do not match the physical ground work (for instance, contract limits covering 4.5 miles while physical lane widening only spans 2.5 miles), you can query PeMS detector stations by giving **start and end coordinates** directly.
+
+The tool **locks to the specified highway route centerline** using Caltrans absolute postmiles (`Abs PM`), calculates perpendicular distance offsets to ensure you stay on the target freeway, and pulls all matching detector stations within the corridor bounds.
+
+### Supported Coordinate Formats:
+- **Decimal Degrees:** `'38.186164, -122.601642'` or `38.186164 -122.601642`
+- **Degrees-Minutes-Seconds (DMS) from Google Maps:** `'38°11'\''10.19"N 122°36'\''05.91"W'`
+
+### Command-Line Usage:
+
+```bash
+# Basic search along US-101 NB between two coordinate pairs:
+python pems_interface.py -r 101 -d NB --coords '38.186164, -122.601642' '38.220556, -122.607222'
+
+# Google Maps DMS format directly:
+python pems_interface.py -r 101 -d NB --coords '38°11'\''10.19"N 122°36'\''05.91"W' '38°13'\''14.99"N 122°36'\''27.10"W'
+
+# With explicit start/end flags:
+python pems_interface.py -r 101 -d NB --start-coords '38.186, -122.601' --end-coords '38.220, -122.607'
+
+# Combine with --lanes to immediately fetch lane configurations & TSN roadway metrics:
+python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --lanes
+
+# Combine with --map to generate an interactive HTML map for the corridor:
+python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --map
+
+# Filter by station types (e.g. Mainline only) or customize buffer tolerance:
+python pems_interface.py -r 101 -d NB --coords '38.186, -122.601' '38.220, -122.607' --station-types ML --buffer 0.1
+```
+
+### Python API Example:
+
+```python
+from pems_interface import find_stations_by_coordinate_range, format_coordinate_search_report
+
+res = find_stations_by_coordinate_range(
+    route="101",
+    direction="NB",
+    start_coord="38°11'10.19\"N 122°36'05.91\"W",
+    end_coord="38°13'14.99\"N 122°36'27.10\"W",
+    station_types=("ML", "HV"),
+    buffer_mi=0.2,
+)
+
+print(format_coordinate_search_report(res))
+for st in res["stations"]:
+    print(f"Station {st.id} ({st.type}): {st.name} at Abs PM {st.abs_pm} (CA PM {st.state_pm})")
+```
+
+---
+
+## Convert & Map Custom California Postmiles (CA PM -> Abs PM & Coordinates)
+
+You can convert any custom California county postmile to its continuous **Absolute Postmile (`Abs PM`)** and highway centerline **Coordinates (lat, lng)**, query detector stations within a postmile corridor, and generate interactive Folium maps.
+
+### Supported County Inputs:
+- Full county names (e.g. `Sonoma`, `Placer`, `Marin`, `Contra Costa`, `Los Angeles`)
+- Standard Caltrans 2- or 3-letter county codes (e.g. `SON`, `PLA`, `MRN`, `CC`, `LA`, `SF`)
+
+### Command-Line Usage:
+
+```bash
+# 1. Convert a single California postmile to Absolute Postmile and Coordinates:
+python pems_interface.py -r 101 -d NB -c Sonoma --pm 0.21
+
+# 2. Query stations and calculate limits for a postmile range in a county:
+python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5
+
+# 3. Generate an interactive corridor map from custom postmiles:
+python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5 --map
+
+# 4. Cross-county corridor query (e.g. from Marin PM 25.0 to Sonoma PM 2.0):
+python pems_interface.py -r 101 -d NB --begin-county Marin --begin-pm 25.0 --end-county Sonoma --end-pm 2.0 --map
+
+# 5. Combine with --lanes to inspect live PeMS lane tables & TSN roadway metrics:
+python pems_interface.py -r 101 -d NB -c Sonoma --begin-pm 0.0 --end-pm 4.5 --lanes
+```
+
+### Python API Example:
+
+```python
+from pems_interface import (
+    convert_california_postmile,
+    find_stations_by_postmile_range,
+    format_single_postmile_report,
+    format_postmile_range_report,
+)
+
+# Convert a single postmile:
+single = convert_california_postmile(route="101", county="Sonoma", ca_pm="0.21", direction="NB")
+print(format_single_postmile_report(single))
+# Output:
+#   • Converted Absolute Postmile:  Abs PM 468.200
+#   • Centerline Coordinates:       (38.17849, -122.59651)
+#   • Caltrans District:            District 4
+
+# Query a postmile corridor:
+corridor = find_stations_by_postmile_range(
+    route="101",
+    county="Sonoma",
+    begin_pm="0.0",
+    end_pm="4.5",
+    direction="NB",
+    buffer_mi=0.1
+)
+print(format_postmile_range_report(corridor))
 ```
 
 ---

@@ -209,42 +209,41 @@ PAGE = """<!doctype html>
 <title>PeMS Postmile Verification</title>
 <style>
   :root { color-scheme: light; }
-  * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.45 Georgia, "Times New Roman", Times, serif;
+  * { box-sizing: border-box; border-radius: 0 !important; box-shadow: none !important; }
+  body { margin:0; font:13px/1.45 "Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace;
          background:#ffffff; color:#000000; }
   .wrap { max-width:1180px; margin:0 auto; padding:18px 16px 36px; }
-  h1 { font-size:20px; font-weight:bold; margin:0 0 2px; }
-  p.sub { margin:0 0 14px; color:#333333; font-size:13px; }
-  form { background:#ffffff; border:1px solid #000000; border-radius:0; padding:10px 12px;
+  h1 { font-size:18px; font-weight:bold; margin:0 0 2px; }
+  p.sub { margin:0 0 14px; color:#333333; font-size:12px; }
+  form { background:#ffffff; border:1px solid #000000; padding:10px 12px;
          display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
          align-items:end; }
-  label { display:block; font-size:11.5px; font-weight:bold; color:#000000;
+  label { display:block; font-size:11px; font-weight:bold; color:#000000;
           text-transform:uppercase; letter-spacing:.03em; margin-bottom:4px; }
-  input[type=text] { width:100%; padding:5px 8px; font-size:14px; font-family:inherit;
-                     border:1px solid #000000; border-radius:0; background:#ffffff; }
+  input[type=text] { width:100%; padding:5px 8px; font-size:13px; font-family:inherit;
+                     border:1px solid #000000; background:#ffffff; color:#000000; }
   input:disabled { background:#eeeeee; color:#777777; }
-  .chk { display:flex; align-items:center; gap:6px; font-size:13px; padding-bottom:6px; }
-  .chk label { margin:0; text-transform:none; letter-spacing:0; font-size:13px; font-weight:normal; }
-  button { padding:6px 14px; font-size:14px; font-family:inherit; font-weight:bold;
-           border:1px solid #000000; border-radius:0; background:#f0f0f0; color:#000000;
+  .chk { display:flex; align-items:center; gap:6px; font-size:12px; padding-bottom:6px; }
+  .chk label { margin:0; text-transform:none; letter-spacing:0; font-size:12px; font-weight:normal; }
+  button { padding:6px 14px; font-size:13px; font-family:inherit; font-weight:bold;
+           border:1px solid #000000; background:#ffffff; color:#000000;
            cursor:pointer; width:100%; }
-  button:hover { background:#e0e0e0; }
-  .hint { font-size:12px; color:#444444; min-height:16px; margin:6px 2px 0; }
-  .banner { margin:12px 0 0; padding:8px 12px; border-radius:0; font-size:13px;
+  button:hover { background:#000000; color:#ffffff; }
+  .hint { font-size:11px; color:#444444; min-height:16px; margin:6px 2px 0; }
+  .banner { margin:12px 0 0; padding:8px 12px; font-size:12px;
             background:#ffffff; border:1px solid #000000; color:#000000; }
-  .card { margin-top:14px; background:#ffffff; border:1px solid #000000; border-radius:0;
-          overflow:hidden; }
-  .card > header { padding:6px 10px; border-bottom:1px solid #000000; font-size:13px;
-                   background:#f4f4f4; color:#000000; display:flex; justify-content:space-between; align-items:center; gap:10px; }
-  .card a { color:#0000ee; text-decoration:underline; font-weight:normal; }
-  .card a:hover { text-decoration:underline; }
+  .map-section { margin-top:14px; background:#ffffff; border:1px solid #000000; }
+  .map-section > header { padding:6px 10px; border-bottom:1px solid #000000; font-size:12px; font-weight:bold;
+                   background:#ffffff; color:#000000; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .map-section a { color:#0000ee; text-decoration:underline; font-weight:normal; }
+  .map-section a:hover { text-decoration:underline; }
   iframe { display:block; width:100%; height:620px; border:0; background:#ffffff; }
-  code { background:#eeeeee; padding:1px 4px; border:1px solid #cccccc; border-radius:0; font-size:12px; font-family:monospace; }
+  code { background:#eeeeee; padding:1px 4px; border:1px solid #cccccc; font-size:11px; font-family:inherit; }
 </style>
 <div class="wrap">
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; border-bottom: 1px solid #000; padding-bottom: 8px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; border-bottom: 2px solid #000; padding-bottom: 8px;">
     <h1 style="margin:0;">PeMS Postmile Verification</h1>
-    <a href="/projects/map" target="_blank" style="color:#0000ee; text-decoration:underline; font-size:14px;">[View All CA Projects Map]</a>
+    <a href="/projects/map" target="_blank" style="color:#0000ee; text-decoration:underline; font-size:13px;">[View All CA Projects Map]</a>
   </div>
   <form id="f" method="get" action="/map" target="mapframe">
     <div>
@@ -276,11 +275,11 @@ PAGE = """<!doctype html>
   </div>
   {% endif %}
 
-  <div class="card">
+  <div class="map-section">
     <header>
       <span id="maplabel">Map</span>
-      <span><a id="popout" href="#" target="_blank" rel="noopener">open in new tab</a> &nbsp;·&nbsp;
-            <a id="dl" href="#">download .html</a></span>
+      <span><a id="popout" href="#" target="_blank" rel="noopener">[open in new tab]</a> &nbsp;·&nbsp;
+            <a id="dl" href="#">[download .html]</a></span>
     </header>
     <iframe name="mapframe" id="mapframe" src="about:blank" title="route map"></iframe>
   </div>
@@ -337,13 +336,13 @@ f.addEventListener('submit', () => {
 
 ERROR_PAGE = """<!doctype html><meta charset="utf-8">
 <style>
- body{font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;padding:22px;
-      background:#fdeceb;color:#7f1d16}
- h3{margin:0 0 8px;font-size:15px}
+ body{font:13px/1.5 "Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace;margin:0;padding:22px;
+      background:#ffffff;color:#000000;border-radius:0 !important;box-shadow:none !important;}
+ h3{margin:0 0 8px;font-size:14px;color:#b42318}
  p{margin:0 0 12px}
- a{color:#b42318;font-weight:600}
- pre{white-space:pre-wrap;background:#fff;border:1px solid #f3b0ab;border-radius:8px;
-     padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#4b1410;
+ a{color:#0000ee}
+ pre{white-space:pre-wrap;background:#ffffff;border:1px solid #000000;border-radius:0;
+     padding:10px 12px;font:12px/1.5 inherit;color:#000000;
      max-height:340px;overflow:auto}
 </style>
 <h3>{{ title }}</h3>

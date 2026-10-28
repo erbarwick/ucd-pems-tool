@@ -779,14 +779,14 @@ class HPMSCorridorEngine:
             col = get_lane_color(tl)
 
             popup_html = f"""
-            <div style="font-family: Arial, sans-serif; min-width: 200px;">
-                <h4 style="margin: 0 0 5px 0; color: #2c3e50;">HPMS Segment (Route {route})</h4>
-                <table style="width: 100%; font-size: 12px; border-collapse: collapse;">
-                    <tr><td><b>Through Lanes:</b></td><td><span style="font-size: 14px; font-weight: bold; color: {col};">{tl or 'N/A'}</span></td></tr>
-                    <tr><td><b>Directional Lanes:</b></td><td>{dtl or 'N/A'}</td></tr>
-                    <tr><td><b>Abs Postmiles:</b></td><td>{bp} - {ep}</td></tr>
-                    <tr><td><b>AADT:</b></td><td>{aadt:,} vpd</td></tr>
-                    <tr><td><b>Overlap Length:</b></td><td>{s.get('overlap_len', 0):.3f} mi</td></tr>
+            <div style="font-family: 'Andale Mono', Menlo, Monaco, 'Courier New', monospace; font-size: 11.5px; min-width: 200px; color: #000; background: #fff;">
+                <h4 style="margin: 0 0 5px 0; color: #000;">HPMS Segment (Route {route})</h4>
+                <table style="width: 100%; font-size: 11px; border-collapse: collapse; border: 1px solid #000;">
+                    <tr><td style="padding: 2px 4px; border: 1px solid #ccc;"><b>Through Lanes:</b></td><td style="padding: 2px 4px; border: 1px solid #ccc;"><span style="font-size: 12px; font-weight: bold; color: {col};">{tl or 'N/A'}</span></td></tr>
+                    <tr><td style="padding: 2px 4px; border: 1px solid #ccc;"><b>Directional Lanes:</b></td><td style="padding: 2px 4px; border: 1px solid #ccc;">{dtl or 'N/A'}</td></tr>
+                    <tr><td style="padding: 2px 4px; border: 1px solid #ccc;"><b>Abs Postmiles:</b></td><td style="padding: 2px 4px; border: 1px solid #ccc;">{bp} - {ep}</td></tr>
+                    <tr><td style="padding: 2px 4px; border: 1px solid #ccc;"><b>AADT:</b></td><td style="padding: 2px 4px; border: 1px solid #ccc;">{aadt:,} vpd</td></tr>
+                    <tr><td style="padding: 2px 4px; border: 1px solid #ccc;"><b>Overlap Length:</b></td><td style="padding: 2px 4px; border: 1px solid #ccc;">{s.get('overlap_len', 0):.3f} mi</td></tr>
                 </table>
             </div>
             """
@@ -807,15 +807,15 @@ class HPMSCorridorEngine:
         # Title Card
         title_html = f"""
         <div style="position: fixed; top: 10px; left: 60px; z-index: 9999;
-                    background: white; padding: 12px 18px; border-radius: 6px;
-                    box-shadow: 0 2px 6px rgba(0,0,0,0.3); max-width: 450px;">
-            <h3 style="margin: 0 0 4px 0; color: #2c3e50; font-size: 16px;">
+                    background: #ffffff; color: #000000; padding: 10px 14px; border: 1px solid #000000;
+                    border-radius: 0; box-shadow: none; font-family: 'Andale Mono', Menlo, Monaco, 'Courier New', monospace; max-width: 450px;">
+            <h3 style="margin: 0 0 4px 0; color: #000000; font-size: 14px; font-weight: bold;">
                 Project {pid} (Route {route}, {county} Co)
             </h3>
-            <p style="margin: 0 0 6px 0; font-size: 12px; color: #555;">
+            <p style="margin: 0 0 6px 0; font-size: 11px; color: #333333;">
                 {desc}
             </p>
-            <div style="font-size: 12px; border-top: 1px solid #eee; padding-top: 5px;">
+            <div style="font-size: 11px; border-top: 1px solid #000000; padding-top: 5px;">
                 <b>Spreadsheet:</b> {data['spreadsheet_lanes_before']} &rarr; {data['spreadsheet_lanes_after']} lanes |
                 <b>HPMS 2024:</b> {data['hpms_predominant_lanes_2024']} lanes (predom) / {data['hpms_avg_lanes_2024']} (wt)
             </div>
