@@ -18,6 +18,8 @@ downloads/*.txt.*
 downloads/*.zip
 downloads/imagery/
 downloads/hpms_cache/
+downloads/station_config_cache/
+downloads/web/
 *.bk
 *.bak
 *.bak_*

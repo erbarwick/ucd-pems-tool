@@ -140,6 +140,7 @@ import urllib.parse
 import textwrap
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Union, Sequence, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
@@ -154,14 +155,25 @@ from hpms_interface import resolve_absolute_postmiles, parse_postmile
 # ---------------------------------------------------------------------------
 # CONFIGURATION & PATHS
 # ---------------------------------------------------------------------------
-load_dotenv()
-
-BASE_URL = "https://pems.dot.ca.gov"
 WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_URL = "https://pems.dot.ca.gov"
+try:
+    from dotenv import find_dotenv
+    _found_env = find_dotenv()
+    if _found_env:
+        load_dotenv(_found_env)
+    else:
+        load_dotenv()
+except Exception:
+    try:
+        load_dotenv()
+    except Exception:
+        pass
 
 DEFAULT_REF_PATH = os.path.join(WORKSPACE_DIR, "downloads", "merged_geo_pm.csv")
 DEFAULT_MASTER_CSV = os.path.join(WORKSPACE_DIR, "staging", "Master_CA_Project_List_Cleaned.csv")
 DEFAULT_METADATA_DIR = os.path.join(WORKSPACE_DIR, "downloads", "metadata")
+DEFAULT_STATION_CONFIG_CACHE_DIR = os.path.join(WORKSPACE_DIR, "downloads", "station_config_cache")
 
 CENSUS_PATHS = [
     os.path.join(WORKSPACE_DIR, "ALL_CENSUS_STATIONS.tsv"),
@@ -379,7 +391,7 @@ class PeMSClient:
             except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
                 last_exc = exc
                 if attempt < max_retries:
-                    current_timeout = max(current_timeout, 90.0)
+                    current_timeout = max(current_timeout * 1.5, min(timeout + 15.0, 45.0))
                     LOGGER.warning(
                         f"PeMS server response slow (timed out after {timeout:.0f}s). Retrying (attempt {attempt + 1}/{max_retries}) with {current_timeout:.0f}s timeout..."
                     )
@@ -618,7 +630,7 @@ def build_station_summary_url(station_id: str) -> str:
 def build_station_config_url(station_id: str) -> str:
     """Construct PeMS VDS Configuration URL (lane configuration table and TSN roadway metrics)."""
     st_id = str(station_id).strip()
-    return f"{BASE_URL}/?report_form=1&dnode=VDS&content=sta_cfg&station_id={st_id}"
+    return f"{BASE_URL}/?dnode=VDS&content=sta_cfg&tab=sta_cfg&station_id={st_id}"
 
 
 def build_clearinghouse_url(district: Any, year: int, file_type: str = "station_aadt") -> str:
@@ -2900,7 +2912,8 @@ _INDEXED_VDS_META: Optional[IndexedVDSMetadata] = None
 def download_all_district_metadata(
     client: PeMSClient,
     target_dir: str = DEFAULT_METADATA_DIR,
-    districts: Tuple[str, ...] = ("3", "4", "5", "6", "7", "8", "10", "11", "12")
+    districts: Tuple[str, ...] = ("3", "4", "5", "6", "7", "8", "10", "11", "12"),
+    force: bool = False
 ) -> Dict[str, str]:
     """Download and cache latest station metadata files for all instrumented Caltrans districts."""
     os.makedirs(target_dir, exist_ok=True)
@@ -2913,7 +2926,7 @@ def download_all_district_metadata(
 
     for d in districts:
         cache_file = os.path.join(target_dir, f"d{int(d):02d}_meta.txt")
-        if os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
+        if not force and os.path.exists(cache_file) and os.path.getsize(cache_file) > 1000:
             downloaded[d] = cache_file
             continue
 
@@ -2943,18 +2956,19 @@ def download_all_district_metadata(
 def load_vds_metadata(
     meta_dir: Optional[str] = None,
     client: Optional[PeMSClient] = None,
-    auto_download: bool = False
+    auto_download: bool = False,
+    refresh: bool = False
 ) -> IndexedVDSMetadata:
     """Load and index statewide VDS detector metadata from cached text files."""
     global _INDEXED_VDS_META
-    if _INDEXED_VDS_META is not None and meta_dir is None:
+    if not refresh and _INDEXED_VDS_META is not None and meta_dir is None:
         return _INDEXED_VDS_META
 
     target_dir = meta_dir or DEFAULT_METADATA_DIR
     meta_files = sorted(glob.glob(os.path.join(target_dir, "*.txt")))
 
-    if not meta_files and auto_download and client is not None:
-        download_all_district_metadata(client, target_dir)
+    if ((not meta_files and auto_download) or refresh) and client is not None:
+        download_all_district_metadata(client, target_dir, force=refresh)
         meta_files = sorted(glob.glob(os.path.join(target_dir, "*.txt")))
 
     if not meta_files:
@@ -2963,7 +2977,7 @@ def load_vds_metadata(
     dfs = []
     for f in meta_files:
         try:
-            df = pd.read_csv(f, sep="\t", dtype=str)
+            df = pd.read_csv(f, sep="\t", dtype=str, on_bad_lines="skip")
             df.columns = df.columns.str.strip()
             if "ID" in df.columns and "Fwy" in df.columns:
                 dfs.append(df)
@@ -2978,10 +2992,10 @@ def load_vds_metadata(
     return _INDEXED_VDS_META
 
 
-def get_indexed_vds_metadata() -> IndexedVDSMetadata:
+def get_indexed_vds_metadata(refresh: bool = False) -> IndexedVDSMetadata:
     global _INDEXED_VDS_META
-    if _INDEXED_VDS_META is None:
-        load_vds_metadata()
+    if _INDEXED_VDS_META is None or refresh:
+        _INDEXED_VDS_META = load_vds_metadata(refresh=refresh)
     return _INDEXED_VDS_META
 
 
@@ -4538,19 +4552,356 @@ def parse_station_configuration_page(
                     if len(td_cells) == len(col_names):
                         details.construction_history.append(dict(zip(col_names, td_cells)))
 
+    # If change log has chronological entries, update station details from the most recent active configuration
+    if details.change_log:
+        latest_log = details.change_log[-1]
+        lat_v = latest_log.get("Lat") or latest_log.get("Latitude")
+        lng_v = latest_log.get("Lng") or latest_log.get("Longitude") or latest_log.get("Lon")
+        if lat_v and lng_v:
+            try:
+                lf, lg = float(lat_v), float(lng_v)
+                if not (np.isnan(lf) or np.isnan(lg) or lf == 0):
+                    details.latitude = lf
+                    details.longitude = lg
+            except (ValueError, TypeError):
+                pass
+        name_v = latest_log.get("Name")
+        if name_v:
+            details.station_name = str(name_v).strip()
+        ca_pm_v = latest_log.get("CA PM") or latest_log.get("State PM")
+        if ca_pm_v:
+            details.ca_pm = str(ca_pm_v).strip()
+        abs_pm_v = latest_log.get("Abs PM")
+        if abs_pm_v:
+            try:
+                details.abs_pm = float(abs_pm_v)
+            except (ValueError, TypeError):
+                pass
+
     return details
+
+
+def station_config_to_dict(st: StationLaneConfigDetails) -> Dict[str, Any]:
+    """Serialize StationLaneConfigDetails to a JSON-compatible dictionary."""
+    return {
+        "station_id": st.station_id,
+        "station_name": st.station_name,
+        "district": st.district,
+        "route": st.route,
+        "direction": st.direction,
+        "county": st.county,
+        "station_type": st.station_type,
+        "ca_pm": st.ca_pm,
+        "abs_pm": st.abs_pm,
+        "latitude": st.latitude,
+        "longitude": st.longitude,
+        "tsn_roadway_info": st.tsn_roadway_info,
+        "lane_table": st.lane_table,
+        "change_log": st.change_log,
+        "construction_history": st.construction_history,
+        "url": st.url,
+        "error": st.error,
+    }
+
+
+def dict_to_station_config(d: Dict[str, Any]) -> StationLaneConfigDetails:
+    """Deserialize a dictionary to a StationLaneConfigDetails object."""
+    abs_pm_val = d.get("abs_pm")
+    lat_val = d.get("latitude")
+    lon_val = d.get("longitude")
+    return StationLaneConfigDetails(
+        station_id=str(d.get("station_id", "")),
+        station_name=str(d.get("station_name", "")),
+        district=d.get("district"),
+        route=d.get("route"),
+        direction=d.get("direction"),
+        county=d.get("county"),
+        station_type=d.get("station_type"),
+        ca_pm=d.get("ca_pm"),
+        abs_pm=float(abs_pm_val) if (abs_pm_val is not None and str(abs_pm_val).strip() != "") else None,
+        latitude=float(lat_val) if (lat_val is not None and str(lat_val).strip() != "") else None,
+        longitude=float(lon_val) if (lon_val is not None and str(lon_val).strip() != "") else None,
+        tsn_roadway_info=d.get("tsn_roadway_info", {}) or {},
+        lane_table=d.get("lane_table", []) or [],
+        change_log=d.get("change_log", []) or [],
+        construction_history=d.get("construction_history", []) or [],
+        url=str(d.get("url", "")),
+        error=d.get("error"),
+    )
+
+
+def load_cached_station_config(
+    station_id: str,
+    cache_dir: Optional[str] = None,
+    require_change_log: bool = True
+) -> Optional[StationLaneConfigDetails]:
+    """Load cached station lane configuration details from disk if available."""
+    cdir = cache_dir or DEFAULT_STATION_CONFIG_CACHE_DIR
+    st_id = str(station_id).strip()
+    cache_path = os.path.join(cdir, f"{st_id}.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # If valid change_log is required, reject failed/timed-out or empty entries
+            if require_change_log and (data.get("error") or not data.get("change_log")):
+                return None
+            return dict_to_station_config(data)
+        except Exception as exc:
+            LOGGER.debug(f"Failed to read cached config for station {st_id}: {exc}")
+    return None
+
+
+def save_cached_station_config(
+    st: StationLaneConfigDetails,
+    cache_dir: Optional[str] = None
+) -> str:
+    """Save station lane configuration details to disk cache as JSON."""
+    cdir = cache_dir or DEFAULT_STATION_CONFIG_CACHE_DIR
+    os.makedirs(cdir, exist_ok=True)
+    st_id = str(st.station_id).strip()
+    cache_path = os.path.join(cdir, f"{st_id}.json")
+    try:
+        data = station_config_to_dict(st)
+        data["cached_at"] = datetime.datetime.now().isoformat()
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return cache_path
+    except Exception as exc:
+        LOGGER.debug(f"Failed to save cached config for station {st_id}: {exc}")
+        return cache_path
+
+
+def get_spreadsheet_sensor_details(
+    station_id: str,
+    proj: Optional[ProjectRecord]
+) -> Optional[Dict[str, Any]]:
+    """Extract sensor before/after lanes, activation dates, and attributes from the master spreadsheet row."""
+    if not proj or not proj.raw_row:
+        return None
+    st_clean = str(station_id).strip()
+    row = proj.raw_row
+    for k in range(1, 12):
+        sid_keys = [
+            f"Sensor Station {k} ID",
+            f"Sensor Station {k} ID ",
+            f"Sensor {k} ID",
+            f"sensor_station_{k}_id",
+        ]
+        matched_k = None
+        for key in sid_keys:
+            val = str(row.get(key, "")).strip().replace(".0", "")
+            if val == st_clean:
+                matched_k = k
+                break
+        if matched_k is not None:
+            b_val = (
+                row.get(f"Sensor Station {matched_k}: number of lanes before")
+                or row.get(f"Sensor Station {matched_k}: number of lanes before ")
+                or row.get(f"Sensor Station {matched_k}: lanes before")
+            )
+            a_val = (
+                row.get(f"Sensor Station {matched_k}: number of lanes after")
+                or row.get(f"Sensor Station {matched_k}: number of lanes after ")
+                or row.get(f"Sensor Station {matched_k}: lanes after")
+            )
+            yr_val = (
+                row.get(f"s{matched_k}_new_lane_year")
+                or row.get(f"Sensor {matched_k} Activation Date for New Lane")
+            )
+            type_val = (
+                row.get(f"Sensor Station {matched_k}: lane type")
+                or row.get(f"Sensor Station {matched_k} Type")
+            )
+            width_val = row.get(f"Sensor Station {matched_k}: lane width (ft)")
+
+            clean_b = str(b_val).strip() if (b_val is not None and pd.notna(b_val) and str(b_val).strip() not in ("nan", "")) else None
+            clean_a = str(a_val).strip() if (a_val is not None and pd.notna(a_val) and str(a_val).strip() not in ("nan", "")) else None
+            clean_yr = str(yr_val).strip() if (yr_val is not None and pd.notna(yr_val) and str(yr_val).strip() not in ("nan", "")) else None
+            clean_type = str(type_val).strip() if (type_val is not None and pd.notna(type_val) and str(type_val).strip() not in ("nan", "")) else None
+            clean_w = str(width_val).strip() if (width_val is not None and pd.notna(width_val) and str(width_val).strip() not in ("nan", "")) else None
+
+            if clean_b or clean_a or clean_yr:
+                return {
+                    "index": matched_k,
+                    "lanes_before": clean_b,
+                    "lanes_after": clean_a,
+                    "new_lane_year": clean_yr,
+                    "lane_type": clean_type,
+                    "lane_width": clean_w,
+                }
+    return None
+
+
+def format_station_lane_config_tooltip(
+    st: StationLaneConfigDetails,
+    vds_rec: Optional[VDSStationRecord] = None,
+    project: Optional[ProjectRecord] = None
+) -> str:
+    """
+    Format a concise, high-density monospace summary of a station's current lane configuration,
+    lane breakdown, historical change log (lane counts over time), TSN roadway cross-section,
+    and spreadsheet sensor audit data for interactive hover tooltips.
+    """
+    lines: List[str] = []
+    st_type = st.station_type or (vds_rec.type if vds_rec else "VDS")
+    name = st.station_name or (vds_rec.name if vds_rec else "")
+    fwy = st.route or (vds_rec.fwy if vds_rec else "-")
+    d = st.direction or (vds_rec.dir if vds_rec else "")
+    co = st.county or (vds_rec.county if vds_rec else "-")
+    pm = st.ca_pm or (vds_rec.state_pm if vds_rec else "-")
+    abs_pm = (
+        f"{st.abs_pm:.2f}"
+        if (st.abs_pm is not None and not np.isnan(st.abs_pm))
+        else (f"{vds_rec.abs_pm:.2f}" if (vds_rec and vds_rec.abs_pm is not None and not np.isnan(vds_rec.abs_pm)) else "-")
+    )
+
+    hdr_name = f" - {name}" if name else ""
+    lines.append(f"STATION {st.station_id} ({st_type}){hdr_name}")
+    lines.append(f"Fwy: {fwy} {d} | County: {co} PM {pm} (Abs: {abs_pm})")
+    lines.append("-" * 46)
+
+    # 1. Current Lane Configuration
+    curr_lanes = len(st.lane_table) if st.lane_table else (vds_rec.lanes if vds_rec else None)
+    curr_str = f"{curr_lanes}" if curr_lanes is not None else "-"
+    lines.append(f"CURRENT LANES: {curr_str}")
+    if st.lane_table:
+        for r in st.lane_table:
+            l_num = r.get("Lane", "?")
+            l_type = r.get("Type", "Lane")
+            l_tech = r.get("Sensor Tech")
+            tech_str = f" ({l_tech})" if l_tech else ""
+            lines.append(f"  • Lane {l_num}: {l_type}{tech_str}")
+    elif vds_rec and vds_rec.lanes:
+        lines.append(f"  • {vds_rec.lanes} mainline lanes recorded in VDS index")
+    lines.append("-" * 46)
+
+    # 2. Lane Counts Over Time (PeMS Change Log)
+    lines.append("LANE COUNTS OVER TIME (PeMS Change Log):")
+    if st.change_log:
+        def _parse_date(d_str: str) -> datetime.datetime:
+            try:
+                return datetime.datetime.strptime(d_str.strip(), "%m/%d/%Y")
+            except Exception:
+                try:
+                    return datetime.datetime.strptime(d_str.strip(), "%Y-%m-%d")
+                except Exception:
+                    return datetime.datetime.min
+
+        sorted_cl = sorted(st.change_log, key=lambda x: _parse_date(x.get("Date", "")))
+        cols: List[str] = []
+        for r in sorted_cl:
+            for k in r.keys():
+                if k not in cols:
+                    cols.append(k)
+        if cols:
+            col_widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in sorted_cl)) for c in cols}
+            hdr_str = "  " + "  ".join(f"{c:<{col_widths[c]}}" for c in cols)
+            sep_str = "  " + "  ".join("-" * col_widths[c] for c in cols)
+            lines.append(hdr_str.rstrip())
+            lines.append(sep_str.rstrip())
+            for r in sorted_cl:
+                row_str = "  " + "  ".join(f"{str(r.get(c, '')):<{col_widths[c]}}" for c in cols)
+                lines.append(row_str.rstrip())
+        else:
+            lines.append("  (No configuration records found)")
+    else:
+        lines.append(f"  • Current: {curr_str} lanes")
+        if st.error:
+            lines.append("  (Historical configuration not cached; PeMS query timed out)")
+        else:
+            lines.append("  (No configuration history recorded in PeMS)")
+
+    # 3. PeMS Construction History (if recorded in PeMS)
+    if st.construction_history:
+        lines.append("-" * 46)
+        lines.append("CONSTRUCTION HISTORY:")
+        cols_c: List[str] = []
+        for r in st.construction_history:
+            for k in r.keys():
+                if k not in cols_c:
+                    cols_c.append(k)
+        if cols_c:
+            col_widths_c = {c: max(len(c), max(len(str(r.get(c, ""))) for r in st.construction_history)) for c in cols_c}
+            hdr_str_c = "  " + "  ".join(f"{c:<{col_widths_c[c]}}" for c in cols_c)
+            sep_str_c = "  " + "  ".join("-" * col_widths_c[c] for c in cols_c)
+            lines.append(hdr_str_c.rstrip())
+            lines.append(sep_str_c.rstrip())
+            for r in st.construction_history:
+                row_str_c = "  " + "  ".join(f"{str(r.get(c, '')):<{col_widths_c[c]}}" for c in cols_c)
+                lines.append(row_str_c.rstrip())
+
+    # 3. Master Spreadsheet Sensor Audit (if applicable)
+    sheet_audit = get_spreadsheet_sensor_details(st.station_id, project) if project else None
+    if sheet_audit:
+        lines.append("-" * 46)
+        lines.append(f"SPREADSHEET AUDIT (Sensor #{sheet_audit['index']}):")
+        b_str = sheet_audit.get("lanes_before") or "-"
+        a_str = sheet_audit.get("lanes_after") or "-"
+        yr_str = sheet_audit.get("new_lane_year") or "-"
+        lines.append(f"  Lanes: {b_str} before -> {a_str} after")
+        if yr_str != "-":
+            lines.append(f"  New Lane Activation: {yr_str}")
+        if sheet_audit.get("lane_type"):
+            lines.append(f"  Type: {sheet_audit['lane_type']}")
+
+    # 4. Caltrans TSN Roadway Metrics
+    if st.tsn_roadway_info and st.tsn_roadway_info.get("Status") != "Not Available in PeMS":
+        rw = st.tsn_roadway_info.get("Road Width")
+        lw = st.tsn_roadway_info.get("Lane Width")
+        spd = st.tsn_roadway_info.get("Design Speed Limit")
+        med = st.tsn_roadway_info.get("Inner Median Type")
+        if rw or lw or spd or med:
+            lines.append("-" * 46)
+            lines.append("TSN ROADWAY CROSS-SECTION:")
+            if rw or lw:
+                lines.append(f"  Road Width: {rw or '-'} | Lane Width: {lw or '-'}")
+            if spd or med:
+                lines.append(f"  Speed Limit: {spd or '-'} | Median: {med or '-'}")
+
+    return "\n".join(lines)
 
 
 def fetch_station_lane_configuration(
     station_id: str,
     client: Optional[PeMSClient] = None,
     vds_record: Optional[VDSStationRecord] = None,
-    timeout: float = 60.0
+    timeout: float = 60.0,
+    use_cache: bool = True,
+    cache_dir: Optional[str] = None
 ) -> StationLaneConfigDetails:
     """
     Fetch and parse raw PeMS station lane configuration, change log, and TSN roadway metrics for a single station.
+    Supports persistent disk caching to avoid redundant slow network queries across tool executions.
     """
     st_id = str(station_id).strip()
+
+    if use_cache:
+        cached = load_cached_station_config(st_id, cache_dir=cache_dir)
+        if cached is not None:
+            if vds_record:
+                if not cached.station_name and vds_record.name:
+                    cached.station_name = vds_record.name
+                if not cached.district and vds_record.district:
+                    cached.district = str(vds_record.district)
+                if not cached.route and vds_record.fwy:
+                    cached.route = str(vds_record.fwy)
+                if not cached.direction and vds_record.dir:
+                    cached.direction = vds_record.dir
+                if not cached.county and vds_record.county:
+                    cached.county = str(vds_record.county)
+                if not cached.station_type and vds_record.type:
+                    cached.station_type = vds_record.type
+                if not cached.ca_pm and vds_record.state_pm:
+                    cached.ca_pm = str(vds_record.state_pm)
+                if cached.abs_pm is None and vds_record.abs_pm is not None:
+                    cached.abs_pm = vds_record.abs_pm
+                if cached.latitude is None and vds_record.latitude is not None:
+                    cached.latitude = vds_record.latitude
+                if cached.longitude is None and vds_record.longitude is not None:
+                    cached.longitude = vds_record.longitude
+            return cached
+
     if client is None:
         client = PeMSClient()
         client.login()
@@ -4558,15 +4909,6 @@ def fetch_station_lane_configuration(
     url = build_station_config_url(st_id)
     try:
         html_txt = client.get_text_content(url, timeout=timeout)
-        if not html_txt:
-            # Fallback to direct tab URL without report_form=1 if primary attempt timed out or was empty
-            tab_url = f"{BASE_URL}/?dnode=VDS&content=sta_cfg&tab=sta_cfg&station_id={st_id}"
-            if tab_url != url:
-                LOGGER.info(f"Retrying station {st_id} configuration with browser tab URL ({tab_url})...")
-                html_txt = client.get_text_content(tab_url, timeout=timeout)
-                if html_txt:
-                    url = tab_url
-
         if not html_txt:
             details = StationLaneConfigDetails(
                 station_id=st_id,
@@ -4584,9 +4926,16 @@ def fetch_station_lane_configuration(
                 details.abs_pm = vds_record.abs_pm
                 details.latitude = vds_record.latitude
                 details.longitude = vds_record.longitude
+                if vds_record.lanes:
+                    details.lane_table = [{"Lane": str(i + 1), "Type": vds_record.type or "Mainline"} for i in range(vds_record.lanes)]
+            if use_cache:
+                save_cached_station_config(details, cache_dir=cache_dir)
             return details
 
-        return parse_station_configuration_page(html_txt, station_id=st_id, vds_record=vds_record)
+        details = parse_station_configuration_page(html_txt, station_id=st_id, vds_record=vds_record)
+        if use_cache:
+            save_cached_station_config(details, cache_dir=cache_dir)
+        return details
     except Exception as exc:
         LOGGER.warning(f"Failed to fetch configuration for station {st_id}: {exc}")
         details = StationLaneConfigDetails(
@@ -4605,6 +4954,8 @@ def fetch_station_lane_configuration(
             details.abs_pm = vds_record.abs_pm
             details.latitude = vds_record.latitude
             details.longitude = vds_record.longitude
+        if use_cache:
+            save_cached_station_config(details, cache_dir=cache_dir)
         return details
 
 
@@ -5510,24 +5861,29 @@ def add_standard_basemaps_to_map(
     """
     carto_key = os.getenv("CARTO_API_KEY", "").strip()
 
-    # 1. Primary Default: Esri Light Gray Canvas (clean, muted, no API key, works over file://)
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-        attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
-        name="Esri Light Gray (Default)",
-        overlay=False,
-        control=True,
-        max_zoom=16
-    ).add_to(m)
+    is_street_default = (default_tiles is None or default_tiles in ("esri_street", "street", "default"))
+    is_gray_default = (default_tiles in ("esri_gray", "gray", "light_gray"))
 
-    # 2. Esri World Street Map (high-detail roads, freeways, street names)
+    # 1. Primary Default: Esri World Street Map (high-detail roads, freeways, street names, max_zoom 19)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
         attr="Tiles &copy; Esri &mdash; Source: Esri, DeLorme, NAVTEQ, USGS",
-        name="Esri Street Map",
+        name="Esri Street Map (Default)" if is_street_default else "Esri Street Map",
         overlay=False,
         control=True,
+        show=is_street_default,
         max_zoom=19
+    ).add_to(m)
+
+    # 2. Esri Light Gray Canvas (clean, muted, no API key, works over file://)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
+        name="Esri Light Gray (Default)" if is_gray_default else "Esri Light Gray",
+        overlay=False,
+        control=True,
+        show=is_gray_default,
+        max_zoom=16
     ).add_to(m)
 
     # 3. USGS Topographic (terrain contours, elevation)
@@ -5537,6 +5893,7 @@ def add_standard_basemaps_to_map(
         name="USGS Topo",
         overlay=False,
         control=True,
+        show=False,
         max_zoom=16
     ).add_to(m)
 
@@ -5548,6 +5905,7 @@ def add_standard_basemaps_to_map(
             name="CartoDB Positron (Authenticated)",
             overlay=False,
             control=True,
+            show=False,
             max_zoom=20
         ).add_to(m)
 
@@ -5558,17 +5916,19 @@ def add_standard_basemaps_to_map(
         name="OpenStreetMap (HTTP Only)",
         overlay=False,
         control=True,
+        show=False,
         max_zoom=19
     ).add_to(m)
 
     # 6. Custom user tiles if explicitly specified and not one of the legacy keywords
-    if default_tiles and default_tiles not in ("cartodbpositron", "cartodb_positron", "openstreetmap", "esri_gray"):
+    if default_tiles and not (is_street_default or is_gray_default) and default_tiles not in ("cartodbpositron", "cartodb_positron", "openstreetmap"):
         folium.TileLayer(
             tiles=default_tiles,
             attr="Custom Tile Provider",
             name="Custom Base Layer",
             overlay=False,
-            control=True
+            control=True,
+            show=True
         ).add_to(m)
 
 
@@ -5749,6 +6109,9 @@ def build_single_project_map(
 
                 for st, in_bounds, b_note, in_sheet, target_p in st_tuple_list:
                     lat, lng = st.latitude, st.longitude
+                    cached_st = load_cached_station_config(st.id)
+                    if cached_st and cached_st.latitude and cached_st.longitude:
+                        lat, lng = cached_st.latitude, cached_st.longitude
                     if lat is None or lng is None or np.isnan(lat) or np.isnan(lng) or lat == 0:
                         _, st_num = st.ca_pm_prefix_and_num
                         if not np.isnan(st_num):
@@ -5837,6 +6200,112 @@ def build_single_project_map(
     display: none !important;
   }
 </style>
+"""))
+
+    m.get_root().html.add_child(folium.Element("""
+<script>
+  window._currentFocusMarkers = [];
+
+  function getLeafletMap() {
+    for (var k in window) {
+      if (k.indexOf('map_') === 0 && window[k] && typeof window[k].setView === 'function') {
+        return window[k];
+      }
+    }
+    return null;
+  }
+
+  window.clearFocusMarkers = function() {
+    var mapObj = getLeafletMap();
+    if (mapObj && window._currentFocusMarkers) {
+      while (window._currentFocusMarkers.length > 0) {
+        var m = window._currentFocusMarkers.pop();
+        try { mapObj.removeLayer(m); } catch(e) {}
+      }
+    }
+    window._currentFocusMarkers = [];
+  };
+
+  window.centerMapAt = function(lat, lon, zoom, label) {
+    if (isNaN(lat) || isNaN(lon)) return;
+    var z = (zoom && !isNaN(zoom)) ? parseInt(zoom) : 17;
+    var mapObj = getLeafletMap();
+    if (!mapObj) return;
+
+    window.clearFocusMarkers();
+    mapObj.setView([lat, lon], z, {animate: true});
+
+    if (window.L && typeof window.L.circleMarker === 'function') {
+      var marker = window.L.circleMarker([lat, lon], {
+        radius: 12,
+        color: '#e11d48',
+        fillColor: '#fb7185',
+        fillOpacity: 0.5,
+        weight: 3
+      }).addTo(mapObj);
+
+      if (label) {
+        marker.bindTooltip(label, {permanent: true, direction: 'top'}).openTooltip();
+      }
+
+      // Allow clicking the focus marker itself to dismiss it
+      marker.on('click', function(ev) {
+        if (window.L && window.L.DomEvent) {
+          window.L.DomEvent.stopPropagation(ev);
+        }
+        window.clearFocusMarkers();
+      });
+
+      window._currentFocusMarkers.push(marker);
+    }
+  };
+
+  function setupMapDismissListeners() {
+    var mapObj = getLeafletMap();
+    if (mapObj && !mapObj._hasDismissClick) {
+      mapObj._hasDismissClick = true;
+      mapObj.on('click', function() {
+        window.clearFocusMarkers();
+      });
+    }
+  }
+
+  function centerFromHash() {
+    var h = window.location.hash;
+    if (!h || h.length < 2) return;
+    var clean = h.substring(1).replace(/^#/, '');
+    var parts = clean.split(',');
+    if (parts.length >= 2) {
+      var lat = parseFloat(parts[0]);
+      var lon = parseFloat(parts[1]);
+      var z = parts.length >= 3 ? parseInt(parts[2]) : 17;
+      var lbl = parts.length >= 4 ? decodeURIComponent(parts[3]) : 'Selected Location';
+      if (!isNaN(lat) && !isNaN(lon)) {
+        window.centerMapAt(lat, lon, z, lbl);
+      }
+    }
+  }
+
+  // Handle messages posted from parent window (cross-window postMessage is 100% reliable)
+  window.addEventListener('message', function(event) {
+    if (event.data && event.data.type === 'FOCUS_MAP') {
+      window.centerMapAt(event.data.lat, event.data.lon, event.data.zoom, event.data.label);
+    }
+  });
+
+  window.addEventListener('DOMContentLoaded', function() {
+    setupMapDismissListeners();
+    setTimeout(function() {
+      setupMapDismissListeners();
+      centerFromHash();
+    }, 250);
+    setTimeout(function() {
+      setupMapDismissListeners();
+      centerFromHash();
+    }, 600);
+    window.addEventListener('hashchange', centerFromHash);
+  });
+</script>
 """))
 
     if output_path:
@@ -6232,6 +6701,8 @@ def slice_project_corridor(
             min_dev, max_dev, max_abs_dev, lat_shift, lat_hspan = calculate_corridor_curvature_bounds(
                 start_c, end_c, sub_coords
             )
+            mid_lat = (start_c[0] + end_c[0]) / 2.0
+            mid_lon = (start_c[1] + end_c[1]) / 2.0
 
             slices.append({
                 "index": len(slices) + 1,
@@ -6241,6 +6712,7 @@ def slice_project_corridor(
                 "abs_end_pm": round(float(p1["_abs_pm"]), 2) if "_abs_pm" in p1 and pd.notna(p1["_abs_pm"]) else None,
                 "start_coords": start_c,
                 "end_coords": end_c,
+                "midpoint": (round(mid_lat, 6), round(mid_lon, 6)),
                 "length_mi": length,
                 "curvature_dev_m": round(max_abs_dev, 2),
                 "lateral_shift_m": round(lat_shift, 2),
@@ -6270,12 +6742,15 @@ def slice_project_corridor(
                 e_coords = (lat1 + t1 * (lat2 - lat1), lon1 + t1 * (lon2 - lon1))
                 s_pm = p_start_pm + t0 * (p_end_pm - p_start_pm)
                 e_pm_val = p_start_pm + t1 * (p_end_pm - p_start_pm)
+                m_lat = (s_coords[0] + e_coords[0]) / 2.0
+                m_lon = (s_coords[1] + e_coords[1]) / 2.0
                 slices.append({
                     "index": k + 1,
                     "start_pm": round(s_pm, 2),
                     "end_pm": round(e_pm_val, 2),
                     "start_coords": s_coords,
                     "end_coords": e_coords,
+                    "midpoint": (round(m_lat, 6), round(m_lon, 6)),
                     "length_mi": round(abs(e_pm_val - s_pm), 2),
                     "curvature_dev_m": 0.0,
                     "coords": [s_coords, e_coords],
@@ -6364,7 +6839,8 @@ def generate_slices_html_report(
     before_meta: Dict[str, Any],
     after_meta: Dict[str, Any],
     output_dir: str,
-    overview_img: Optional[str] = None
+    overview_img: Optional[str] = None,
+    map_file: Optional[str] = "project_map.html"
 ) -> str:
     """
     Generate a self-contained, interactive HTML comparison report with Before/After curtain wipe sliders.
@@ -6382,6 +6858,20 @@ def generate_slices_html_report(
         st_fn = os.path.basename(s["stacked_image"])
         s_pm_str = f"PM {s['start_pm']:.2f} &rarr; {s['end_pm']:.2f}"
         nav_links.append(f'<a href="#seg-{idx}" class="nav-chip">Seg {idx} ({s_pm_str})</a>')
+
+        # Coordinates for external verification
+        mid_lat, mid_lon = s.get("midpoint") or (0.0, 0.0)
+        if (mid_lat == 0.0 or mid_lon == 0.0) and "start_coords" in s and "end_coords" in s:
+            mid_lat = (s["start_coords"][0] + s["end_coords"][0]) / 2.0
+            mid_lon = (s["start_coords"][1] + s["end_coords"][1]) / 2.0
+        if (mid_lat == 0.0 or mid_lon == 0.0) and project.start_coords:
+            mid_lat, mid_lon = project.start_coords
+
+        length_mi = s.get("length_mi", 0.25)
+        eye_dist = max(450, int(length_mi * 1609.34 * 1.6))
+        ge_url = f"https://earth.google.com/web/@{mid_lat:.6f},{mid_lon:.6f},0a,{eye_dist}d,35y,0h,0t,0r"
+        gmaps_url = f"https://www.google.com/maps/@{mid_lat:.6f},{mid_lon:.6f},18z/data=!3m1!1e3"
+        local_map_target = f"{map_file}#{mid_lat:.6f},{mid_lon:.6f},17,Segment%20{idx}%20Center" if map_file else f"#{mid_lat:.6f},{mid_lon:.6f},17,Segment%20{idx}%20Center"
 
         sensors_callout = ""
         if s.get("sensors"):
@@ -6413,6 +6903,23 @@ def generate_slices_html_report(
             </div>
           </div>
 
+          <!-- Quick Verification Links next to each imagery slice -->
+          <div class="slice-verification-bar">
+            <span class="verif-label">Ground-Truth Verification:</span>
+            <a href="{ge_url}" target="_blank" rel="noopener noreferrer" class="verif-link ge-link" title="Open Google Earth 3D at midpoint ({mid_lat:.5f}, {mid_lon:.5f}) to inspect road markings, turn pockets, and lanes">
+              [Google Earth]
+            </a>
+            <a href="{local_map_target}" target="_blank" rel="noopener noreferrer" class="verif-link map-link" title="Open local project map centered on this segment with all PeMS detector stations and lane overlays">
+              [Local Station Map]
+            </a>
+            <a href="{gmaps_url}" target="_blank" rel="noopener noreferrer" class="verif-link gmaps-link" title="Open Google Maps satellite view for this segment">
+              [Google Maps]
+            </a>
+            <a href="{st_fn}" target="_blank" rel="noopener noreferrer" class="verif-link file-link" title="Open raw full-resolution stacked comparison PNG">
+              [Stacked PNG]
+            </a>
+          </div>
+
           {sensors_callout}
 
           <!-- View: Curtain Wipe Slider -->
@@ -6420,11 +6927,13 @@ def generate_slices_html_report(
             <div class="compare-box" id="compare-box-{idx}">
               <img src="{b_fn}" class="img-base" alt="Before Image" loading="lazy">
               <img src="{a_fn}" class="img-overlay" alt="After Image" loading="lazy">
+              <div class="slider-tag slider-tag-after">AFTER: {s['after_capture_date']}</div>
+              <div class="slider-tag slider-tag-before">BEFORE: {s['before_capture_date']}</div>
               <div class="slider-divider">
                 <div class="slider-thumb">&#8596;</div>
               </div>
             </div>
-            <div class="slider-hint">&lt; Drag slider to wipe between Pre-Construction and Post-Opening imagery &gt;</div>
+            <div class="slider-hint">&lt; Drag slider to wipe between Before and After imagery &gt;</div>
           </div>
 
           <!-- View: Vertically Stacked -->
@@ -6447,7 +6956,12 @@ def generate_slices_html_report(
           </div>
 
           <div class="segment-footer">
-            <span class="meta-note">Resolution: Native Zoom {s.get('zoom', 19)} (~0.3m/px) | Dimensions: {s.get('width', 0)}&times;{s.get('height', 0)} px | <a href="{st_fn}" target="_blank" style="color: #000; text-decoration: underline;">[View Full Stacked PNG]</a></span>
+            <span class="meta-note">
+              Midpoint: {mid_lat:.5f}, {mid_lon:.5f} | Resolution: Native Zoom {s.get('zoom', 19)} (~0.3m/px) | Dimensions: {s.get('width', 0)}&times;{s.get('height', 0)} px |
+              <a href="{ge_url}" target="_blank" style="color:#000; text-decoration:underline;">[Google Earth]</a>
+              <a href="{local_map_target}" target="_blank" style="color:#000; text-decoration:underline; margin-left:6px;">[Local Station Map]</a>
+              <a href="{st_fn}" target="_blank" style="color:#000; text-decoration:underline; margin-left:6px;">[View Full Stacked PNG]</a>
+            </span>
           </div>
         </div>
         """
@@ -6651,7 +7165,26 @@ def generate_slices_html_report(
       height: 100%;
       object-fit: cover;
       pointer-events: none;
-      clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%);
+      clip-path: inset(0 50% 0 0);
+    }}
+    .slider-tag {{
+      position: absolute;
+      top: 8px;
+      z-index: 5;
+      background: rgba(0, 0, 0, 0.75);
+      color: #ffffff;
+      padding: 2px 6px;
+      font-size: 10px;
+      font-weight: bold;
+      pointer-events: none;
+      letter-spacing: 0.5px;
+      line-height: 1.2;
+    }}
+    .slider-tag-after {{
+      left: 8px;
+    }}
+    .slider-tag-before {{
+      right: 8px;
     }}
     .slider-divider {{
       position: absolute;
@@ -6661,6 +7194,7 @@ def generate_slices_html_report(
       width: 2px;
       background: #ffffff;
       pointer-events: none;
+      z-index: 4;
     }}
     .slider-thumb {{
       position: absolute;
@@ -6714,6 +7248,81 @@ def generate_slices_html_report(
       font-size: 11px;
       color: #555555;
     }}
+    .slice-verification-bar {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 8px 0 12px 0;
+      padding: 6px 10px;
+      background: #fafafa;
+      border: 1px solid #000000;
+      font-size: 11px;
+    }}
+    .verif-label {{
+      font-weight: bold;
+      color: #000000;
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: 0.5px;
+      margin-right: 4px;
+    }}
+    .verif-link {{
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      background: #ffffff;
+      color: #000000;
+      border: 1px solid #000000;
+      text-decoration: none;
+      font-size: 11px;
+      font-weight: bold;
+      line-height: 1.2;
+    }}
+    .verif-link:hover {{
+      background: #000000;
+      color: #ffffff;
+    }}
+    .verif-link.ge-link {{
+      background: #f0fdf4;
+      border-color: #166534;
+      color: #166534;
+    }}
+    .verif-link.ge-link:hover {{
+      background: #166534;
+      color: #ffffff;
+    }}
+    .verif-link.map-link {{
+      background: #eff6ff;
+      border-color: #1d4ed8;
+      color: #1d4ed8;
+    }}
+    .verif-link.map-link:hover {{
+      background: #1d4ed8;
+      color: #ffffff;
+    }}
+    .verif-link.gmaps-link {{
+      background: #fffbeb;
+      border-color: #b45309;
+      color: #b45309;
+    }}
+    .verif-link.gmaps-link:hover {{
+      background: #b45309;
+      color: #ffffff;
+    }}
+    .verif-link.file-link {{
+      background: #f8fafc;
+      border-color: #334155;
+      color: #334155;
+    }}
+    .verif-link.file-link:hover {{
+      background: #334155;
+      color: #ffffff;
+    }}
+    .verif-icon {{
+      font-size: 12px;
+    }}
   </style>
 </head>
 <body>
@@ -6728,7 +7337,9 @@ def generate_slices_html_report(
 </header>
 
 <div class="nav-bar">
+  <span style="font-weight:bold; color:#444; align-self:center; margin-right:4px;">SLICES:</span>
   {nav_chips_html}
+  {f'<span style="border-left: 1px solid #ccc; margin: 0 4px;"></span><a href="{map_file}" target="_blank" class="nav-chip" style="background:#eff6ff; border-color:#1d4ed8; color:#1d4ed8; font-weight:bold;">[Full Project Map with Stations]</a>' if map_file else ''}
 </div>
 
 <div class="container">
@@ -6773,7 +7384,7 @@ def generate_slices_html_report(
       if (x < 0) x = 0;
       if (x > rect.width) x = rect.width;
       const pct = (x / rect.width) * 100;
-      overlay.style.clipPath = `polygon(0 0, ${{pct.toFixed(2)}}% 0, ${{pct.toFixed(2)}}% 100%, 0 100%)`;
+      overlay.style.clipPath = `inset(0 ${{(100 - pct).toFixed(2)}}% 0 0)`;
       divider.style.left = `${{pct.toFixed(2)}}%`;
     }}
 
@@ -6806,7 +7417,7 @@ def generate_slices_html_report(
     }}, {{passive: true}});
 
     box.addEventListener('dblclick', () => {{
-      overlay.style.clipPath = 'polygon(0 0, 50% 0, 50% 100%, 0 100%)';
+      overlay.style.clipPath = 'inset(0 0 0 50%)';
       divider.style.left = '50%';
     }});
   }});
@@ -6851,7 +7462,9 @@ def generate_corridor_slices(
     custom_before_date: Optional[str] = None,
     custom_after_date: Optional[str] = None,
     open_browser: bool = True,
-    workers: int = 8,
+    workers: int = 16,
+    prioritize_quality: bool = True,
+    quality_window: float = 5.0,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -6923,15 +7536,32 @@ def generate_corridor_slices(
     if verbose:
         print(f"  Querying Esri Wayback archive for capture flights around {d_before} and {d_after}...")
 
-    try:
-        c_before = wayback.find_release_by_capture(d_before, lon_c, lat_c, zoom=zoom, mode="before")
-    except ValueError:
-        c_before = wayback.find_release_by_capture(d_before, lon_c, lat_c, zoom=zoom, mode="nearest")
+    # Shared persistent session with large connection pool
+    imagery_session = getattr(wayback, "_make_session", lambda pool_size=64: requests.Session())(pool_size=max(64, workers * 4))
 
     try:
-        c_after = wayback.find_release_by_capture(d_after, lon_c, lat_c, zoom=zoom, mode="after")
-    except ValueError:
-        c_after = wayback.find_release_by_capture(d_after, lon_c, lat_c, zoom=zoom, mode="nearest")
+        c_before = wayback.find_release_by_capture(
+            d_before, lon_c, lat_c, zoom=zoom, mode="before",
+            session=imagery_session, workers=max(16, workers),
+            prioritize_quality=prioritize_quality, max_year_gap=quality_window
+        )
+    except (ValueError, TypeError):
+        try:
+            c_before = wayback.find_release_by_capture(d_before, lon_c, lat_c, zoom=zoom, mode="before")
+        except ValueError:
+            c_before = wayback.find_release_by_capture(d_before, lon_c, lat_c, zoom=zoom, mode="nearest")
+
+    try:
+        c_after = wayback.find_release_by_capture(
+            d_after, lon_c, lat_c, zoom=zoom, mode="after",
+            session=imagery_session, workers=max(16, workers),
+            prioritize_quality=prioritize_quality, max_year_gap=quality_window
+        )
+    except (ValueError, TypeError):
+        try:
+            c_after = wayback.find_release_by_capture(d_after, lon_c, lat_c, zoom=zoom, mode="after")
+        except ValueError:
+            c_after = wayback.find_release_by_capture(d_after, lon_c, lat_c, zoom=zoom, mode="nearest")
 
     before_rel_id = c_before.release.release_id
     after_rel_id = c_after.release.release_id
@@ -6939,8 +7569,10 @@ def generate_corridor_slices(
     after_cap_str = c_after.capture_date.isoformat() if c_after.capture_date else str(d_after)
 
     if verbose:
-        print(f"  ✓ Resolved BEFORE release {before_rel_id} (Captured: {before_cap_str})")
-        print(f"  ✓ Resolved AFTER  release {after_rel_id} (Captured: {after_cap_str})")
+        b_res_note = f" @ {c_before.resolution_m:g}m/px" if c_before.resolution_m else ""
+        a_res_note = f" @ {c_after.resolution_m:g}m/px" if c_after.resolution_m else ""
+        print(f"  ✓ Resolved BEFORE release {before_rel_id} (Captured: {before_cap_str}{b_res_note})")
+        print(f"  ✓ Resolved AFTER  release {after_rel_id} (Captured: {after_cap_str}{a_res_note})")
 
     # 6. Map sensors to slices
     sensors_by_slice = {s["index"]: [] for s in slices}
@@ -6969,16 +7601,13 @@ def generate_corridor_slices(
         LOGGER.debug(f"Sensor mapping warning: {exc}")
 
     # 7. Generate each slice
-    slices_data = []
-    for s in slices:
+    def _process_slice(s: Dict[str, Any]) -> Dict[str, Any]:
         idx = s["index"]
         curv_dev = s.get("curvature_dev_m", 0.0)
         lat_shift = s.get("lateral_shift_m", 0.0)
         lat_hspan = s.get("lateral_half_span_m", 0.0)
 
         # Center bounding box laterally over curved roadway and ensure generous vertical height
-        # Default half_width_m is 110.0m to guarantee adequate vertical height (not too wide/narrow)
-        # and prevent road clipping on curves, ramps, shoulders, and multi-lane freeways.
         slice_half_width = max(half_width_m, lat_hspan + 85.0)
 
         # Apply lateral shift to start and end coordinates so corridor box is centered on the road curve
@@ -7001,10 +7630,6 @@ def generate_corridor_slices(
                 s_coords = (lat0 + dlat_shift, lon0 + dlon_shift)
                 e_coords = (lat1 + dlat_shift, lon1 + dlon_shift)
 
-        if verbose:
-            curv_note = f" [curve dev: {curv_dev:.1f}m, shift: {lat_shift:.1f}m -> half-width: {slice_half_width:.1f}m]" if curv_dev > 5.0 else ""
-            print(f"\n  [Slice {idx}/{len(slices)}] PM {s['start_pm']:.2f} -> {s['end_pm']:.2f} ({s['length_mi']:.2f} mi){curv_note}...")
-
         geom = wayback.corridor_geometry(
             s_coords,
             e_coords,
@@ -7012,39 +7637,42 @@ def generate_corridor_slices(
             pad_m=40.0
         )
         prefix = f"slice_{idx:02d}_PM{s['start_pm']:.2f}-{s['end_pm']:.2f}"
-
-        # Raw Before Strip
-        b_res = wayback.generate_image(
-            bbox=geom.envelope,
-            date=d_before,
-            label=f"PID {proj.project_id} BEFORE | PM {s['start_pm']:.2f}-{s['end_pm']:.2f}",
-            out_dir=proj_dir,
-            corridor=geom,
-            zoom=zoom,
-            release_id=before_rel_id,
-            workers=workers,
-        )
         b_dest = os.path.join(proj_dir, f"{prefix}_before.png")
+        a_dest = os.path.join(proj_dir, f"{prefix}_after.png")
+        stacked_dest = os.path.join(proj_dir, f"{prefix}_stacked.png")
+
+        def _fetch_strip(date_val, rel_id, cap_obj, label_tag):
+            kwargs = {
+                "bbox": geom.envelope,
+                "date": date_val,
+                "label": f"PID {proj.project_id} {label_tag} | PM {s['start_pm']:.2f}-{s['end_pm']:.2f}",
+                "out_dir": proj_dir,
+                "corridor": geom,
+                "zoom": zoom,
+                "release_id": rel_id,
+                "workers": workers,
+            }
+            try:
+                return wayback.generate_image(
+                    **kwargs,
+                    session=imagery_session,
+                    capture_info=cap_obj,
+                    sample_dates=False,
+                )
+            except TypeError:
+                return wayback.generate_image(**kwargs)
+
+        with ThreadPoolExecutor(max_workers=2) as sub_pool:
+            b_fut = sub_pool.submit(_fetch_strip, d_before, before_rel_id, c_before, "BEFORE")
+            a_fut = sub_pool.submit(_fetch_strip, d_after, after_rel_id, c_after, "AFTER")
+            b_res = b_fut.result()
+            a_res = a_fut.result()
+
         if os.path.exists(b_res["path"]) and b_res["path"] != b_dest:
             shutil.move(b_res["path"], b_dest)
-
-        # Raw After Strip
-        a_res = wayback.generate_image(
-            bbox=geom.envelope,
-            date=d_after,
-            label=f"PID {proj.project_id} AFTER | PM {s['start_pm']:.2f}-{s['end_pm']:.2f}",
-            out_dir=proj_dir,
-            corridor=geom,
-            zoom=zoom,
-            release_id=after_rel_id,
-            workers=workers,
-        )
-        a_dest = os.path.join(proj_dir, f"{prefix}_after.png")
         if os.path.exists(a_res["path"]) and a_res["path"] != a_dest:
             shutil.move(a_res["path"], a_dest)
 
-        # Stacked Comparison Image
-        stacked_dest = os.path.join(proj_dir, f"{prefix}_stacked.png")
         create_stacked_slice_image(
             before_img_path=b_dest,
             after_img_path=a_dest,
@@ -7056,7 +7684,11 @@ def generate_corridor_slices(
             zoom=zoom,
         )
 
-        slice_rec = {
+        mid_lat = (s_coords[0] + e_coords[0]) / 2.0
+        mid_lon = (s_coords[1] + e_coords[1]) / 2.0
+        w, s_lat, e_lon, n_lat = geom.envelope
+
+        return {
             "index": idx,
             "start_pm": s["start_pm"],
             "end_pm": s["end_pm"],
@@ -7072,34 +7704,91 @@ def generate_corridor_slices(
             "curvature_dev_m": curv_dev,
             "width": b_res["width"],
             "height": b_res["height"],
-            "sensors": sensors_by_slice.get(idx, [])
+            "sensors": sensors_by_slice.get(idx, []),
+            "start_coords": s_coords,
+            "end_coords": e_coords,
+            "midpoint": (mid_lat, mid_lon),
+            "bbox": [w, s_lat, e_lon, n_lat],
         }
-        slices_data.append(slice_rec)
 
-        if verbose:
-            print(f"    ✓ Generated {prefix}_stacked.png ({b_res['width']}x{b_res['height']} px)")
+    slices_data = []
+    slice_pool_size = min(len(slices), 4)
+
+    if verbose:
+        for s in slices:
+            idx = s["index"]
+            curv_dev = s.get("curvature_dev_m", 0.0)
+            lat_shift = s.get("lateral_shift_m", 0.0)
+            lat_hspan = s.get("lateral_half_span_m", 0.0)
+            slice_half_width = max(half_width_m, lat_hspan + 85.0)
+            curv_note = f" [curve dev: {curv_dev:.1f}m, shift: {lat_shift:.1f}m -> half-width: {slice_half_width:.1f}m]" if curv_dev > 5.0 else ""
+            print(f"  [Slice {idx}/{len(slices)}] PM {s['start_pm']:.2f} -> {s['end_pm']:.2f} ({s['length_mi']:.2f} mi){curv_note}...")
+
+    if slice_pool_size > 1:
+        with ThreadPoolExecutor(max_workers=slice_pool_size) as pool:
+            futures = {pool.submit(_process_slice, s): s for s in slices}
+            for fut in as_completed(futures):
+                s_rec = fut.result()
+                slices_data.append(s_rec)
+                if verbose:
+                    prefix = f"slice_{s_rec['index']:02d}_PM{s_rec['start_pm']:.2f}-{s_rec['end_pm']:.2f}"
+                    print(f"    ✓ Generated {prefix}_stacked.png ({s_rec['width']}x{s_rec['height']} px)")
+        slices_data.sort(key=lambda x: x["index"])
+    else:
+        for s in slices:
+            s_rec = _process_slice(s)
+            slices_data.append(s_rec)
+            if verbose:
+                prefix = f"slice_{s_rec['index']:02d}_PM{s_rec['start_pm']:.2f}-{s_rec['end_pm']:.2f}"
+                print(f"    ✓ Generated {prefix}_stacked.png ({s_rec['width']}x{s_rec['height']} px)")
 
     # 8. Generate Full Corridor Overview Image (Macro view at Z15)
     overview_fn = "00_overview_corridor.png"
     overview_path = os.path.join(proj_dir, overview_fn)
     try:
         ov_bbox = wayback.bbox_from_segment(s_c, e_c, margin_m=200.0)
-        ov_res = wayback.generate_image(
-            bbox=ov_bbox,
-            date=d_after,
-            label=f"PROJECT {proj.project_id} FULL OVERVIEW | ROUTE {proj.route} {proj.direction} PM {proj.begin_pm}-{proj.end_pm}",
-            out_dir=proj_dir,
-            max_px=1600,
-            max_zoom=16,
-            release_id=after_rel_id,
-            points=[s_c, e_c],
-            workers=workers,
-        )
+        ov_kwargs = {
+            "bbox": ov_bbox,
+            "date": d_after,
+            "label": f"PROJECT {proj.project_id} FULL OVERVIEW | ROUTE {proj.route} {proj.direction} PM {proj.begin_pm}-{proj.end_pm}",
+            "out_dir": proj_dir,
+            "max_px": 1600,
+            "max_zoom": 16,
+            "release_id": after_rel_id,
+            "points": [s_c, e_c],
+            "workers": workers,
+        }
+        try:
+            ov_res = wayback.generate_image(
+                **ov_kwargs,
+                session=imagery_session,
+                capture_info=c_after,
+                sample_dates=False,
+            )
+        except TypeError:
+            ov_res = wayback.generate_image(**ov_kwargs)
         if os.path.exists(ov_res["path"]) and ov_res["path"] != overview_path:
             shutil.move(ov_res["path"], overview_path)
     except Exception as exc:
         LOGGER.debug(f"Overview generation failed: {exc}")
         overview_fn = None
+
+    # 8b. Generate Local Interactive Project Map with All Overlaid Stations
+    map_fn = "project_map.html"
+    map_path = os.path.join(proj_dir, map_fn)
+    try:
+        build_single_project_map(
+            target_pid=proj.project_id,
+            projects=[proj],
+            output_path=map_path,
+            open_browser=False,
+            include_stations=True,
+        )
+        if verbose:
+            print(f"  ✓ Generated local project map with stations: {map_fn}")
+    except Exception as exc:
+        LOGGER.debug(f"Local project map generation warning: {exc}")
+        map_fn = None
 
     # 9. Generate Interactive HTML Report
     html_report = generate_slices_html_report(
@@ -7108,7 +7797,8 @@ def generate_corridor_slices(
         before_meta=c_before.as_dict(),
         after_meta=c_after.as_dict(),
         output_dir=proj_dir,
-        overview_img=overview_fn
+        overview_img=overview_fn,
+        map_file=map_fn
     )
 
     # 10. Save metadata JSON
@@ -7132,6 +7822,9 @@ def generate_corridor_slices(
         print(f"  {proj_dir}")
         print(f"✓ Interactive HTML comparison report available at:")
         print(f"  {html_report}")
+        if map_fn:
+            print(f"✓ Local station map available at:")
+            print(f"  {map_path}")
         print(f"================================================================================\n")
 
     if open_browser:
@@ -7142,6 +7835,7 @@ def generate_corridor_slices(
         "folder": proj_dir,
         "slices": slices_data,
         "report_html": html_report,
+        "local_map": map_path if map_fn else None,
         "overview_image": overview_path if overview_fn else None,
     }
 
@@ -7162,7 +7856,9 @@ def get_project_imagery(
     corridor_slices: bool = False,
     slice_mi: float = 0.25,
     open_browser: bool = False,
-    workers: int = 8,
+    workers: int = 16,
+    prioritize_quality: bool = True,
+    quality_window: float = 5.0,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -7205,6 +7901,8 @@ def get_project_imagery(
             custom_after_date=custom_after_date,
             open_browser=open_browser,
             workers=workers,
+            prioritize_quality=prioritize_quality,
+            quality_window=quality_window,
             verbose=verbose,
         )
 
@@ -7335,45 +8033,43 @@ def get_project_imagery(
         target_tasks.append(("custom", d, "nearest"))
 
     # 5. Download and stitch imagery
+    imagery_session = getattr(wayback, "_make_session", lambda pool_size=64: requests.Session())(pool_size=max(64, workers * 2))
     results = {}
     for kind, target_date, mode in target_tasks:
         label = f"PID {proj.project_id} ({kind.upper()}) - Route {proj.route} {proj.direction} PM {proj.begin_pm}-{proj.end_pm}"
         if verbose:
             print(f"\n[Wayback] Fetching {kind.upper()} imagery for Project {proj.project_id} (target date: {target_date}, mode: {mode})...")
 
+        gen_kwargs = {
+            "bbox": bbox,
+            "date": target_date,
+            "label": label,
+            "out_dir": output_dir,
+            "zoom": zoom,
+            "max_px": max_px,
+            "max_zoom": max_zoom,
+            "mode": mode,
+            "select_by": "capture",
+            "points": [start_pt, end_pt] if not aligned else None,
+            "workers": workers,
+            "corridor": corridor,
+            "prioritize_quality": prioritize_quality,
+            "max_year_gap": quality_window,
+        }
         try:
-            img_meta = wayback.generate_image(
-                bbox=bbox,
-                date=target_date,
-                label=label,
-                out_dir=output_dir,
-                zoom=zoom,
-                max_px=max_px,
-                max_zoom=max_zoom,
-                mode=mode,
-                select_by="capture",
-                points=[start_pt, end_pt] if not aligned else None,
-                workers=workers,
-                corridor=corridor,
-            )
+            try:
+                img_meta = wayback.generate_image(**gen_kwargs, session=imagery_session)
+            except TypeError:
+                img_meta = wayback.generate_image(**gen_kwargs)
         except ValueError as exc:
             if "No capture date" in str(exc) and mode in ("before", "after"):
                 if verbose:
                     print(f"  Note: {exc} - Falling back to nearest available capture...")
-                img_meta = wayback.generate_image(
-                    bbox=bbox,
-                    date=target_date,
-                    label=label,
-                    out_dir=output_dir,
-                    zoom=zoom,
-                    max_px=max_px,
-                    max_zoom=max_zoom,
-                    mode="nearest",
-                    select_by="capture",
-                    points=[start_pt, end_pt] if not aligned else None,
-                    workers=workers,
-                    corridor=corridor,
-                )
+                gen_kwargs["mode"] = "nearest"
+                try:
+                    img_meta = wayback.generate_image(**gen_kwargs, session=imagery_session)
+                except TypeError:
+                    img_meta = wayback.generate_image(**gen_kwargs)
             else:
                 raise exc
 
@@ -7397,6 +8093,1374 @@ def get_project_imagery(
         "aligned": aligned,
         "imagery": results,
     }
+
+
+def generate_project_validation_web_page(
+    project_id: str,
+    projects: Optional[List[ProjectRecord]] = None,
+    output_dir: Optional[str] = None,
+    master_csv_path: Optional[str] = None,
+    metadata_dir: Optional[str] = None,
+    station_buffer_mi: float = 0.5,
+    fetch_online: bool = True,
+) -> str:
+    """
+    Generate a high-density, minimal-styling, monospace single-page research validation
+    web dashboard for a project, bringing together:
+      - Ground truth validation matrix (Sheet vs HPMS vs VDS lanes, PMs, AADT, sensors)
+      - Interactive local Folium Leaflet map with all stations and PM markers overlaid
+      - Complete corridor detector stations audit table (ML, HV, OR, FR)
+      - Historical corridor satellite imagery slices (curtain slider, stacked view, Google Earth links)
+      - Full raw master spreadsheet attributes, timeline dates, and reviewer notes
+    """
+    target_pid = str(project_id).strip()
+    all_projects = projects or load_master_csv(master_csv_path or DEFAULT_MASTER_CSV)
+    matched = [p for p in all_projects if p.project_id == target_pid]
+    if not matched:
+        raise ValueError(f"Project ID {target_pid} not found in master project records.")
+
+    # Pre-resolve absolute postmiles and geometry
+    for p in matched:
+        if p.abs_begin_pm is None or p.abs_end_pm is None:
+            b, e = resolve_absolute_postmiles(p.route, p.county, p.begin_pm, p.end_pm)
+            p.abs_begin_pm, p.abs_end_pm = b, e
+        if p.start_coords is None or p.end_coords is None:
+            builder = ProjectPeMSQueryBuilder(p)
+            p.start_coords, p.end_coords = builder.resolve_geometry()
+
+    primary_proj = matched[0]
+    out_dir = output_dir or os.path.join(WORKSPACE_DIR, "downloads", "web", f"PID_{target_pid}")
+    os.makedirs(out_dir, exist_ok=True)
+    index_html_path = os.path.join(out_dir, "index.html")
+    map_html_path = os.path.join(out_dir, "project_map.html")
+
+    # 1. Build or refresh local interactive map
+    try:
+        build_single_project_map(
+            target_pid=target_pid,
+            projects=matched,
+            output_path=map_html_path,
+            open_browser=False,
+            include_stations=True,
+            station_buffer_mi=station_buffer_mi,
+        )
+    except Exception as exc:
+        LOGGER.warning(f"Could not build local station map for PID {target_pid}: {exc}")
+
+    # 2. HPMS Tandem Audit
+    hpms_data = None
+    try:
+        from hpms_interface import HPMSCorridorEngine
+        hpms_master = master_csv_path if (master_csv_path and os.path.exists(master_csv_path)) else DEFAULT_MASTER_CSV
+        hpms_eng = HPMSCorridorEngine(master_csv_path=hpms_master)
+        hpms_data = hpms_eng.tandem_audit_project(target_pid, direction=primary_proj.direction)
+    except Exception as exc:
+        LOGGER.debug(f"HPMS tandem audit lookup failed for {target_pid}: {exc}")
+
+    # 3. Load VDS Metadata
+    vds_meta = load_vds_metadata(metadata_dir)
+
+    # 4. Search for existing corridor slices and imagery
+    imagery_dir = None
+    slices_data = []
+    slice_meta_json = None
+    dedicated_report_rel = None
+    imagery_base = os.path.join(WORKSPACE_DIR, "downloads", "imagery")
+    if os.path.exists(imagery_base):
+        candidates = []
+        clean_beg = re.sub(r'[^A-Za-z0-9\.]', '', primary_proj.begin_pm)
+        clean_end = re.sub(r'[^A-Za-z0-9\.]', '', primary_proj.end_pm)
+        pm_tag = f"PM{clean_beg}-{clean_end}"
+
+        for entry in os.listdir(imagery_base):
+            full_p = os.path.join(imagery_base, entry)
+            if not os.path.isdir(full_p):
+                continue
+            if entry == f"PID_{target_pid}" or entry.startswith(f"PID_{target_pid}_"):
+                mj = os.path.join(full_p, "metadata.json")
+                n_meta_slices = 0
+                m_data = None
+                if os.path.exists(mj):
+                    try:
+                        with open(mj, "r", encoding="utf-8") as f:
+                            m_data = json.load(f)
+                            if m_data and "slices" in m_data:
+                                n_meta_slices = len(m_data["slices"])
+                    except Exception:
+                        pass
+                png_slices = len([f for f in os.listdir(full_p) if f.startswith("slice_") and f.endswith("_stacked.png")])
+                slice_cnt = max(n_meta_slices, png_slices)
+                is_pm_match = (pm_tag in entry)
+                candidates.append((slice_cnt, bool(m_data), is_pm_match, full_p, m_data))
+
+        if candidates:
+            # Sort by slice count desc, has_metadata desc, pm_match desc
+            candidates.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
+            best_slice_cnt, _, _, best_p, best_m = candidates[0]
+            if best_slice_cnt > 0:
+                imagery_dir = best_p
+                slice_meta_json = best_m
+                idx_p = os.path.join(best_p, "index.html")
+                if os.path.exists(idx_p):
+                    dedicated_report_rel = os.path.relpath(idx_p, out_dir)
+
+    if imagery_dir:
+        corridor_geom_slices = None
+        try:
+            corridor_geom_slices = slice_project_corridor(primary_proj, slice_mi=0.25)
+        except Exception as exc:
+            LOGGER.debug(f"Could not precalculate corridor geometry slices: {exc}")
+            corridor_geom_slices = None
+
+        if slice_meta_json and "slices" in slice_meta_json:
+            for s in slice_meta_json["slices"]:
+                s_idx = s.get("index", len(slices_data) + 1)
+                st_p = None
+                b_p = None
+                a_p = None
+                for fn in os.listdir(imagery_dir):
+                    if fn.startswith(f"slice_{s_idx:02d}_") and fn.endswith("_stacked.png"):
+                        st_p = os.path.join(imagery_dir, fn)
+                        b_p = os.path.join(imagery_dir, fn.replace("_stacked.png", "_before.png"))
+                        a_p = os.path.join(imagery_dir, fn.replace("_stacked.png", "_after.png"))
+                        break
+
+                midpoint = s.get("midpoint")
+                start_coords = s.get("start_coords")
+                end_coords = s.get("end_coords")
+                if not midpoint and start_coords and end_coords:
+                    midpoint = ((start_coords[0] + end_coords[0]) / 2.0, (start_coords[1] + end_coords[1]) / 2.0)
+                if not midpoint and corridor_geom_slices:
+                    match_slice = None
+                    if 0 <= s_idx - 1 < len(corridor_geom_slices):
+                        cand = corridor_geom_slices[s_idx - 1]
+                        if s.get("start_pm") is None or abs(cand["start_pm"] - float(s["start_pm"])) <= 0.05:
+                            match_slice = cand
+                    if not match_slice and s.get("start_pm") is not None and s.get("end_pm") is not None:
+                        s_mid_pm = (float(s["start_pm"]) + float(s["end_pm"])) / 2.0
+                        match_slice = min(
+                            corridor_geom_slices,
+                            key=lambda cs: abs(((cs["start_pm"] + cs["end_pm"]) / 2.0) - s_mid_pm)
+                        )
+                    if match_slice:
+                        midpoint = match_slice.get("midpoint")
+                        if not midpoint and "start_coords" in match_slice and "end_coords" in match_slice:
+                            sc, ec = match_slice["start_coords"], match_slice["end_coords"]
+                            midpoint = ((sc[0] + ec[0]) / 2.0, (sc[1] + ec[1]) / 2.0)
+                        if not start_coords and "start_coords" in match_slice:
+                            start_coords = match_slice["start_coords"]
+                        if not end_coords and "end_coords" in match_slice:
+                            end_coords = match_slice["end_coords"]
+
+                slices_data.append({
+                    "index": s_idx,
+                    "start_pm": s.get("start_pm"),
+                    "end_pm": s.get("end_pm"),
+                    "length_mi": s.get("length_mi", 0.25),
+                    "bearing": s.get("bearing"),
+                    "midpoint": midpoint,
+                    "start_coords": start_coords,
+                    "end_coords": end_coords,
+                    "stacked_rel": os.path.relpath(st_p, out_dir) if (st_p and os.path.exists(st_p)) else None,
+                    "before_rel": os.path.relpath(b_p, out_dir) if (b_p and os.path.exists(b_p)) else None,
+                    "after_rel": os.path.relpath(a_p, out_dir) if (a_p and os.path.exists(a_p)) else None,
+                })
+        else:
+            s_files = sorted([f for f in os.listdir(imagery_dir) if f.startswith("slice_") and f.endswith("_stacked.png")])
+            for idx, f in enumerate(s_files, 1):
+                base_n = f.replace("_stacked.png", "")
+                st_p = os.path.join(imagery_dir, f)
+                b_p = os.path.join(imagery_dir, base_n + "_before.png")
+                a_p = os.path.join(imagery_dir, base_n + "_after.png")
+                midpoint = None
+                start_coords = None
+                end_coords = None
+                s_pm_val = None
+                e_pm_val = None
+                l_mi = 0.25
+                bear_val = None
+                if corridor_geom_slices and 0 <= idx - 1 < len(corridor_geom_slices):
+                    match_slice = corridor_geom_slices[idx - 1]
+                    midpoint = match_slice.get("midpoint")
+                    if not midpoint and "start_coords" in match_slice and "end_coords" in match_slice:
+                        sc, ec = match_slice["start_coords"], match_slice["end_coords"]
+                        midpoint = ((sc[0] + ec[0]) / 2.0, (sc[1] + ec[1]) / 2.0)
+                    start_coords = match_slice.get("start_coords")
+                    end_coords = match_slice.get("end_coords")
+                    s_pm_val = match_slice.get("start_pm")
+                    e_pm_val = match_slice.get("end_pm")
+                    l_mi = match_slice.get("length_mi", 0.25)
+                slices_data.append({
+                    "index": idx,
+                    "start_pm": s_pm_val,
+                    "end_pm": e_pm_val,
+                    "length_mi": l_mi,
+                    "bearing": bear_val,
+                    "midpoint": midpoint,
+                    "start_coords": start_coords,
+                    "end_coords": end_coords,
+                    "stacked_rel": os.path.relpath(st_p, out_dir) if os.path.exists(st_p) else None,
+                    "before_rel": os.path.relpath(b_p, out_dir) if os.path.exists(b_p) else None,
+                    "after_rel": os.path.relpath(a_p, out_dir) if os.path.exists(a_p) else None,
+                })
+
+    # Flight info strings
+    before_flight_str = "Pre-Construction Flight"
+    after_flight_str = "Post-Opening Flight"
+    if slice_meta_json:
+        bf = slice_meta_json.get("before_flight", {})
+        af = slice_meta_json.get("after_flight", {})
+        if bf:
+            before_flight_str = f"BEFORE: {bf.get('capture_date', '-')} (Rel {bf.get('release_id', '-')}, {bf.get('provider', '')} @ {bf.get('resolution_m', '-')}m/px)"
+        if af:
+            after_flight_str = f"AFTER: {af.get('capture_date', '-')} (Rel {af.get('release_id', '-')}, {af.get('provider', '')} @ {af.get('resolution_m', '-')}m/px)"
+
+    # 5. Gather all unique stations across all directions & preload/cache configurations
+    all_unique_stations: Dict[str, VDSStationRecord] = {}
+    for proj in matched:
+        c_st = vds_meta.find_corridor_stations(
+            district=proj.dist,
+            route=proj.route,
+            direction=proj.pems_direction,
+            begin_pm=proj.begin_pm,
+            end_pm=proj.end_pm,
+            abs_begin_pm=proj.abs_begin_pm,
+            abs_end_pm=proj.abs_end_pm,
+            buffer_mi=station_buffer_mi,
+            station_types=("ALL",),
+            county=proj.county
+        )
+        for s in c_st:
+            all_unique_stations[s.id] = s
+        for sid in proj.sensor_stations:
+            if sid in vds_meta.by_id:
+                all_unique_stations[sid] = vds_meta.by_id[sid]
+
+    # Pre-cache / fetch lane configurations
+    station_configs_map: Dict[str, StationLaneConfigDetails] = {}
+    uncached_ids: List[str] = []
+    for sid, st_rec in all_unique_stations.items():
+        cached = load_cached_station_config(sid)
+        if cached is not None and cached.change_log and not cached.error:
+            station_configs_map[sid] = cached
+        else:
+            uncached_ids.append(sid)
+
+    if uncached_ids and fetch_online and not os.getenv("PEMS_OFFLINE"):
+        pems_client: Optional[PeMSClient] = None
+        if os.getenv("PEMS_USERNAME") and os.getenv("PEMS_PASSWORD"):
+            try:
+                pems_client = PeMSClient()
+                pems_client.login()
+            except Exception as exc:
+                LOGGER.warning(f"PeMS login for station lane config caching failed: {exc}")
+
+        if pems_client and pems_client.logged_in:
+            def _fetch_st(sid_to_fetch: str) -> Tuple[str, StationLaneConfigDetails]:
+                v_rec = all_unique_stations.get(sid_to_fetch)
+                cfg = fetch_station_lane_configuration(
+                    sid_to_fetch, client=pems_client, vds_record=v_rec, timeout=15.0, use_cache=True
+                )
+                return sid_to_fetch, cfg
+
+            w_count = min(4, len(uncached_ids))
+            with ThreadPoolExecutor(max_workers=w_count) as pool:
+                futs = [pool.submit(_fetch_st, s) for s in uncached_ids]
+                for fut in as_completed(futs):
+                    try:
+                        s_id, cfg_res = fut.result()
+                        if cfg_res and cfg_res.change_log:
+                            station_configs_map[s_id] = cfg_res
+                    except Exception as exc:
+                        LOGGER.warning(f"Failed to fetch config for station: {exc}")
+
+        # Fallback for any stations that could not be fetched
+        for sid in uncached_ids:
+            if sid not in station_configs_map:
+                v_rec = all_unique_stations.get(sid)
+                fb_details = StationLaneConfigDetails(
+                    station_id=sid,
+                    station_name=v_rec.name if v_rec else "",
+                    district=str(v_rec.district) if v_rec else None,
+                    route=str(v_rec.fwy) if v_rec else None,
+                    direction=v_rec.dir if v_rec else None,
+                    county=str(v_rec.county) if v_rec else None,
+                    station_type=v_rec.type if v_rec else None,
+                    ca_pm=str(v_rec.state_pm) if v_rec else None,
+                    abs_pm=v_rec.abs_pm if v_rec else None,
+                    latitude=v_rec.latitude if v_rec else None,
+                    longitude=v_rec.longitude if v_rec else None,
+                    lane_table=[{"Lane": str(i + 1), "Type": v_rec.type or "Mainline"} for i in range(v_rec.lanes or 0)] if (v_rec and v_rec.lanes) else [],
+                )
+                station_configs_map[sid] = fb_details
+
+    # Tooltip text dictionary for all stations
+    station_tooltips: Dict[str, str] = {}
+    for sid, st_rec in all_unique_stations.items():
+        cfg = station_configs_map.get(sid) or StationLaneConfigDetails(station_id=sid)
+        station_tooltips[sid] = format_station_lane_config_tooltip(cfg, vds_rec=st_rec, project=primary_proj)
+
+    # 6. Build Content For Each Direction
+    dir_nav_chips = []
+    dir_sections_html = []
+
+    for d_idx, proj in enumerate(matched):
+        dir_label = proj.direction or f"Dir {d_idx+1}"
+        dir_id = f"dir-{d_idx+1}"
+        active_cls = " active" if d_idx == 0 else ""
+        display_style = "display: block;" if d_idx == 0 else "display: none;"
+        dir_nav_chips.append(
+            f'<button type="button" class="nav-btn{active_cls}" data-dir-target="{dir_id}" onclick="showDirection(\'{dir_id}\')">'
+            f'Direction {html.escape(dir_label)} (Route {html.escape(str(proj.route))})'
+            f'</button>'
+        )
+
+        # Distance calculations
+        _, b_n = split_ca_pm(proj.begin_pm)
+        _, e_n = split_ca_pm(proj.end_pm)
+        sheet_len = abs(e_n - b_n) if (not np.isnan(b_n) and not np.isnan(e_n)) else None
+        poly = get_project_corridor_geometry(proj)
+        geom_len = sum(haversine_distance_miles(p1[0], p1[1], p2[0], p2[1]) for p1, p2 in zip(poly[:-1], poly[1:])) if len(poly) >= 2 else None
+        abs_len = abs(proj.abs_end_pm - proj.abs_begin_pm) if (proj.abs_begin_pm is not None and proj.abs_end_pm is not None) else None
+
+        # Stations matching
+        comp = compare_project_stations(proj, vds_meta=vds_meta, buffer_mi=0.1, station_types=("ML", "HV"))
+        all_st = vds_meta.find_corridor_stations(
+            district=proj.dist,
+            route=proj.route,
+            direction=proj.pems_direction,
+            begin_pm=proj.begin_pm,
+            end_pm=proj.end_pm,
+            abs_begin_pm=proj.abs_begin_pm,
+            abs_end_pm=proj.abs_end_pm,
+            buffer_mi=station_buffer_mi,
+            station_types=("ALL",),
+            county=proj.county
+        )
+        seen_ids = {s.id for s in all_st}
+        for sid in proj.sensor_stations:
+            if sid not in seen_ids and sid in vds_meta.by_id:
+                all_st.append(vds_meta.by_id[sid])
+                seen_ids.add(sid)
+
+        def _st_sort(s):
+            if s.abs_pm is not None and not np.isnan(s.abs_pm):
+                return s.abs_pm
+            _, num = s.ca_pm_prefix_and_num
+            return num if not np.isnan(num) else 999999.0
+        all_st.sort(key=_st_sort)
+
+        # Build Stations Rows
+        st_rows = []
+        for st in all_st:
+            is_in_b, note, delta = classify_station_relative_to_project(st, proj)
+            in_sheet = (st.id in proj.sensor_stations)
+            if is_in_b:
+                bounds_badge = '<span class="badge badge-pass">[IN CORRIDOR]</span>'
+            elif delta is not None and abs(delta) <= station_buffer_mi:
+                bounds_badge = f'<span class="badge badge-neutral">[BUFFER ({delta:+.2f} mi)]</span>'
+            else:
+                bounds_badge = '<span class="badge badge-warn">[OUT OF BOUNDS]</span>'
+
+            if is_in_b and in_sheet:
+                sheet_badge = '<span class="badge badge-pass">[VERIFIED IN SHEET]</span>'
+            elif in_sheet and not is_in_b:
+                sheet_badge = '<span class="badge badge-warn">[SHEET DISCREPANCY]</span>'
+            elif is_in_b and not in_sheet:
+                sheet_badge = '<span class="badge badge-info">[ADDITIONAL ACTIVE]</span>'
+            else:
+                sheet_badge = '<span class="badge badge-neutral">[NEARBY DETECTOR]</span>'
+
+            st_cfg = station_configs_map.get(st.id) or load_cached_station_config(st.id)
+            st_lat = (st_cfg.latitude if (st_cfg and st_cfg.latitude) else st.latitude)
+            st_lon = (st_cfg.longitude if (st_cfg and st_cfg.longitude) else st.longitude)
+            focus_btn = ""
+            if st_lat and st_lon:
+                focus_btn = f' <button type="button" class="action-btn" onclick="focusMap({st_lat:.6f}, {st_lon:.6f}, 17, \'Station {st.id}\')">[Map]</button>'
+
+            abs_pm_str = f"{st.abs_pm:.2f}" if (st.abs_pm is not None and not np.isnan(st.abs_pm)) else "-"
+            st_rows.append(
+                f'<tr>'
+                f'<td><span class="st-hover" data-station-id="{html.escape(st.id)}" tabindex="0"><a href="https://pems.dot.ca.gov/?report_form=1&dnode=VDS&content=summary&tab=summary&station_id={st.id}" target="_blank"><strong>{html.escape(st.id)}</strong></a></span>{focus_btn}</td>'
+                f'<td>{html.escape(st.type)}</td>'
+                f'<td>{html.escape(st.fwy)} {html.escape(st.dir)}</td>'
+                f'<td>{html.escape(st.county)} {html.escape(st.state_pm)}</td>'
+                f'<td>{abs_pm_str}</td>'
+                f'<td><strong>{st.lanes if st.lanes is not None else "-"}</strong></td>'
+                f'<td>{bounds_badge}</td>'
+                f'<td>{sheet_badge}</td>'
+                f'<td>{html.escape(st.name or "-")}</td>'
+                f'</tr>'
+            )
+
+        stations_table_html = (
+            "".join(st_rows) if st_rows else '<tr><td colspan="9" style="text-align:center; color:#555;">(No detector stations found in corridor or sheet)</td></tr>'
+        )
+
+        # Validation Matrix Rows
+        tot_b = proj.raw_row.get("total_lanes_before")
+        tot_a = proj.raw_row.get("total_lanes_after")
+        tot_b_str = f"{float(tot_b):.0f}" if (tot_b is not None and pd.notna(tot_b)) else "-"
+        tot_a_str = f"{float(tot_a):.0f}" if (tot_a is not None and pd.notna(tot_a)) else "-"
+        net_str = f" (+{float(tot_a)-float(tot_b):.0f})" if (tot_b_str != "-" and tot_a_str != "-") else ""
+        sheet_lanes_str = f"{tot_b_str} &rarr; {tot_a_str}{net_str}"
+
+        hpms_b_str = str(hpms_data.get("hpms_before_lanes")) if hpms_data and hpms_data.get("hpms_before_lanes") is not None else "-"
+        hpms_a_str = str(hpms_data.get("hpms_after_lanes")) if hpms_data and hpms_data.get("hpms_after_lanes") is not None else "-"
+        hpms_b_yr = hpms_data.get("hpms_before_year") if hpms_data and hpms_data.get("hpms_before_year") is not None else "-"
+        hpms_a_yr = hpms_data.get("hpms_after_year") if hpms_data and hpms_data.get("hpms_after_year") is not None else "-"
+        hpms_lanes_str = f"{hpms_b_str} ({hpms_b_yr}) &rarr; {hpms_a_str} ({hpms_a_yr})" if hpms_data else "(HPMS data unavailable)"
+
+        vds_lanes_list = [str(s.lanes) for s in comp.found_stations if s.type in ("ML", "HV") and s.lanes is not None]
+        vds_lanes_str = f"ML/HV detectors: [{', '.join(vds_lanes_list)}] lanes" if vds_lanes_list else "(No active ML/HV detectors)"
+
+        if hpms_data and hpms_a_str != "-" and tot_a_str != "-":
+            if hpms_a_str == tot_a_str:
+                lane_verdict_badge = f'<span class="badge badge-pass">[PASS: HPMS &amp; Sheet Match ({tot_a_str} lanes)]</span>'
+            else:
+                lane_verdict_badge = f'<span class="badge badge-warn">[CHECK: HPMS {hpms_a_str} vs Sheet {tot_a_str}]</span>'
+        elif len(comp.found_stations) == 0:
+            lane_verdict_badge = '<span class="badge badge-neutral">[UNINSTRUMENTED: PeMS 0 Detectors]</span>'
+        else:
+            lane_verdict_badge = '<span class="badge badge-info">[EVALUATED]</span>'
+
+        # Postmiles & Length
+        pm_range_str = f"PM {proj.begin_pm} &rarr; {proj.end_pm}"
+        abs_range_str = f"Abs PM {proj.abs_begin_pm:.2f} &rarr; {proj.abs_end_pm:.2f}" if (proj.abs_begin_pm and proj.abs_end_pm) else "-"
+        sheet_len_str = f"{sheet_len:.2f} mi" if sheet_len is not None else "-"
+        geom_len_str = f"{geom_len:.2f} mi" if geom_len is not None else "-"
+
+        if sheet_len is not None and geom_len is not None:
+            diff = abs(sheet_len - geom_len)
+            if diff <= 0.05:
+                pm_verdict_badge = f'<span class="badge badge-pass">[PASS: Aligns (delta: {diff:.2f} mi)]</span>'
+            else:
+                pm_verdict_badge = f'<span class="badge badge-warn">[FLAG: Deviates by {diff:.2f} mi]</span>'
+        else:
+            pm_verdict_badge = f'<span class="badge badge-neutral">[LENGTH: {sheet_len_str}]</span>'
+
+        # Traffic Volumes
+        ex_aadt = proj.raw_row.get("Existing AADT")
+        fc_aadt = proj.raw_row.get("forecast AADT ") or proj.raw_row.get("forecast AADT")
+        aadt_yr = proj.raw_row.get("year ") or proj.raw_row.get("year")
+        fc_yr = proj.raw_row.get("forecast year ") or proj.raw_row.get("forecast year")
+        sheet_aadt_str = f"Ex: {ex_aadt or '-'} ({aadt_yr or '-'}) | Fc: {fc_aadt or '-'} ({fc_yr or '-'})"
+
+        hpms_2024 = hpms_data.get("hpms_2024_aadt") if hpms_data else None
+        hpms_fut = hpms_data.get("hpms_future_aadt") if hpms_data else None
+        hpms_aadt_str = f"2024: {hpms_2024:,} | Future: {hpms_fut:,}" if (hpms_2024 and hpms_fut) else "(Not recorded)"
+        aadt_verdict_badge = '<span class="badge badge-pass">[HPMS 2024 AVAILABLE]</span>' if hpms_2024 else '<span class="badge badge-neutral">[SHEET VOLUMES]</span>'
+
+        # Sensors Audit
+        sheet_sensors_cnt = len(proj.sensor_stations)
+        vds_cnt = len(comp.found_stations)
+        sensor_status_badge = f'<span class="badge badge-pass">[{comp.status}]</span>' if comp.status in ("EXACT_MATCH", "PARTIAL_MATCH") else f'<span class="badge badge-warn">[{comp.status}]</span>'
+        sheet_sensors_html = (
+            ", ".join(
+                f'<span class="st-hover" data-station-id="{html.escape(str(sid).strip())}" tabindex="0"><strong>{html.escape(str(sid).strip())}</strong></span>'
+                for sid in proj.sensor_stations
+            )
+            if proj.sensor_stations else "None"
+        )
+        vds_sensors_html = (
+            ", ".join(
+                f'<span class="st-hover" data-station-id="{html.escape(str(s.id))}" tabindex="0"><strong>{html.escape(str(s.id))}</strong></span>'
+                for s in comp.found_stations
+            )
+            if comp.found_stations else "None"
+        )
+
+        # Added Lanes Breakdown
+        breakdown_items = [
+            ("GP Lanes", proj.raw_row.get("New Gen Pur-pose Lanes (Lane Miles)")),
+            ("HOV Lanes", proj.raw_row.get("New HOV Lanes (Lane Miles)")),
+            ("Turn Pockets", proj.raw_row.get("New or Extend L/R Turn Pockets (Lane Miles)")),
+            ("Aux Lanes", proj.raw_row.get("New or Extend Aux Lanes (Lane Miles)")),
+            ("Truck Climbing", proj.raw_row.get("New or Extend Truck Climb-ing Lanes (Lane Miles)")),
+            ("Accel/Decel", proj.raw_row.get("New or Extend Accel/Decel Lanes (Lane Miles)")),
+            ("Toll Lanes", proj.raw_row.get("New Exp Toll Lanes (ETL) (Lane Miles)")),
+            ("Transit Lanes", proj.raw_row.get("New Transit Lanes (Lane Miles)")),
+            ("Ramps/Connectors", proj.raw_row.get("New Lanes in Ramps and Conn-ectors (Non-Main-line)")),
+            ("Total Added", proj.raw_row.get("Total Added Lanes (Lane Miles)")),
+        ]
+        breakdown_html = "".join(
+            f"<tr><td>{label}</td><td><strong>{val}</strong></td></tr>"
+            for label, val in breakdown_items if val is not None and pd.notna(val) and str(val).strip() != "" and str(val) != "0"
+        )
+        if not breakdown_html:
+            breakdown_html = '<tr><td colspan="2" style="color:#555;">(No specific added lane miles itemized)</td></tr>'
+
+        dir_sections_html.append(f"""
+        <div class="dir-section" id="{dir_id}" style="{display_style}">
+          
+          <!-- Validation Scorecard Matrix -->
+          <div class="card">
+            <div class="card-header">
+              <span>GROUND TRUTH VALIDATION MATRIX</span>
+              <span>Direction: {html.escape(dir_label)}</span>
+            </div>
+            <div class="card-body">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 22%;">Metric / Dimension</th>
+                    <th style="width: 26%;">Master Spreadsheet</th>
+                    <th style="width: 26%;">HPMS Ground Truth</th>
+                    <th style="width: 26%;">Validation Verdict</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>Total Through Lanes</strong></td>
+                    <td>{sheet_lanes_str}</td>
+                    <td>{hpms_lanes_str}</td>
+                    <td>{lane_verdict_badge}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Directional Lanes</strong></td>
+                    <td>Before: {proj.raw_row.get('dir_lanes_before') or '-'} &rarr; After: {proj.raw_row.get('dir_lanes_after') or '-'}</td>
+                    <td>{vds_lanes_str}</td>
+                    <td><span class="badge badge-info">[INSPECT SENSORS]</span></td>
+                  </tr>
+                  <tr>
+                    <td><strong>Corridor Postmiles &amp; Length</strong></td>
+                    <td>{pm_range_str} ({sheet_len_str})</td>
+                    <td>Road Alignment: {geom_len_str}<br><span style="color:#555;">({abs_range_str})</span></td>
+                    <td>{pm_verdict_badge}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Traffic Volumes (AADT)</strong></td>
+                    <td>{sheet_aadt_str}</td>
+                    <td>{hpms_aadt_str}</td>
+                    <td>{aadt_verdict_badge}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Detector Sensors Audit</strong></td>
+                    <td>{sheet_sensors_cnt} listed: {sheet_sensors_html}</td>
+                    <td>{vds_cnt} active: {vds_sensors_html}</td>
+                    <td>{sensor_status_badge}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Corridor Detector Stations Table -->
+          <div class="card">
+            <div class="card-header">
+              <span>CORRIDOR DETECTOR STATIONS AUDIT ({len(all_st)} Total in Corridor &amp; Buffer)</span>
+              <span>Tolerance: &plusmn;{station_buffer_mi:.2f} mi</span>
+            </div>
+            <div class="card-body" style="overflow-x: auto; max-height: 380px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Station ID</th>
+                    <th>Type</th>
+                    <th>Fwy/Dir</th>
+                    <th>County PM</th>
+                    <th>Abs PM</th>
+                    <th>Lanes</th>
+                    <th>Corridor Bounds</th>
+                    <th>Sheet Status</th>
+                    <th>Cross Street / Location</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stations_table_html}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Master Sheet Record & Metadata -->
+          <div class="card">
+            <div class="card-header">
+              <span>MASTER SPREADSHEET RECORD ATTRIBUTES</span>
+              <span>Project ID: {html.escape(proj.project_id)}</span>
+            </div>
+            <div class="card-body">
+              <div style="margin-bottom: 8px;">
+                <strong>Project Description:</strong>
+                <div style="background:#fafafa; border:1px solid #ccc; padding:6px 8px; margin-top:4px;">
+                  {html.escape(proj.project_description or '(No description recorded in spreadsheet)')}
+                </div>
+              </div>
+              
+              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;">
+                <div>
+                  <strong>Timeline &amp; Cost:</strong>
+                  <table style="margin-top: 4px;">
+                    <tr><td>Construction Begin</td><td><strong>{html.escape(str(proj.construction_begin_date or proj.raw_row.get('Begin Date (formatted YYYY-MM-DD)') or '-'))}</strong></td></tr>
+                    <tr><td>Open to Traffic</td><td><strong>{html.escape(str(proj.open_to_traffic_date or proj.raw_row.get('Open to Traffic Date (formatted YYYY-MM-DD)') or '-'))}</strong></td></tr>
+                    <tr><td>Project Cost</td><td>{html.escape(str(proj.raw_row.get('Project Cost') or '-'))}</td></tr>
+                    <tr><td>VMT Mitigation Cost</td><td>{html.escape(str(proj.raw_row.get('VMT Mitigation Cost') or '-'))}</td></tr>
+                  </table>
+                </div>
+                <div>
+                  <strong>Added Lane Miles Itemization:</strong>
+                  <table style="margin-top: 4px;">
+                    {breakdown_html}
+                  </table>
+                </div>
+              </div>
+
+              <div style="margin-top: 8px;">
+                <strong>Reviewer &amp; Audit Notes:</strong>
+                <table style="margin-top: 4px;">
+                  <tr><td style="width: 25%;">Reviewer / Notes</td><td>{html.escape(str(proj.raw_row.get('Reviewer') or '-'))}: {html.escape(str(proj.raw_row.get('Notes') or 'None'))}</td></tr>
+                  <tr><td>Peer Reviewer</td><td>{html.escape(str(proj.raw_row.get('Peer Reviewer') or '-'))}: {html.escape(str(proj.raw_row.get('Peer Reviewer Notes') or 'None'))}</td></tr>
+                </table>
+              </div>
+            </div>
+          </div>
+
+        </div>
+        """)
+
+    # 6. Build Imagery Card (Right Column)
+    if slices_data:
+        seg_chips = []
+        slice_panels = []
+        for s in slices_data:
+            s_idx = s["index"]
+            is_first = (s_idx == 1)
+            active_chip = " active" if is_first else ""
+            panel_disp = "display: block;" if is_first else "display: none;"
+            s_pm_label = f" (PM {s['start_pm']:.2f}-{s['end_pm']:.2f})" if s.get("start_pm") is not None else ""
+            seg_chips.append(
+                f'<button type="button" class="nav-btn{active_chip}" data-slice-chip="{s_idx}" onclick="showSlice({s_idx})">'
+                f'Seg {s_idx}{s_pm_label}'
+                f'</button>'
+            )
+
+            midpoint = s.get("midpoint")
+            if not midpoint and primary_proj.start_coords and primary_proj.end_coords:
+                s_frac = (s_idx - 0.5) / max(1, len(slices_data))
+                p_s, p_e = primary_proj.start_coords, primary_proj.end_coords
+                midpoint = (p_s[0] + s_frac * (p_e[0] - p_s[0]), p_s[1] + s_frac * (p_e[1] - p_s[1]))
+            elif not midpoint:
+                midpoint = primary_proj.start_coords or (37.5, -122.2)
+            mid_lat, mid_lon = midpoint
+            length_mi = s.get("length_mi", 0.25)
+            eye_dist = max(450, int(length_mi * 1609.34 * 1.6))
+            ge_url = f"https://earth.google.com/web/@{mid_lat:.6f},{mid_lon:.6f},0a,{eye_dist}d,35y,0h,0t,0r"
+            gmaps_url = f"https://www.google.com/maps/@{mid_lat:.6f},{mid_lon:.6f},18z/data=!3m1!1e3"
+
+            b_rel = s.get("before_rel") or ""
+            a_rel = s.get("after_rel") or ""
+            st_rel = s.get("stacked_rel") or ""
+
+            slider_html = ""
+            if b_rel and a_rel:
+                slider_html = f"""
+                <div class="slice-view slice-slider-view active" id="view-slider-{s_idx}">
+                  <div class="slider-box" id="slider-box-{s_idx}">
+                    <img src="{b_rel}" alt="Before Image">
+                    <div class="img-top">
+                      <img src="{a_rel}" alt="After Image">
+                    </div>
+                    <div class="slider-tag slider-tag-after">AFTER: {s.get('after_capture_date', 'Post-Opening')}</div>
+                    <div class="slider-tag slider-tag-before">BEFORE: {s.get('before_capture_date', 'Pre-Con')}</div>
+                    <div class="slider-handle"></div>
+                  </div>
+                  <div style="text-align:center; font-size:10px; color:#555; margin-top:4px;">
+                    &lt; Drag handle to wipe between Before and After imagery &gt;
+                  </div>
+                </div>
+                """
+
+            stacked_html = ""
+            if st_rel:
+                stacked_html = f"""
+                <div class="slice-view slice-stacked-view" id="view-stacked-{s_idx}" style="display:none;">
+                  <img src="{st_rel}" style="width:100%; height:auto; border:1px solid #000;" alt="Stacked PNG">
+                </div>
+                """
+
+            split_html = ""
+            if b_rel and a_rel:
+                split_html = f"""
+                <div class="slice-view slice-split-view" id="view-split-{s_idx}" style="display:none;">
+                  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+                    <div>
+                      <div style="font-weight:bold; font-size:10px;">BEFORE</div>
+                      <img src="{b_rel}" style="width:100%; border:1px solid #000;" alt="Before">
+                    </div>
+                    <div>
+                      <div style="font-weight:bold; font-size:10px;">AFTER</div>
+                      <img src="{a_rel}" style="width:100%; border:1px solid #000;" alt="After">
+                    </div>
+                  </div>
+                </div>
+                """
+
+            st_link_html = f'<a href="{st_rel}" target="_blank" class="action-link">[Stacked PNG]</a>' if st_rel else ''
+            slice_panels.append(f"""
+            <div class="slice-panel" id="slice-panel-{s_idx}" style="{panel_disp}">
+              <div class="quick-actions" style="margin-bottom: 6px;">
+                <span style="font-weight:bold;">Segment {s_idx} Links:</span>
+                <a href="{ge_url}" target="_blank" class="action-link">[Google Earth]</a>
+                <button type="button" class="action-btn" onclick="focusMap({mid_lat:.6f}, {mid_lon:.6f}, 17, \'Segment {s_idx} Center\')">[Focus on Map]</button>
+                <a href="{gmaps_url}" target="_blank" class="action-link">[Google Maps]</a>
+                {st_link_html}
+              </div>
+              {slider_html}
+              {stacked_html}
+              {split_html}
+            </div>
+            """)
+
+        open_report_html = f'<div style="margin-top:10px; border-top:1px solid #ccc; padding-top:6px;"><a href="{dedicated_report_rel}" target="_blank" class="action-link">[Open Full Dedicated Slices Report (index.html)]</a></div>' if dedicated_report_rel else ''
+        imagery_card_html = f"""
+        <div class="card">
+          <div class="card-header">
+            <span>HISTORICAL SATELLITE IMAGERY SLICES ({len(slices_data)} Segments)</span>
+            <span>Native Zoom 19 (~0.3m/px)</span>
+          </div>
+          <div class="card-body">
+            <div style="font-size:11px; margin-bottom: 6px; color:#333;">
+              <div>{html.escape(before_flight_str)}</div>
+              <div>{html.escape(after_flight_str)}</div>
+            </div>
+
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
+              <div class="quick-actions" style="margin:0; max-height:85px; overflow-y:auto; border:1px solid #ccc; padding:4px;">
+                <span style="font-weight:bold;">Segments:</span>
+                {" ".join(seg_chips)}
+              </div>
+              <div class="quick-actions" style="margin:0;">
+                <span style="font-weight:bold;">View:</span>
+                <button type="button" class="nav-btn active" id="btn-view-slider" onclick="setSliceView('slider')">[Slider]</button>
+                <button type="button" class="nav-btn" id="btn-view-stacked" onclick="setSliceView('stacked')">[Stacked]</button>
+                <button type="button" class="nav-btn" id="btn-view-split" onclick="setSliceView('split')">[Side-by-Side]</button>
+              </div>
+            </div>
+
+            {"".join(slice_panels)}
+
+            {open_report_html}
+          </div>
+        </div>
+        """
+    else:
+        imagery_card_html = f"""
+        <div class="card">
+          <div class="card-header">
+            <span>HISTORICAL SATELLITE IMAGERY</span>
+            <span>Status: Not Generated</span>
+          </div>
+          <div class="card-body" style="padding:14px; background:#fafafa;">
+            <p><strong>[Imagery Slices: Not Generated]</strong></p>
+            <p style="margin-top:6px; color:#444;">No native Zoom 19 historical before/after corridor slices found for Project {html.escape(target_pid)}.</p>
+            <p style="margin-top:8px;">To download high-resolution Before/After imagery and generate interactive curtain wipe sliders, run:</p>
+            <pre style="background:#000; color:#fff; padding:6px 10px; margin-top:6px; font-family:inherit; font-size:11px;">uv run pems_interface.py -p {html.escape(target_pid)} --slices</pre>
+          </div>
+        </div>
+        """
+
+    prim_poly = get_project_corridor_geometry(primary_proj)
+    if prim_poly:
+        p_lat, p_lon = prim_poly[len(prim_poly)//2]
+    elif primary_proj.start_coords:
+        p_lat, p_lon = primary_proj.start_coords
+    else:
+        p_lat, p_lon = (37.5, -122.2)
+
+    ge_corridor_url = f"https://earth.google.com/web/@{p_lat:.6f},{p_lon:.6f},0a,1200d,35y,0h,0t,0r"
+    gmaps_corridor_url = f"https://www.google.com/maps/@{p_lat:.6f},{p_lon:.6f},16z/data=!3m1!1e3"
+
+    full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROJECT VALIDATION: {html.escape(target_pid)} - Route {html.escape(str(primary_proj.route))}</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; box-shadow: none !important; }}
+    body {{
+      background: #ffffff;
+      color: #000000;
+      font-family: "Andale Mono", Menlo, Monaco, "Courier New", Courier, monospace !important;
+      font-size: 12px;
+      line-height: 1.4;
+      padding: 10px 14px 40px 14px;
+    }}
+    header {{
+      border-bottom: 2px solid #000000;
+      padding-bottom: 8px;
+      margin-bottom: 12px;
+    }}
+    .top-meta {{
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    h1 {{
+      font-size: 15px;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }}
+    .top-nav {{
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+      font-size: 11px;
+    }}
+    .nav-btn {{
+      background: #ffffff;
+      border: 1px solid #000000;
+      color: #000000;
+      padding: 2px 6px;
+      font-family: inherit;
+      font-size: 11px;
+      text-decoration: none;
+      cursor: pointer;
+    }}
+    .nav-btn:hover, .nav-btn.active {{
+      background: #000000;
+      color: #ffffff;
+    }}
+    .action-btn {{
+      background: #ffffff;
+      border: 1px solid #000000;
+      color: #000000;
+      padding: 1px 4px;
+      font-family: inherit;
+      font-size: 10px;
+      cursor: pointer;
+    }}
+    .action-btn:hover {{
+      background: #000000;
+      color: #ffffff;
+    }}
+    .badge {{
+      display: inline-block;
+      padding: 1px 4px;
+      font-weight: bold;
+      font-size: 10px;
+      border: 1px solid #000000;
+      white-space: nowrap;
+    }}
+    .badge-pass {{ background: #e6f4ea; color: #137333; border-color: #137333; }}
+    .badge-warn {{ background: #fef7e0; color: #b06000; border-color: #b06000; }}
+    .badge-info {{ background: #e8f0fe; color: #1a73e8; border-color: #1a73e8; }}
+    .badge-neutral {{ background: #f1f3f4; color: #3c4043; border-color: #5f6368; }}
+
+    .dashboard-grid {{
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 12px;
+    }}
+    @media (max-width: 1120px) {{
+      .dashboard-grid {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+
+    .card {{
+      border: 1px solid #000000;
+      margin-bottom: 12px;
+      background: #ffffff;
+    }}
+    .card-header {{
+      background: #f0f0f0;
+      border-bottom: 1px solid #000000;
+      padding: 4px 8px;
+      font-weight: bold;
+      font-size: 11px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }}
+    .card-body {{
+      padding: 8px;
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid #000000;
+      font-size: 11px;
+      margin-bottom: 4px;
+    }}
+    th, td {{
+      border: 1px solid #000000;
+      padding: 4px 6px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      background: #f0f0f0;
+      font-weight: bold;
+    }}
+    tr:nth-child(even) td {{
+      background: #fafafa;
+    }}
+    .map-frame {{
+      width: 100%;
+      height: 480px;
+      border: 1px solid #000000;
+      display: block;
+      background: #f4f4f4;
+    }}
+    .slider-box {{
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      border: 1px solid #000000;
+      user-select: none;
+      cursor: ew-resize;
+    }}
+    .slider-box img {{
+      display: block;
+      width: 100%;
+      height: auto;
+    }}
+    .slider-box .img-top {{
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 100%;
+      clip-path: inset(0 50% 0 0);
+    }}
+    .slider-tag {{
+      position: absolute;
+      top: 6px;
+      z-index: 5;
+      background: rgba(0, 0, 0, 0.75);
+      color: #ffffff;
+      padding: 2px 6px;
+      font-size: 10px;
+      font-weight: bold;
+      pointer-events: none;
+      line-height: 1.2;
+    }}
+    .slider-tag-after {{
+      left: 6px;
+    }}
+    .slider-tag-before {{
+      right: 6px;
+    }}
+    .slider-handle {{
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 2px;
+      background: #000000;
+      pointer-events: none;
+      z-index: 4;
+    }}
+    .slider-handle::after {{
+      content: "<>";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: #ffffff;
+      border: 1px solid #000000;
+      font-size: 9px;
+      padding: 1px 3px;
+      font-weight: bold;
+    }}
+    a {{
+      color: #0000ee;
+      text-decoration: underline;
+    }}
+    a:hover {{
+      background: #000000;
+      color: #ffffff;
+      text-decoration: none;
+    }}
+    .quick-actions {{
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin: 4px 0 8px 0;
+      font-size: 11px;
+      align-items: center;
+    }}
+    .action-link {{
+      padding: 2px 5px;
+      border: 1px solid #000000;
+      background: #ffffff;
+      text-decoration: none;
+      color: #000000;
+      font-weight: bold;
+      font-size: 10px;
+    }}
+    .action-link:hover {{
+      background: #000000;
+      color: #ffffff;
+    }}
+    #global-station-tooltip {{
+      position: fixed;
+      display: none;
+      z-index: 999999;
+      background: #ffffff;
+      color: #000000;
+      border: 1px solid #000000;
+      padding: 8px 10px;
+      font-family: inherit;
+      font-size: 11px;
+      line-height: 1.35;
+      white-space: pre;
+      pointer-events: none;
+      box-shadow: none !important;
+      max-width: 90vw;
+      max-height: 85vh;
+      overflow: auto;
+    }}
+    .st-hover {{
+      display: inline-block;
+      cursor: help;
+      border-bottom: 1px dotted #000000;
+    }}
+    .st-hover:hover, .st-hover:focus {{
+      background: #000000;
+      color: #ffffff;
+    }}
+    .st-hover:hover a, .st-hover:focus a {{
+      color: #ffffff !important;
+    }}
+  </style>
+</head>
+<body>
+
+  <div id="global-station-tooltip" role="tooltip"></div>
+  <script id="station-tooltips-data" type="application/json">
+{json.dumps(station_tooltips)}
+  </script>
+
+  <header>
+    <div class="top-meta">
+      <div>
+        <h1>[PROJECT VALIDATION DASHBOARD] PID: {html.escape(target_pid)}</h1>
+        <div style="font-size: 11px; color: #444; margin-top: 2px;">
+          District {html.escape(str(primary_proj.dist))}, {html.escape(primary_proj.county)} County | Route {html.escape(str(primary_proj.route))} | PM {html.escape(str(primary_proj.begin_pm))} &rarr; {html.escape(str(primary_proj.end_pm))}
+        </div>
+      </div>
+      <div style="font-size: 11px; text-align: right;">
+        <span>Research Tool | Single-Screen Validation Mode</span>
+      </div>
+    </div>
+
+    <div class="top-nav">
+      <span style="font-weight:bold; align-self:center;">DIRECTIONS:</span>
+      {" ".join(dir_nav_chips)}
+      <span style="border-left:1px solid #ccc; margin:0 4px;"></span>
+      <a href="project_map.html" target="_blank" class="nav-btn">[Open Standalone Map]</a>
+      <a href="{ge_corridor_url}" target="_blank" class="nav-btn">[Google Earth Full Corridor]</a>
+      <a href="{gmaps_corridor_url}" target="_blank" class="nav-btn">[Google Maps Full Corridor]</a>
+    </div>
+  </header>
+
+  <div class="dashboard-grid">
+    <!-- Left Column: Data Tables & Attributes -->
+    <div class="col-left">
+      {"".join(dir_sections_html)}
+    </div>
+
+    <!-- Right Column: Interactive Map & Imagery Slices -->
+    <div class="col-right">
+      
+      <!-- Interactive Corridor Map Card -->
+      <div class="card">
+        <div class="card-header">
+          <span>INTERACTIVE CORRIDOR MAP &amp; DETECTOR OVERLAY</span>
+          <div class="quick-actions" style="margin:0;">
+            <a href="project_map.html" target="_blank" class="action-link">[Fullscreen]</a>
+            <a href="{ge_corridor_url}" target="_blank" class="action-link">[Google Earth]</a>
+            <a href="{gmaps_corridor_url}" target="_blank" class="action-link">[Google Maps]</a>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0;">
+          <iframe id="mapFrame" class="map-frame" src="project_map.html"></iframe>
+          <div style="padding: 6px 8px; font-size: 10px; color: #555; border-top: 1px solid #000; background: #fafafa;">
+            Showing highway alignment path and all detector stations (ML, HV, OR, FR). Click [Map] on any station row to center.
+          </div>
+        </div>
+      </div>
+
+      <!-- Historical Satellite Imagery Card -->
+      {imagery_card_html}
+
+    </div>
+  </div>
+
+  <script>
+    // Direction Switching
+    function showDirection(dirId) {{
+      var sections = document.querySelectorAll('.dir-section');
+      sections.forEach(function(s) {{ s.style.display = 'none'; }});
+      var target = document.getElementById(dirId);
+      if (target) target.style.display = 'block';
+
+      var btns = document.querySelectorAll('[data-dir-target]');
+      btns.forEach(function(b) {{
+        if (b.getAttribute('data-dir-target') === dirId) {{
+          b.classList.add('active');
+        }} else {{
+          b.classList.remove('active');
+        }}
+      }});
+    }}
+
+    // Slice Segment Switching
+    var currentSlice = 1;
+    function showSlice(sliceIdx) {{
+      currentSlice = sliceIdx;
+      var panels = document.querySelectorAll('.slice-panel');
+      panels.forEach(function(p) {{ p.style.display = 'none'; }});
+      var target = document.getElementById('slice-panel-' + sliceIdx);
+      if (target) target.style.display = 'block';
+
+      var chips = document.querySelectorAll('[data-slice-chip]');
+      chips.forEach(function(c) {{
+        if (parseInt(c.getAttribute('data-slice-chip')) === sliceIdx) {{
+          c.classList.add('active');
+        }} else {{
+          c.classList.remove('active');
+        }}
+      }});
+    }}
+
+    // Slice View Mode (Slider vs Stacked vs Split)
+    function setSliceView(mode) {{
+      ['slider', 'stacked', 'split'].forEach(function(m) {{
+        var btn = document.getElementById('btn-view-' + m);
+        if (btn) {{
+          if (m === mode) btn.classList.add('active');
+          else btn.classList.remove('active');
+        }}
+      }});
+
+      var allViews = document.querySelectorAll('.slice-view');
+      allViews.forEach(function(v) {{ v.style.display = 'none'; }});
+
+      var activeViews = document.querySelectorAll('.slice-' + mode + '-view');
+      activeViews.forEach(function(v) {{ v.style.display = 'block'; }});
+    }}
+
+    // Map Centering & Focus
+    var pendingMapFocus = null;
+
+    function focusMap(lat, lon, zoom, label) {{
+      if (isNaN(lat) || isNaN(lon)) return;
+      var frame = document.getElementById('mapFrame');
+      if (!frame) return;
+      var z = zoom || 17;
+      var lbl = label || 'Focus Location';
+
+      // 1. Direct function call if iframe is loaded and accessible
+      try {{
+        if (frame.contentWindow && typeof frame.contentWindow.centerMapAt === 'function') {{
+          frame.contentWindow.centerMapAt(lat, lon, z, lbl);
+          return;
+        }}
+      }} catch (e) {{}}
+
+      // 2. Cross-window HTML5 postMessage
+      try {{
+        if (frame.contentWindow && typeof frame.contentWindow.postMessage === 'function') {{
+          frame.contentWindow.postMessage({{
+            type: 'FOCUS_MAP',
+            lat: lat,
+            lon: lon,
+            zoom: z,
+            label: lbl
+          }}, '*');
+          return;
+        }}
+      }} catch (e) {{}}
+
+      // 3. Queue pending if iframe still loading
+      pendingMapFocus = {{ lat: lat, lon: lon, zoom: z, label: lbl }};
+
+      // 4. Fallback hash navigation
+      try {{
+        if (frame.contentWindow && frame.contentWindow.location) {{
+          frame.contentWindow.location.hash = '#' + lat + ',' + lon + ',' + z + ',' + encodeURIComponent(lbl);
+          return;
+        }}
+      }} catch (e) {{}}
+
+      frame.src = 'project_map.html#' + lat + ',' + lon + ',' + z + ',' + encodeURIComponent(lbl);
+    }}
+
+    window.addEventListener('DOMContentLoaded', function() {{
+      var frame = document.getElementById('mapFrame');
+      if (frame) {{
+        frame.addEventListener('load', function() {{
+          if (pendingMapFocus) {{
+            setTimeout(function() {{
+              focusMap(pendingMapFocus.lat, pendingMapFocus.lon, pendingMapFocus.zoom, pendingMapFocus.label);
+              pendingMapFocus = null;
+            }}, 350);
+          }}
+        }});
+      }}
+    }});
+
+    // Slider Drag Logic
+    function initSliders() {{
+      var boxes = document.querySelectorAll('.slider-box');
+      boxes.forEach(function(box) {{
+        var topImg = box.querySelector('.img-top');
+        var handle = box.querySelector('.slider-handle');
+        if (!topImg || !handle) return;
+        var dragging = false;
+
+        function update(clientX) {{
+          var rect = box.getBoundingClientRect();
+          var pct = ((clientX - rect.left) / rect.width) * 100;
+          pct = Math.max(0, Math.min(100, pct));
+          topImg.style.clipPath = 'inset(0 ' + (100 - pct) + '% 0 0)';
+          handle.style.left = pct + '%';
+        }}
+
+        box.addEventListener('mousedown', function(e) {{
+          dragging = true;
+          update(e.clientX);
+          e.preventDefault();
+        }});
+        window.addEventListener('mouseup', function() {{ dragging = false; }});
+        window.addEventListener('mousemove', function(e) {{
+          if (dragging) update(e.clientX);
+        }});
+        box.addEventListener('touchstart', function(e) {{
+          dragging = true;
+          if (e.touches && e.touches[0]) update(e.touches[0].clientX);
+        }});
+        window.addEventListener('touchend', function() {{ dragging = false; }});
+        window.addEventListener('touchmove', function(e) {{
+          if (dragging && e.touches && e.touches[0]) update(e.touches[0].clientX);
+        }});
+        box.addEventListener('dblclick', function() {{
+          topImg.style.clipPath = 'inset(0 50% 0 0)';
+          handle.style.left = '50%';
+        }});
+      }});
+    }}
+
+    // Station Tooltip Logic
+    var stationTooltipsData = {{}};
+    try {{
+      var stDataEl = document.getElementById('station-tooltips-data');
+      if (stDataEl) {{
+        stationTooltipsData = JSON.parse(stDataEl.textContent);
+      }}
+    }} catch (e) {{}}
+
+    var globalTooltip = document.getElementById('global-station-tooltip');
+
+    function updateTooltipPosition(e) {{
+      if (!globalTooltip) return;
+      var pad = 14;
+      var x = e.clientX + pad;
+      var y = e.clientY + pad;
+      var rect = globalTooltip.getBoundingClientRect();
+      if (x + rect.width > window.innerWidth - 10) {{
+        x = Math.max(10, e.clientX - rect.width - pad);
+      }}
+      if (y + rect.height > window.innerHeight - 10) {{
+        y = Math.max(10, e.clientY - rect.height - pad);
+      }}
+      if (x < 10) x = 10;
+      if (y < 10) y = 10;
+      globalTooltip.style.left = x + 'px';
+      globalTooltip.style.top = y + 'px';
+    }}
+
+    document.addEventListener('mouseover', function(e) {{
+      var hoverTarget = e.target.closest('.st-hover');
+      if (hoverTarget && globalTooltip) {{
+        var sid = hoverTarget.getAttribute('data-station-id');
+        var text = stationTooltipsData[sid] || ('Station ' + sid + '\\n(No configuration data cached)');
+        globalTooltip.textContent = text;
+        globalTooltip.style.display = 'block';
+        updateTooltipPosition(e);
+      }}
+    }});
+
+    document.addEventListener('mousemove', function(e) {{
+      if (globalTooltip && globalTooltip.style.display === 'block') {{
+        updateTooltipPosition(e);
+      }}
+    }});
+
+    document.addEventListener('mouseout', function(e) {{
+      var hoverTarget = e.target.closest('.st-hover');
+      if (hoverTarget && globalTooltip) {{
+        globalTooltip.style.display = 'none';
+      }}
+    }});
+
+    window.addEventListener('DOMContentLoaded', initSliders);
+  </script>
+
+</body>
+</html>
+"""
+
+    with open(index_html_path, "w", encoding="utf-8") as f:
+        f.write(full_html)
+
+    # Also save a copy inside imagery directory if one exists
+    if imagery_dir and os.path.exists(imagery_dir):
+        try:
+            val_in_imagery = os.path.join(imagery_dir, "validation.html")
+            with open(val_in_imagery, "w", encoding="utf-8") as f:
+                f.write(full_html)
+            map_in_imagery = os.path.join(imagery_dir, "project_map.html")
+            if os.path.exists(map_html_path):
+                import shutil
+                shutil.copy2(map_html_path, map_in_imagery)
+        except Exception:
+            pass
+
+    return index_html_path
+
+
+def launch_project_web_interface(
+    project_id: str,
+    projects: Optional[List[ProjectRecord]] = None,
+    open_browser: bool = True,
+    output_dir: Optional[str] = None,
+    master_csv_path: Optional[str] = None,
+    metadata_dir: Optional[str] = None,
+    station_buffer_mi: float = 0.5,
+) -> str:
+    """
+    Generate and launch the single-page research validation web dashboard for a project.
+    """
+    html_path = generate_project_validation_web_page(
+        project_id=project_id,
+        projects=projects,
+        output_dir=output_dir,
+        master_csv_path=master_csv_path,
+        metadata_dir=metadata_dir,
+        station_buffer_mi=station_buffer_mi,
+    )
+
+    abs_p = os.path.abspath(html_path)
+    print("\n" + "=" * 80)
+    print(f"PROJECT VALIDATION DASHBOARD: Project {project_id}")
+    print("=" * 80)
+    print(f"✓ Single-screen validation interface generated:")
+    print(f"  {abs_p}")
+    print("=" * 80 + "\n")
+
+    if open_browser:
+        webbrowser.open("file://" + abs_p)
+
+    return abs_p
 
 
 # ---------------------------------------------------------------------------
@@ -7482,6 +9546,15 @@ Examples:
         dest="project",
         metavar="PID",
         help="Target Project ID. Default action is project inspection. Can also be combined with --slices, --imagery, --map, or --download."
+    )
+    act_group.add_argument(
+        "--web",
+        dest="web",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="PID",
+        help="Generate and launch the single-page research validation interface for a project (e.g. -p 414000032 --web or --web 414000032)."
     )
     act_group.add_argument(
         "--slices", "--corridor-slices",
@@ -7627,6 +9700,25 @@ Examples:
         type=float,
         default=150.0,
         help="Margin around highway segment in meters (default: 150m)."
+    )
+    img_group.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Number of concurrent download worker threads for imagery tiles (default: 16)."
+    )
+    img_group.add_argument(
+        "--quality-window",
+        type=float,
+        default=5.0,
+        help="Maximum years before/after target date to prioritize highest resolution imagery (default: 5.0 years)."
+    )
+    img_group.add_argument(
+        "--no-prioritize-quality",
+        dest="prioritize_quality",
+        action="store_false",
+        default=True,
+        help="Disable resolution-based quality prioritization and use strict nearest date."
     )
 
     # 3. PeMS Data Download Options
@@ -8137,7 +10229,9 @@ def main(argv: Optional[List[str]] = None):
     # Resolve target project ID or station ID from any argument that provided one
     target_pid = None
     target_station = None
-    if isinstance(args.slices, str):
+    if isinstance(args.web, str):
+        target_pid = args.web.strip()
+    elif isinstance(args.slices, str):
         target_pid = args.slices.strip()
     elif isinstance(args.imagery, str):
         target_pid = args.imagery.strip()
@@ -8161,17 +10255,21 @@ def main(argv: Optional[List[str]] = None):
 
     # Pre-resolve absolute postmiles from CA postmiles for target project if needed
     if target_pid:
-        for p in projects:
-            if p.project_id == target_pid:
-                if p.abs_begin_pm is None or p.abs_end_pm is None:
-                    calc_b, calc_e = resolve_absolute_postmiles(
-                        p.route, p.county, p.begin_pm, p.end_pm
-                    )
-                    if calc_b is not None and calc_e is not None:
-                        if p.abs_begin_pm is None:
-                            p.abs_begin_pm = calc_b
-                        if p.abs_end_pm is None:
-                            p.abs_end_pm = calc_e
+        matched_target = [p for p in projects if p.project_id == target_pid]
+        if not matched_target and not (args.coords or (args.route and not args.project)):
+            print(f"Error: Project ID '{target_pid}' not found.")
+            sys.exit(1)
+
+        for p in matched_target:
+            if p.abs_begin_pm is None or p.abs_end_pm is None:
+                calc_b, calc_e = resolve_absolute_postmiles(
+                    p.route, p.county, p.begin_pm, p.end_pm
+                )
+                if calc_b is not None and calc_e is not None:
+                    if p.abs_begin_pm is None:
+                        p.abs_begin_pm = calc_b
+                    if p.abs_end_pm is None:
+                        p.abs_end_pm = calc_e
 
     # 4. Multi-project map
     if args.map_all:
@@ -8286,6 +10384,22 @@ def main(argv: Optional[List[str]] = None):
             )
         return
 
+    # 5c. Single-Page Research Validation Web Interface
+    if args.web:
+        if not target_pid:
+            print("Error: Please specify a Project ID for the web interface (e.g. -p <PID> --web or --web <PID>).")
+            sys.exit(1)
+        launch_project_web_interface(
+            project_id=target_pid,
+            projects=projects,
+            open_browser=not args.no_open,
+            output_dir=args.output_dir if args.output_dir != "." else None,
+            master_csv_path=args.input if os.path.exists(args.input) else None,
+            metadata_dir=args.metadata_dir,
+            station_buffer_mi=args.station_buffer,
+        )
+        return
+
     # 6. Corridor Slices (high-resolution Zoom 19 with interactive report)
     if args.slices:
         if not target_pid:
@@ -8304,6 +10418,9 @@ def main(argv: Optional[List[str]] = None):
             custom_before_date=c_before,
             custom_after_date=c_after,
             open_browser=not args.no_open,
+            workers=getattr(args, "workers", 16),
+            prioritize_quality=getattr(args, "prioritize_quality", True),
+            quality_window=getattr(args, "quality_window", 5.0),
             verbose=True
         )
         return
@@ -8328,8 +10445,9 @@ def main(argv: Optional[List[str]] = None):
             custom_before_date=c_before,
             custom_after_date=c_after,
             corridor_slices=False,
-            slice_mi=args.slice_mi,
-            open_browser=not args.no_open,
+            workers=getattr(args, "workers", 16),
+            prioritize_quality=getattr(args, "prioritize_quality", True),
+            quality_window=getattr(args, "quality_window", 5.0),
             verbose=True
         )
         return

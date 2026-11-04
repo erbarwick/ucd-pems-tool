@@ -501,8 +501,8 @@ class TestProjectMapping(unittest.TestCase):
         pems_interface.add_standard_basemaps_to_map(m)
         folium.LayerControl().add_to(m)
         html = m.get_root().render()
-        self.assertIn("Esri Light Gray (Default)", html)
-        self.assertIn("Esri Street Map", html)
+        self.assertIn("Esri Street Map (Default)", html)
+        self.assertIn("Esri Light Gray", html)
         self.assertIn("USGS Topo", html)
         self.assertIn("server.arcgisonline.com", html)
         self.assertNotIn("basemaps.cartocdn.com", html)
@@ -2020,7 +2020,7 @@ class TestStationLaneConfiguration(unittest.TestCase):
 
     def test_build_station_config_url(self):
         url = pems_interface.build_station_config_url("410756")
-        self.assertEqual(url, "https://pems.dot.ca.gov/?report_form=1&dnode=VDS&content=sta_cfg&station_id=410756")
+        self.assertEqual(url, "https://pems.dot.ca.gov/?dnode=VDS&content=sta_cfg&tab=sta_cfg&station_id=410756")
 
     def test_parse_station_configuration_page(self):
         sample_html = """
@@ -2602,6 +2602,482 @@ class TestPostmileConversionAndRangeSearch(unittest.TestCase):
         self.assertEqual(args2.end_county, "Sonoma")
         self.assertEqual(args2.end_pm, "2.0")
         self.assertTrue(args2.map)
+
+
+class TestSliceLinksAndQualitySelection(unittest.TestCase):
+    """Tests for slice report verification links and Wayback quality-prioritized selection."""
+
+    def test_slice_report_contains_google_earth_and_local_map_links(self):
+        import tempfile
+        import wayback_imagery.core as wayback
+
+        proj = pems_interface.ProjectRecord(
+            project_id="414000032",
+            dist="4",
+            county="San Mateo",
+            state="CA",
+            route="84",
+            direction="NB",
+            begin_pm="25.30",
+            end_pm="25.70",
+            abs_begin_pm=25.30,
+            abs_end_pm=25.70,
+            construction_begin_date="2019-01-01",
+            open_to_traffic_date="2024-12-31",
+            project_description="Widen Woodside Road to six lanes."
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            before_img = os.path.join(tmpdir, "slice_01_before.png")
+            after_img = os.path.join(tmpdir, "slice_01_after.png")
+            stacked_img = os.path.join(tmpdir, "slice_01_stacked.png")
+            with open(before_img, "w") as f: f.write("dummy")
+            with open(after_img, "w") as f: f.write("dummy")
+            with open(stacked_img, "w") as f: f.write("dummy")
+
+            slices_data = [{
+                "index": 1,
+                "start_pm": 25.30,
+                "end_pm": 25.50,
+                "length_mi": 0.20,
+                "bearing": 90.0,
+                "before_image": before_img,
+                "after_image": after_img,
+                "stacked_image": stacked_img,
+                "before_capture_date": "2017-08-28",
+                "after_capture_date": "2025-07-30",
+                "zoom": 19,
+                "start_coords": (37.478, -122.215),
+                "end_coords": (37.480, -122.210),
+                "midpoint": (37.479, -122.2125),
+                "bbox": [-122.216, 37.477, -122.209, 37.481],
+                "width": 1600,
+                "height": 1100,
+                "sensors": [{"id": "400001", "type": "ML", "pm": 25.40, "lanes": "3"}]
+            }]
+
+            report_path = pems_interface.generate_slices_html_report(
+                project=proj,
+                slices_data=slices_data,
+                before_meta={"release_id": 20399, "capture_date": "2017-08-28"},
+                after_meta={"release_id": 13192, "capture_date": "2025-07-30"},
+                output_dir=tmpdir,
+                map_file="project_map.html"
+            )
+
+            self.assertTrue(os.path.exists(report_path))
+            with open(report_path, "r", encoding="utf-8") as f:
+                html_text = f.read()
+
+            # 1. Assert Google Earth link present with midpoint coordinates
+            self.assertIn("earth.google.com/web/@37.479000,-122.212500", html_text)
+            self.assertIn("Google Earth", html_text)
+
+            # 2. Assert Local Station Map link present with exact slice hash
+            self.assertIn("project_map.html#37.479000,-122.212500,17", html_text)
+            self.assertIn("Local Station Map", html_text)
+
+            # 3. Assert Google Maps Satellite link present
+            self.assertIn("google.com/maps/@37.479000,-122.212500", html_text)
+
+            # 4. Assert Full Project Map chip in nav bar
+            self.assertIn('href="project_map.html"', html_text)
+            self.assertIn("Full Project Map with Stations", html_text)
+
+    def test_build_single_project_map_has_hash_listener(self):
+        import tempfile
+
+        proj = pems_interface.ProjectRecord(
+            project_id="414000032",
+            dist="4",
+            county="San Mateo",
+            state="CA",
+            route="84",
+            direction="NB",
+            begin_pm="25.30",
+            end_pm="25.70",
+            abs_begin_pm=25.30,
+            abs_end_pm=25.70,
+            start_coords=(37.478, -122.215),
+            end_coords=(37.480, -122.210),
+            construction_begin_date="2019-01-01",
+            open_to_traffic_date="2024-12-31"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_map = os.path.join(tmpdir, "test_map.html")
+            m = pems_interface.build_single_project_map(
+                target_pid=proj,
+                output_path=out_map,
+                include_stations=False
+            )
+            self.assertIsNotNone(m)
+            self.assertTrue(os.path.exists(out_map))
+            with open(out_map, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("centerFromHash", content)
+            self.assertIn("hashchange", content)
+            self.assertIn("setView", content)
+            self.assertIn("clearFocusMarkers", content)
+            self.assertIn("_currentFocusMarkers", content)
+            self.assertIn("_hasDismissClick", content)
+            self.assertNotIn("Slice Focus Center", content)
+
+    def test_pick_by_quality_and_date_prioritizes_resolution_within_5_years(self):
+        import wayback_imagery.core as wayback
+        import datetime as dt
+
+        rel1 = wayback.Release(1, dt.date(2011, 4, 10), "2011-04-10", "template", None)
+        rel2 = wayback.Release(2, dt.date(2017, 8, 28), "2017-08-28", "template", None)
+        rel3 = wayback.Release(3, dt.date(2018, 9, 12), "2018-09-12", "template", None)
+
+        # Candidate A: 0.15m (super sharp) but 7.7 years before target -> exceeds 5-year gap
+        cap_a = wayback.CaptureInfo(rel1, dt.date(2011, 4, 10), 0.15, 1.0, "USGS")
+        # Candidate B: 0.30m (next best) and 1.3 years before target -> WITHIN 5-year gap!
+        cap_b = wayback.CaptureInfo(rel2, dt.date(2017, 8, 28), 0.30, 1.0, "Esri")
+        # Candidate C: 0.60m (blurrier) and 0.3 years before target -> within 5-year gap
+        cap_c = wayback.CaptureInfo(rel3, dt.date(2018, 9, 12), 0.60, 1.0, "Maxar")
+
+        target_date = dt.date(2019, 1, 1)
+
+        # Standard date-only selection would choose cap_c (latest date)
+        standard_pick = wayback._pick_by_date([cap_a, cap_b, cap_c], lambda c: c.capture_date, target_date, "before", "test")
+        self.assertEqual(standard_pick.release.release_id, 3)
+
+        # Quality-prioritized selection skips cap_a (> 5 years) and chooses cap_b (0.30m within 5 years)!
+        quality_pick = wayback._pick_by_quality_and_date([cap_a, cap_b, cap_c], target_date, mode="before", max_year_gap=5.0)
+        self.assertEqual(quality_pick.release.release_id, 2)
+        self.assertEqual(quality_pick.resolution_m, 0.30)
+        self.assertEqual(quality_pick.capture_date, dt.date(2017, 8, 28))
+
+    def test_pick_by_quality_and_date_picks_highest_tier_when_within_5_years(self):
+        import wayback_imagery.core as wayback
+        import datetime as dt
+
+        rel1 = wayback.Release(1, dt.date(2016, 5, 1), "2016-05-01", "template", None)
+        rel2 = wayback.Release(2, dt.date(2018, 8, 1), "2018-08-01", "template", None)
+
+        # Candidate A: 0.15m from 2016 (2.6 years before 2019) -> within 5 years!
+        cap_a = wayback.CaptureInfo(rel1, dt.date(2016, 5, 1), 0.15, 1.0, "USGS")
+        # Candidate B: 0.60m from 2018 (0.4 years before 2019) -> within 5 years
+        cap_b = wayback.CaptureInfo(rel2, dt.date(2018, 8, 1), 0.60, 1.0, "Maxar")
+
+        target_date = dt.date(2019, 1, 1)
+
+        # Highest quality tier (0.15m) has a candidate within 5 years -> selected!
+        quality_pick = wayback._pick_by_quality_and_date([cap_a, cap_b], target_date, mode="before", max_year_gap=5.0)
+        self.assertEqual(quality_pick.release.release_id, 1)
+        self.assertEqual(quality_pick.resolution_m, 0.15)
+
+    def test_pick_by_quality_and_date_fallback_when_none_within_5_years(self):
+        import wayback_imagery.core as wayback
+        import datetime as dt
+
+        rel1 = wayback.Release(1, dt.date(2010, 1, 1), "2010-01-01", "template", None)
+        rel2 = wayback.Release(2, dt.date(2012, 1, 1), "2012-01-01", "template", None)
+
+        # Both > 5 years before 2019
+        cap_a = wayback.CaptureInfo(rel1, dt.date(2010, 1, 1), 0.15, 1.0, "USGS")
+        cap_b = wayback.CaptureInfo(rel2, dt.date(2012, 1, 1), 0.30, 1.0, "Esri")
+
+        target_date = dt.date(2019, 1, 1)
+
+        # Neither within 5 years -> fallback picks closest in date (2012)
+        quality_pick = wayback._pick_by_quality_and_date([cap_a, cap_b], target_date, mode="before", max_year_gap=5.0)
+        self.assertEqual(quality_pick.release.release_id, 2)
+        self.assertEqual(quality_pick.capture_date, dt.date(2012, 1, 1))
+
+
+class TestProjectWebDashboard(unittest.TestCase):
+    """Tests for the single-page research validation web dashboard."""
+
+    def test_cli_web_parser(self):
+        parser = pems_interface.build_parser()
+        args1 = parser.parse_args(["-p", "414000032", "--web"])
+        self.assertEqual(args1.project, "414000032")
+        self.assertTrue(args1.web)
+
+        args2 = parser.parse_args(["--web", "414000032"])
+        self.assertEqual(args2.web, "414000032")
+
+    def test_generate_project_validation_web_page(self):
+        import tempfile
+        import re
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_html = pems_interface.generate_project_validation_web_page(
+                project_id="414000032",
+                output_dir=tmpdir
+            )
+            self.assertTrue(os.path.exists(out_html))
+            map_path = os.path.join(tmpdir, "project_map.html")
+            self.assertTrue(os.path.exists(map_path))
+
+            with open(out_html, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Monospace font styling required
+            self.assertIn("Andale Mono", content)
+            self.assertIn("monospace", content)
+
+            # Key sections present
+            self.assertIn("[PROJECT VALIDATION DASHBOARD]", content)
+            self.assertIn("GROUND TRUTH VALIDATION MATRIX", content)
+            self.assertIn("CORRIDOR DETECTOR STATIONS AUDIT", content)
+            self.assertIn("INTERACTIVE CORRIDOR MAP &amp; DETECTOR OVERLAY", content)
+            self.assertIn("HISTORICAL SATELLITE IMAGERY SLICES", content)
+            self.assertIn("MASTER SPREADSHEET RECORD ATTRIBUTES", content)
+
+            # Deep link & external ground truth verification links present
+            self.assertIn("focusMap(", content)
+            self.assertIn("Google Earth", content)
+            self.assertIn("Google Maps", content)
+
+            # Ensure NO emojis present in web interface
+            emoji_pattern = re.compile(r"[\U00010000-\U0010ffff]|[\u2600-\u26ff]|[\u2700-\u27bf]|&#x1F")
+            self.assertIsNone(emoji_pattern.search(content), "Web dashboard contains disallowed emoji or emoji HTML entity")
+
+            # Check that Esri Street Map (Default) is the default map in project_map.html
+            with open(map_path, "r", encoding="utf-8") as mf:
+                map_content = mf.read()
+            self.assertIn("Esri Street Map (Default)", map_content)
+            self.assertIn("clearFocusMarkers", map_content)
+            self.assertIn("_currentFocusMarkers", map_content)
+            self.assertNotIn("Slice Focus Center", map_content)
+
+            # Check slider orientation tags
+            self.assertIn("slider-tag-before", content)
+            self.assertIn("slider-tag-after", content)
+            self.assertIn("inset(0 50% 0 0)", content)
+
+            # Check that segment links have distinct accurate slice midpoints
+            self.assertIn("37.484879,-122.215155", content)
+            self.assertIn("37.487397,-122.213836", content)
+
+    def test_slice_midpoint_resolution_and_links(self):
+        """Test that slice midpoints are computed dynamically even if metadata.json lacks midpoint fields."""
+        import tempfile
+        import json
+        import re
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a mock slice directory with metadata that has NO midpoint or coords
+            mock_slice_dir = os.path.join(tmpdir, "downloads", "imagery", "PID_414000032_Route84_N_PM25.3-25.7")
+            os.makedirs(mock_slice_dir, exist_ok=True)
+            mock_meta = {
+                "project_id": "414000032",
+                "route": "84",
+                "direction": "NB",
+                "county": "San Mateo",
+                "postmiles": ["25.3", "25.7"],
+                "slices": [
+                    {
+                        "index": 1,
+                        "start_pm": 25.3,
+                        "end_pm": 25.5,
+                        "length_mi": 0.2,
+                    },
+                    {
+                        "index": 2,
+                        "start_pm": 25.5,
+                        "end_pm": 25.7,
+                        "length_mi": 0.2,
+                    }
+                ]
+            }
+            with open(os.path.join(mock_slice_dir, "metadata.json"), "w") as f:
+                json.dump(mock_meta, f)
+            # Create dummy pngs
+            for s_idx in [1, 2]:
+                open(os.path.join(mock_slice_dir, f"slice_{s_idx:02d}_stacked.png"), "w").close()
+                open(os.path.join(mock_slice_dir, f"slice_{s_idx:02d}_before.png"), "w").close()
+                open(os.path.join(mock_slice_dir, f"slice_{s_idx:02d}_after.png"), "w").close()
+
+            out_html = pems_interface.generate_project_validation_web_page(
+                project_id="414000032",
+                output_dir=os.path.join(tmpdir, "web_out"),
+                fetch_online=False
+            )
+            with open(out_html, "r", encoding="utf-8") as f:
+                html_text = f.read()
+
+            # Ensure Seg 1 and Seg 2 resolved distinct midpoints instead of identical fallbacks
+            ge_matches = re.findall(r'href="(https://earth\.google\.com/web/@[^"]+)"', html_text)
+            self.assertGreaterEqual(len(ge_matches), 2)
+            # Slices must not share the exact same midpoint
+            seg1_ge = [g for g in ge_matches if "Seg 1" in html_text[max(0, html_text.find(g)-150):html_text.find(g)] or "Segment 1" in html_text[max(0, html_text.find(g)-150):html_text.find(g)]]
+            seg2_ge = [g for g in ge_matches if "Seg 2" in html_text[max(0, html_text.find(g)-150):html_text.find(g)] or "Segment 2" in html_text[max(0, html_text.find(g)-150):html_text.find(g)]]
+            if seg1_ge and seg2_ge:
+                self.assertNotEqual(seg1_ge[0], seg2_ge[0])
+
+
+class TestStationLaneConfigHoverAndCaching(unittest.TestCase):
+    """Tests for station lane configuration caching and interactive hover tooltips."""
+
+    def test_station_config_serialization_and_disk_cache(self):
+        import tempfile
+
+        st = pems_interface.StationLaneConfigDetails(
+            station_id="410756",
+            station_name="EB 12 OC",
+            district="4",
+            route="80",
+            direction="E",
+            county="95",
+            station_type="ML",
+            ca_pm="11.86",
+            abs_pm=39.33,
+            latitude=38.20691,
+            longitude=-122.151326,
+            tsn_roadway_info={"Road Width": "48 ft", "Lane Width": "12.0 ft"},
+            lane_table=[{"Lane": "1", "Type": "Mainline", "Sensor Tech": "Dual Loop"}],
+            change_log=[{"Date": "04/09/2016", "Status": "Active", "Lanes": "12345"}],
+            construction_history=[{"Start Date": "03/14/2017", "End Date": "01/14/2018"}]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = pems_interface.save_cached_station_config(st, cache_dir=tmpdir)
+            self.assertTrue(os.path.exists(cache_file))
+
+            loaded = pems_interface.load_cached_station_config("410756", cache_dir=tmpdir)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.station_id, "410756")
+            self.assertEqual(loaded.station_name, "EB 12 OC")
+            self.assertEqual(loaded.abs_pm, 39.33)
+            self.assertEqual(len(loaded.lane_table), 1)
+            self.assertEqual(loaded.lane_table[0]["Sensor Tech"], "Dual Loop")
+            self.assertEqual(len(loaded.change_log), 1)
+            self.assertEqual(loaded.change_log[0]["Lanes"], "12345")
+            self.assertEqual(loaded.tsn_roadway_info["Road Width"], "48 ft")
+
+    def test_format_station_lane_config_tooltip_contents(self):
+        st = pems_interface.StationLaneConfigDetails(
+            station_id="410756",
+            station_name="EB 12 OC",
+            district="4",
+            route="80",
+            direction="E",
+            county="Solano",
+            station_type="ML",
+            ca_pm="11.86",
+            abs_pm=39.33,
+            tsn_roadway_info={"Road Width": "48 ft", "Lane Width": "12.0 ft", "Design Speed Limit": "70 mph"},
+            lane_table=[
+                {"Lane": "1", "Type": "Mainline", "Sensor Tech": "Dual Loop"},
+                {"Lane": "2", "Type": "Mainline", "Sensor Tech": "Dual Loop"},
+                {"Lane": "3", "Type": "Mainline", "Sensor Tech": "Dual Loop"},
+            ],
+            change_log=[
+                {"Date": "04/09/2016", "Status": "Active", "Lanes": "123"},
+                {"Date": "05/20/2017", "Status": "Active", "Lanes": "1234"},
+            ]
+        )
+
+        proj = pems_interface.ProjectRecord(
+            project_id="418000244",
+            dist="4",
+            county="Solano",
+            state="CA",
+            route="80",
+            direction="E",
+            begin_pm="11.4",
+            end_pm="12.8",
+            raw_row={
+                "Sensor Station 1 ID": "410756",
+                "Sensor Station 1: number of lanes before": "3",
+                "Sensor Station 1: number of lanes after": "4",
+                "s1_new_lane_year": "2017",
+                "Sensor Station 1: lane type": "Mainline"
+            }
+        )
+
+        tooltip = pems_interface.format_station_lane_config_tooltip(st, project=proj)
+
+        # Monospace formatting checks
+        self.assertIn("STATION 410756 (ML) - EB 12 OC", tooltip)
+        self.assertIn("CURRENT LANES: 3", tooltip)
+        self.assertIn("Lane 1: Mainline (Dual Loop)", tooltip)
+        self.assertIn("LANE COUNTS OVER TIME (PeMS Change Log):", tooltip)
+        self.assertIn("04/09/2016", tooltip)
+        self.assertIn("05/20/2017", tooltip)
+        self.assertIn("123", tooltip)
+        self.assertIn("1234", tooltip)
+        self.assertIn("Active", tooltip)
+        self.assertIn("SPREADSHEET AUDIT (Sensor #1):", tooltip)
+        self.assertIn("Lanes: 3 before -> 4 after", tooltip)
+        self.assertIn("New Lane Activation: 2017", tooltip)
+        self.assertIn("TSN ROADWAY CROSS-SECTION:", tooltip)
+        self.assertIn("Road Width: 48 ft | Lane Width: 12.0 ft", tooltip)
+
+    def test_format_station_lane_config_tooltip_with_full_change_log(self):
+        # Full change log should preserve all 17 entries without collapsing or omitting
+        change_log = [
+            {"Date": f"01/01/200{i}" if i < 10 else f"01/01/20{i}", "Status": "Active", "Lanes": "1234"}
+            for i in range(17)
+        ]
+        st = pems_interface.StationLaneConfigDetails(
+            station_id="401318",
+            station_name="Red Top Rd",
+            station_type="ML",
+            lane_table=[{"Lane": str(i+1), "Type": "Mainline"} for i in range(4)],
+            change_log=change_log
+        )
+        tooltip = pems_interface.format_station_lane_config_tooltip(st)
+        self.assertIn("CURRENT LANES: 4", tooltip)
+        self.assertIn("01/01/2000", tooltip)
+        self.assertNotIn("unchanged checkpoints", tooltip)
+        self.assertIn("01/01/2008", tooltip)
+        self.assertIn("01/01/2016", tooltip)
+        for i in range(17):
+            dt = f"01/01/200{i}" if i < 10 else f"01/01/20{i}"
+            self.assertIn(dt, tooltip)
+
+    def test_web_page_contains_hover_tooltips_and_cache(self):
+        import tempfile
+        import json
+
+        # Pre-cache station 410756
+        st = pems_interface.StationLaneConfigDetails(
+            station_id="410756",
+            station_name="EB 12 OC",
+            district="4",
+            route="80",
+            direction="E",
+            county="Solano",
+            station_type="ML",
+            ca_pm="11.86",
+            abs_pm=39.33,
+            lane_table=[{"Lane": "1", "Type": "Mainline"}],
+            change_log=[{"Date": "04/09/2016", "Status": "Active", "Lanes": "12345"}],
+        )
+        pems_interface.save_cached_station_config(st)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_html = pems_interface.generate_project_validation_web_page(
+                project_id="418000244",
+                output_dir=tmpdir,
+                fetch_online=False
+            )
+            self.assertTrue(os.path.exists(out_html))
+            with open(out_html, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Global station tooltip element and script data present
+            self.assertIn('id="global-station-tooltip"', content)
+            self.assertIn('id="station-tooltips-data"', content)
+
+            # Tooltip hover triggers present in station rows
+            self.assertIn('class="st-hover"', content)
+            self.assertIn('data-station-id="410756"', content)
+
+            # Verify tooltip JSON is valid and includes station 410756
+            import re
+            m = re.search(r'<script id="station-tooltips-data" type="application/json">\s*(\{.*?\})\s*</script>', content, re.DOTALL)
+            self.assertIsNotNone(m)
+            tooltips = json.loads(m.group(1))
+            self.assertIn("410756", tooltips)
+            self.assertIn("STATION 410756", tooltips["410756"])
+            self.assertIn("LANE COUNTS OVER TIME", tooltips["410756"])
 
 
 if __name__ == "__main__":
