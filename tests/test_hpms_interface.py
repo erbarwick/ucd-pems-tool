@@ -53,23 +53,23 @@ class TestHPMSClient(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    @patch("urllib.request.urlopen")
-    def test_query_caching(self, mock_urlopen):
+    @patch("requests.Session.get")
+    def test_query_caching(self, mock_get):
         # Mock network response
         mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = b'[{"test_key": "test_val"}]'
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [{"test_key": "test_val"}]
+        mock_get.return_value = mock_resp
 
         # First query should hit network
         res1 = self.client.query("test_uid", where="route=99", use_cache=True)
         self.assertEqual(res1, [{"test_key": "test_val"}])
-        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(mock_get.call_count, 1)
 
         # Second identical query should hit disk cache without network call
         res2 = self.client.query("test_uid", where="route=99", use_cache=True)
         self.assertEqual(res2, [{"test_key": "test_val"}])
-        self.assertEqual(mock_urlopen.call_count, 1)
+        self.assertEqual(mock_get.call_count, 1)
 
     @patch.object(HPMSClient, "query")
     def test_get_spatial_sections(self, mock_query):
@@ -392,78 +392,85 @@ class TestRobustDataIntegrity(unittest.TestCase):
     @patch("hpms_interface.HPMSClient.query")
     def test_strict_historical_route_id_query(self, mock_query):
         """Verify that HPMS historical queries strictly match Caltrans SHS routes and omit dangerous wildcards."""
-        client = HPMSClient(cache_dir=tempfile.mkdtemp())
-        mock_query.return_value = []
+        with tempfile.TemporaryDirectory() as cache_tmp:
+            client = HPMSClient(cache_dir=cache_tmp)
+            mock_query.return_value = []
 
-        # 2018 query
-        client.get_historical_event_lanes(route_number=4, begin_pm=10.0, end_pm=20.0, year=2018)
-        self.assertTrue(mock_query.called)
-        where_clause = mock_query.call_args[1]["where"]
+            # 2018 query
+            client.get_historical_event_lanes(route_number=4, begin_pm=10.0, end_pm=20.0, year=2018)
+            self.assertTrue(mock_query.called)
+            where_clause = mock_query.call_args[1]["where"]
 
-        # Ensure exact SHS patterns are checked
-        self.assertIn("route_id='SHS_004_P'", where_clause)
-        self.assertIn("route_id='SHS_4_P'", where_clause)
-        # Ensure dangerous wildcard like '%4%P%' is NOT present
-        self.assertNotIn("%4%P%", where_clause)
+            # Ensure exact SHS patterns are checked
+            self.assertIn("route_id='SHS_004_P'", where_clause)
+            self.assertIn("route_id='SHS_4_P'", where_clause)
+            # Ensure dangerous wildcard like '%4%P%' is NOT present
+            self.assertNotIn("%4%P%", where_clause)
 
-    def test_dual_direction_handling(self):
+    @patch("hpms_interface.HPMSClient.query")
+    def test_dual_direction_handling(self, mock_query):
         """Verify that passing direction='NB' vs direction='SB' correctly targets directional rows."""
-        temp_dir = tempfile.TemporaryDirectory()
-        master_csv = os.path.join(temp_dir.name, "master.csv")
-        df_master = pd.DataFrame([
-            {
-                "Project ID": 1014000158,
-                "Route": 99,
-                "County": "San Joaquin",
-                "Direction": "NB",
-                "Begin PM": 10.0,
-                "End PM": 15.0,
-                "total_lanes_before": 4.0,
-                "total_lanes_after": 6.0,
-                "dir_lanes_before": 2.0,
-                "dir_lanes_after": 3.0,
-                "Project Description": "NB widening"
-            },
-            {
-                "Project ID": 1014000158,
-                "Route": 99,
-                "County": "San Joaquin",
-                "Direction": "SB",
-                "Begin PM": 12.0,
-                "End PM": 17.0,
-                "total_lanes_before": 4.0,
-                "total_lanes_after": 6.0,
-                "dir_lanes_before": 2.0,
-                "dir_lanes_after": 3.0,
-                "Project Description": "SB widening"
-            }
-        ])
-        df_master.to_csv(master_csv, index=False)
+        mock_query.return_value = [
+            {"begin_point": "100.0", "end_point": "107.0", "through_lanes": "4", "aadt": "50000"}
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master_csv = os.path.join(temp_dir, "master.csv")
+            df_master = pd.DataFrame([
+                {
+                    "Project ID": 1014000158,
+                    "Route": 99,
+                    "County": "San Joaquin",
+                    "Direction": "NB",
+                    "Begin PM": 10.0,
+                    "End PM": 15.0,
+                    "total_lanes_before": 4.0,
+                    "total_lanes_after": 6.0,
+                    "dir_lanes_before": 2.0,
+                    "dir_lanes_after": 3.0,
+                    "Project Description": "NB widening"
+                },
+                {
+                    "Project ID": 1014000158,
+                    "Route": 99,
+                    "County": "San Joaquin",
+                    "Direction": "SB",
+                    "Begin PM": 12.0,
+                    "End PM": 17.0,
+                    "total_lanes_before": 4.0,
+                    "total_lanes_after": 6.0,
+                    "dir_lanes_before": 2.0,
+                    "dir_lanes_after": 3.0,
+                    "Project Description": "SB widening"
+                }
+            ])
+            df_master.to_csv(master_csv, index=False)
 
-        ref_csv = os.path.join(temp_dir.name, "ref.csv")
-        df_ref = pd.DataFrame([
-            {"Route": 99, "County": "San Joaquin", "CA PM": "10.0", "Abs PM": 100.0},
-            {"Route": 99, "County": "San Joaquin", "CA PM": "12.0", "Abs PM": 102.0},
-            {"Route": 99, "County": "San Joaquin", "CA PM": "15.0", "Abs PM": 105.0},
-            {"Route": 99, "County": "San Joaquin", "CA PM": "17.0", "Abs PM": 107.0}
-        ])
-        df_ref.to_csv(ref_csv, index=False)
+            ref_csv = os.path.join(temp_dir, "ref.csv")
+            df_ref = pd.DataFrame([
+                {"Route": 99, "County": "San Joaquin", "CA PM": "10.0", "Abs PM": 100.0},
+                {"Route": 99, "County": "San Joaquin", "CA PM": "12.0", "Abs PM": 102.0},
+                {"Route": 99, "County": "San Joaquin", "CA PM": "15.0", "Abs PM": 105.0},
+                {"Route": 99, "County": "San Joaquin", "CA PM": "17.0", "Abs PM": 107.0}
+            ])
+            df_ref.to_csv(ref_csv, index=False)
 
-        engine = HPMSCorridorEngine(master_csv_path=master_csv, ref_path=ref_csv)
+            engine = HPMSCorridorEngine(
+                master_csv_path=master_csv,
+                ref_path=ref_csv,
+                client=HPMSClient(cache_dir=os.path.join(temp_dir, "cache")),
+            )
 
-        # Inspect NB
-        nb_insp = engine.inspect_project(1014000158, direction="NB")
-        self.assertEqual(nb_insp["direction"], "NB")
-        self.assertEqual(nb_insp["begin_pm"], 10.0)
-        self.assertEqual(nb_insp["end_pm"], 15.0)
+            # Inspect NB
+            nb_insp = engine.inspect_project(1014000158, direction="NB")
+            self.assertEqual(nb_insp["direction"], "NB")
+            self.assertEqual(nb_insp["begin_pm"], 10.0)
+            self.assertEqual(nb_insp["end_pm"], 15.0)
 
-        # Inspect SB
-        sb_insp = engine.inspect_project(1014000158, direction="SB")
-        self.assertEqual(sb_insp["direction"], "SB")
-        self.assertEqual(sb_insp["begin_pm"], 12.0)
-        self.assertEqual(sb_insp["end_pm"], 17.0)
-
-        temp_dir.cleanup()
+            # Inspect SB
+            sb_insp = engine.inspect_project(1014000158, direction="SB")
+            self.assertEqual(sb_insp["direction"], "SB")
+            self.assertEqual(sb_insp["begin_pm"], 12.0)
+            self.assertEqual(sb_insp["end_pm"], 17.0)
 
     @patch("hpms_interface.HPMSCorridorEngine.tandem_audit_project")
     def test_fill_local_spreadsheet_protects_qualitative_cells(self, mock_audit):

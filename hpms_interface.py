@@ -20,126 +20,34 @@ import shutil
 import datetime
 import argparse
 import textwrap
-import urllib.request
-import urllib.parse
 from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
+import requests
 
-# Base Directories
-WORKSPACE_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(WORKSPACE_DIR, "downloads", "hpms_cache")
-DEFAULT_MASTER_CSV = os.path.join(WORKSPACE_DIR, "staging", "Master_CA_Project_List_Cleaned.csv")
-DEFAULT_REF_PATH = os.path.join(WORKSPACE_DIR, "downloads", "merged_geo_pm.csv")
+from pems.config import (
+    CA_COUNTY_FIPS,
+    CA_FIPS_TO_COUNTY,
+    CA_STATE_FIPS,
+    DEFAULT_HPMS_CACHE_DIR as CACHE_DIR,
+    DEFAULT_MASTER_CSV,
+    DEFAULT_REF_PATH,
+    HPMS_HISTORIC_UNIVERSE,
+    HPMS_SECTION_ENDPOINTS,
+    HPMS_SPATIAL_ENDPOINTS,
+    WORKSPACE_DIR,
+)
+from pems.geo import resolve_absolute_postmiles
+from pems.normalize import (
+    assert_not_box_path,
+    format_aadt_display as _fmt_aadt_display,
+    is_empty_cell as _is_empty_cell,
+    parse_postmile,
+)
+from pems.projects import save_master_csv_with_backup
+from pems.vds import load_vds_metadata
 
-# Ensure cache dir exists
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-# California FIPS code
-CA_STATE_FIPS = 6
-
-# Mapping of California County Name to County FIPS (odd numbers 1 to 115)
-CA_COUNTY_FIPS = {
-    "alameda": 1, "alpine": 3, "amador": 5, "butte": 7, "calaveras": 9,
-    "colusa": 11, "contra costa": 13, "del norte": 15, "el dorado": 17, "fresno": 19,
-    "glenn": 21, "humboldt": 23, "imperial": 25, "inyo": 27, "kern": 29,
-    "kings": 31, "lake": 33, "lassen": 35, "los angeles": 37, "madera": 39,
-    "marin": 41, "mariposa": 43, "mendocino": 45, "merced": 47, "modoc": 49,
-    "mono": 51, "monterey": 53, "napa": 55, "nevada": 57, "orange": 59,
-    "placer": 61, "plumas": 63, "riverside": 65, "sacramento": 67, "san benito": 69,
-    "san bernardino": 71, "san diego": 73, "san francisco": 75, "san joaquin": 77,
-    "san luis obispo": 79, "san mateo": 81, "santa barbara": 83, "santa clara": 85,
-    "santa cruz": 87, "shasta": 89, "sierra": 91, "siskiyou": 93, "solano": 95,
-    "sonoma": 97, "stanislaus": 99, "sutter": 101, "tehama": 103, "trinity": 105,
-    "tulare": 107, "tuolumne": 109, "ventura": 111, "yolo": 113, "yuba": 115
-}
-CA_FIPS_TO_COUNTY = {v: k.title() for k, v in CA_COUNTY_FIPS.items()}
-
-# Dataset Endpoints on datahub.transportation.gov
-# Modern Spatial All Sections (wide schema with through_lanes, dir_through_lanes, aadt, wkt line)
-HPMS_SPATIAL_ENDPOINTS = {
-    2024: "42um-tgh5",
-}
-
-# Annual Roadway Events / Sections (EAV or section format)
-HPMS_SECTION_ENDPOINTS = {
-    2024: "4wpf-u82y",
-    2023: "8gz6-23ex",
-    2022: "fsfq-kawt",
-    2021: "trfk-mhda",
-    2020: "q8hw-cdnd",
-    2019: "rkzg-z7ht",  # Roadway Sections West 2019
-    2018: "v9ae-hsuk",  # Roadway Sections West 2018
-}
-
-# Historical Universe Datasets (1980 - 2008)
-HPMS_HISTORIC_UNIVERSE = {
-    2008: "65pp-nswq", 2007: "9vq4-dn8b", 2006: "w95q-6nqw", 2005: "8xu8-ax8r",
-    2004: "kpa7-pmax", 2003: "ismp-dmnm", 2002: "brry-xrw9", 2001: "w2yw-84zu",
-    2000: "hddu-nghv", 1999: "6mnf-74vh", 1998: "dzuk-qpr3", 1997: "sgat-h8mv",
-    1996: "922p-sj4m", 1995: "3n3x-bbb4", 1994: "affx-yhsw", 1993: "g5nf-5mpb",
-    1992: "5cn3-yynq", 1991: "mhuc-n78n", 1990: "mp2w-t2nd", 1989: "mxiv-t53i",
-    1988: "dbr2-hxmv", 1987: "e56t-hfa9", 1986: "cu4q-nx8c", 1985: "2m53-wgng",
-    1984: "j2gk-sh7k", 1983: "6itn-mw5q", 1982: "br2w-67fy", 1981: "wekv-ifsj",
-    1980: "efu4-vidc"
-}
-
-
-def parse_postmile(val: Any) -> Tuple[Optional[float], str]:
-    """Parses a Caltrans postmile value, extracting the numeric float while preserving
-    the original string label (including prefixes like 'R', 'M', 'L', 'C', 'G' and suffixes).
-
-    Returns (numeric_float, original_string).
-    If val is invalid/empty, returns (None, "").
-    """
-    if val is None or pd.isna(val):
-        return None, ""
-    s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", ""):
-        return None, ""
-
-    cleaned = s.replace("PM", "").replace("pm", "").strip()
-    match = re.search(r"[-+]?\d*\.?\d+", cleaned)
-    if match:
-        try:
-            num = float(match.group(0))
-            return num, s
-        except Exception:
-            pass
-    return None, s
-
-
-def _fmt_aadt_display(val: Any) -> str:
-    """Formats an AADT value for display in reports.
-    If it is an integer or clean float, formats with commas.
-    If it is an archival range, curve, or annotation, preserves the raw string as-is.
-    If empty/null, returns '(None)'.
-    """
-    if pd.isna(val) or val is None:
-        return "(None)"
-    s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", ""):
-        return "(None)"
-
-    clean_dig = s.replace(".0", "").replace(",", "").strip()
-    if clean_dig.isdigit():
-        try:
-            return f"{int(clean_dig):,}"
-        except Exception:
-            pass
-    return s
-
-
-def _is_empty_cell(val: Any) -> bool:
-    """Returns True only if a cell is genuinely empty (None, NaN, blank string, or 0/0.0).
-    Returns False if the cell contains qualitative research notes, dates, ranges,
-    or non-integer strings (e.g. '8,510; 2020 \n 10,000; 2030' or '23,000-36,000').
-    This protects qualitative researcher data from being accidentally overwritten.
-    """
-    if val is None or pd.isna(val):
-        return True
-    s = str(val).strip()
-    return s in ("", "nan", "None", "0", "0.0")
 
 
 class HPMSClient:
@@ -150,12 +58,21 @@ class HPMSClient:
     def __init__(self, cache_dir: str = CACHE_DIR):
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "CERCET-HPMS-Client/1.0"})
 
-    def query(self, dataset_uid: str, where: Optional[str] = None, select: Optional[str] = None,
-              order: Optional[str] = None, limit: int = 5000, offset: int = 0,
-              use_cache: bool = True) -> List[Dict[str, Any]]:
+    def query(
+        self,
+        dataset_uid: str,
+        where: Optional[str] = None,
+        select: Optional[str] = None,
+        order: Optional[str] = None,
+        limit: int = 5000,
+        offset: int = 0,
+        use_cache: bool = True,
+    ) -> List[Dict[str, Any]]:
         """Query SODA REST API with automatic caching and retry logic."""
-        params = {}
+        params: Dict[str, str] = {}
         if where:
             params["$where"] = where
         if select:
@@ -166,7 +83,6 @@ class HPMSClient:
         if offset > 0:
             params["$offset"] = str(offset)
 
-        # Cache key based on dataset UID and query parameters
         cache_key_str = f"{dataset_uid}__" + "_".join(f"{k}={v}" for k, v in sorted(params.items()))
         safe_filename = "".join(c if c.isalnum() or c in "._-" else "_" for c in cache_key_str)[:200] + ".json"
         cache_path = os.path.join(self.cache_dir, safe_filename)
@@ -178,27 +94,24 @@ class HPMSClient:
             except Exception:
                 pass
 
-        url = f"{self.BASE_URL}/{dataset_uid}.json?{urllib.parse.urlencode(params)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "CERCET-HPMS-Client/1.0"})
-
+        url = f"{self.BASE_URL}/{dataset_uid}.json"
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    if resp.status == 200:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        if use_cache:
-                            try:
-                                with open(cache_path, "w", encoding="utf-8") as f:
-                                    json.dump(data, f)
-                            except Exception:
-                                pass
-                        return data
-                    else:
-                        raise RuntimeError(f"HTTP {resp.status}: {resp.reason}")
-            except Exception as e:
+                resp = self.session.get(url, params=params, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if use_cache:
+                        try:
+                            with open(cache_path, "w", encoding="utf-8") as f:
+                                json.dump(data, f)
+                        except Exception:
+                            pass
+                    return data
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.reason}")
+            except Exception as exc:
                 if attempt == max_retries - 1:
-                    raise RuntimeError(f"Failed to query HPMS endpoint {dataset_uid}: {e}")
+                    raise RuntimeError(f"Failed to query HPMS endpoint {dataset_uid}: {exc}") from exc
                 time.sleep(1.0 * (attempt + 1))
 
         return []
@@ -308,129 +221,21 @@ class HPMSClient:
         return []
 
 
-def resolve_absolute_postmiles(
-    route: Any,
-    county: str,
-    begin_pm: Any,
-    end_pm: Any,
-    ref_df: Optional[pd.DataFrame] = None,
-    ref_path: Optional[str] = None
-) -> Tuple[Optional[float], Optional[float]]:
-    """Converts County Postmiles (CA PM) to Absolute / Continuous Postmiles (Abs PM)
-    using the Caltrans Geo Postmile reference table.
-
-    Robust to numeric or string routes (e.g. 5, '5', '005') and postmile alignment
-    prefixes (e.g. 'R11.7', '39.0').
-
-    Returns (abs_begin_pm, abs_end_pm) or (None, None) if matching fails or
-    if cross-county inversion is detected.
-    """
-    if ref_df is None or ref_df.empty:
-        target_path = ref_path or DEFAULT_REF_PATH
-        if os.path.exists(target_path):
-            try:
-                for sep in (",", "\t"):
-                    try:
-                        df_cand = pd.read_csv(target_path, sep=sep, low_memory=False)
-                        if "Route" in df_cand.columns or "Fwy" in df_cand.columns:
-                            ref_df = df_cand
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                return None, None
-        else:
-            return None, None
-
-    if ref_df is None or ref_df.empty:
-        return None, None
-
-    if route is None or not str(route).strip():
-        return None, None
-    if not county or not str(county).strip():
-        return None, None
-
-    # Parse postmiles to float
-    if isinstance(begin_pm, (int, float)) and not pd.isna(begin_pm):
-        b_num = float(begin_pm)
-    else:
-        b_num, _ = parse_postmile(begin_pm)
-
-    if isinstance(end_pm, (int, float)) and not pd.isna(end_pm):
-        e_num = float(end_pm)
-    else:
-        e_num, _ = parse_postmile(end_pm)
-
-    if b_num is None or e_num is None:
-        return None, None
-
-    # Match route (supporting int or str)
-    rt_str = str(route).strip().lstrip("0") or "0"
-    route_col = "Route" if "Route" in ref_df.columns else "Fwy"
-    if route_col not in ref_df.columns or "County" not in ref_df.columns:
-        return None, None
-
-    route_mask = (ref_df[route_col].astype(str).str.strip().str.lstrip("0") == rt_str)
-    county_clean = str(county).strip().lower()
-    county_mask = (ref_df["County"].astype(str).str.strip().str.lower() == county_clean)
-
-    sub = ref_df[route_mask & county_mask]
-    if sub.empty:
-        return None, None
-
-    # Clean numeric CA PM
-    def to_float(val):
-        try:
-            if isinstance(val, (int, float)):
-                return float(val)
-            val_str = str(val).strip().lstrip("RMLCGE")
-            return float(val_str)
-        except Exception:
-            return None
-
-    sub_clean = sub.copy()
-    sub_clean["clean_ca_pm"] = sub_clean["CA PM"].apply(to_float)
-    sub_clean["clean_abs_pm"] = pd.to_numeric(sub_clean["Abs PM"], errors="coerce")
-    sub_valid = sub_clean.dropna(subset=["clean_ca_pm", "clean_abs_pm"])
-
-    if sub_valid.empty:
-        return None, None
-
-    # Sort by CA PM
-    sub_valid = sub_valid.sort_values(by="clean_ca_pm")
-
-    # Guard against cross-county boundary inversion: if begin_pm > end_pm,
-    # snapping both against the same county produces an inverted, false corridor.
-    if b_num > e_num:
-        return None, None
-
-    # Find closest Abs PM for begin_pm and end_pm
-    idx_b = (sub_valid["clean_ca_pm"] - b_num).abs().idxmin()
-    idx_e = (sub_valid["clean_ca_pm"] - e_num).abs().idxmin()
-
-    delta_b = abs(sub_valid.loc[idx_b, "clean_ca_pm"] - b_num)
-    delta_e = abs(sub_valid.loc[idx_e, "clean_ca_pm"] - e_num)
-    if delta_b > 2.0 or delta_e > 2.0:
-        # Distance too large to snap safely
-        return None, None
-
-    abs_begin = float(sub_valid.loc[idx_b, "clean_abs_pm"])
-    abs_end = float(sub_valid.loc[idx_e, "clean_abs_pm"])
-
-    return min(abs_begin, abs_end), max(abs_begin, abs_end)
-
-
 class HPMSCorridorEngine:
     """Matches highway projects against HPMS corridor data, calculates lane metrics,
 
     and performs validation against project descriptions and spreadsheet values.
     """
 
-    def __init__(self, master_csv_path: str = DEFAULT_MASTER_CSV,
-                 ref_path: str = DEFAULT_REF_PATH):
+    def __init__(
+        self,
+        master_csv_path: str = DEFAULT_MASTER_CSV,
+        ref_path: str = DEFAULT_REF_PATH,
+        client: Optional[HPMSClient] = None,
+    ):
         self.master_csv_path = master_csv_path
         self.ref_path = ref_path
-        self.client = HPMSClient()
+        self.client = client or HPMSClient()
         self._ref_df: Optional[pd.DataFrame] = None
         self._master_df: Optional[pd.DataFrame] = None
 
@@ -529,7 +334,6 @@ class HPMSCorridorEngine:
         lanes_before = row.get("total_lanes_before")
         lanes_after = row.get("total_lanes_after")
         dir_before = row.get("dir_lanes_before")
-        dir_after = row.get("dir_lanes_after")
         dir_after = row.get("dir_lanes_after")
 
         # Query 2024 HPMS Spatial Sections
@@ -998,7 +802,6 @@ class HPMSCorridorEngine:
         pems_predom_lanes = None
 
         try:
-            from pems_interface import load_vds_metadata
             meta = load_vds_metadata()
             pems_dir = dir_val[0] if dir_val else "N"
             stns = meta.find_corridor_stations(
@@ -1318,14 +1121,7 @@ class HPMSCorridorEngine:
         if target_path is None:
             target_path = os.path.join(WORKSPACE_DIR, "staging", "Master_CA_Project_List_Cleaned.csv")
 
-        abs_path = os.path.abspath(target_path)
-        # STRICT BOX-BOX REJECTION GUARD
-        if "box-box" in abs_path.lower() or "cloudstorage/box" in abs_path.lower():
-            raise PermissionError(
-                f"CRITICAL SAFETY VIOLATION: Refusing to modify Box spreadsheet at {target_path}. "
-                "Direct edits to the Box master spreadsheet are strictly prohibited. "
-                "Target only local repository files (e.g. staging/Master_CA_Project_List_Cleaned.csv)."
-            )
+        assert_not_box_path(target_path)
 
         if not os.path.exists(target_path):
             raise FileNotFoundError(f"Local master spreadsheet not found: {target_path}")
@@ -1504,21 +1300,17 @@ class HPMSCorridorEngine:
 
         # Apply Mode
         if candidates:
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = f"{target_path}.bak_{ts}"
-            shutil.copy2(target_path, backup_path)
-            print(f"\n[BACKUP CREATED]: {backup_path}")
-
             for c in candidates:
                 idx = c["index"]
                 fld = c["field"]
                 val = c["proposed_val"]
-                df_local.at[idx, fld] = val
+                df_local.loc[idx, fld] = val
                 if "field_year" in c and c["field_year"] and "proposed_year" in c:
-                    df_local.at[idx, c["field_year"]] = c["proposed_year"]
+                    df_local.loc[idx, c["field_year"]] = c["proposed_year"]
                 applied_count += 1
 
-            df_local.to_csv(target_path, index=False)
+            backup_path, _ = save_master_csv_with_backup(target_path, df_local, use_iso_timestamp=True)
+            print(f"\n[BACKUP CREATED]: {backup_path}")
             print(f"[APPLIED SUCCESSFULLY]: Updated {applied_count} values in {target_path}")
         else:
             print("\nNo candidate fills to apply.")

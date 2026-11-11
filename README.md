@@ -204,9 +204,11 @@ python pems_interface.py -p 300020420 --find-open-date          # Infer opening 
 python pems_interface.py --find-open-date                       # Evaluate all missing projects statewide
 python pems_interface.py --find-open-date --apply               # Commit inferred dates with backup
 
-# 8. FETCH RAW PeMS STATION LANE TABLES & TSN ROADWAY METRICS:
+# 8. FETCH OR PRE-CACHE RAW PeMS STATION LANE TABLES & TSN ROADWAY METRICS:
 python pems_interface.py -p 400000680 --lanes                 # Fetch lane tables & TSN metrics for all project stations
 python pems_interface.py -s 410756 --lanes                    # Fetch raw lane table & TSN metrics for single station
+python pems_interface.py --download-lane-config               # Pre-cache station lane configs locally for all projects
+python pems_interface.py -p 414000032 --web --fast            # Launch validation web UI using local cache only
 python pems_interface.py -p 400000680 --lanes --output-report reports/lanes.json  # Export structured JSON
 
 # 9. SEARCH STATIONS BY COORDINATE RANGE (ROUTE-LOCKED CORRIDOR):
@@ -433,6 +435,11 @@ python pems_interface.py --lanes 400000680
 
 # Fetch lane table & TSN metrics for a single detector station ID:
 python pems_interface.py -s 410756 --lanes
+
+# Bulk pre-cache PeMS station configs locally (`downloads/station_config_cache/`) so `--web --fast` runs offline:
+python pems_interface.py --download-lane-config
+python pems_interface.py -p 400000680 --download-lane-config
+python pems_interface.py --download-lane-config --dist 4 --overwrite
 
 # Export structured JSON containing all parsed tables and TSN key-value pairs:
 python pems_interface.py -p 400000680 --lanes --output-report reports/project_lanes.json

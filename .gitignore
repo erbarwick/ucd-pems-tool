@@ -53,3 +53,5 @@ project_*/
 
 # Backups
 backup_legacy/
+
+*.temp

@@ -25,14 +25,15 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 os.chdir(_HERE)
 
-import pems_interface
-from pems_interface import (
+import pems
+from pems import (
     DEFAULT_MASTER_CSV,
     DEFAULT_REF_PATH,
     IndexedGeoReference,
     add_standard_basemaps_to_map,
     build_multi_project_map,
     build_single_project_map,
+    download_station_data,
     format_pm,
     get_corridor_stations,
     get_indexed_geo_ref,
@@ -41,6 +42,7 @@ from pems_interface import (
     normalize_direction,
     normalize_route,
     pm_to_coordinates,
+    reset_geo_cache,
     split_ca_pm,
 )
 
@@ -572,8 +574,7 @@ def api_route(route):
 
 @app.post("/api/reload")
 def api_reload():
-    pems_interface._INDEXED_GEO_REF = None
-    pems_interface._RAW_GEO_DF = None
+    reset_geo_cache()
     try:
         idx_ref = get_indexed_geo_ref()
         rows = len(idx_ref.raw_df) if idx_ref.raw_df is not None else 0
@@ -616,7 +617,7 @@ def api_download_station_view(sid):
         export_fmt = request.args.get("export_format", "text").strip().lower()
 
         out_dir = os.path.join(_HERE, "downloads", "stations", str(sid).strip())
-        res = pems_interface.download_station_data(
+        res = download_station_data(
             station_id=sid,
             data_type=data_type,
             granularity=granularity,
@@ -651,12 +652,12 @@ def healthz():
         "default_ref_path": DEFAULT_REF_PATH,
         "reference_rows": None if df is None else int(len(df)),
         "master_csv": DEFAULT_MASTER_CSV,
-        "pems_module": getattr(pems_interface, "__file__", None),
+        "pems_module": getattr(pems, "__file__", None),
     })
 
 
 if __name__ == "__main__":
-    print(f"pems_interface : {getattr(pems_interface, '__file__', '?')}")
+    print(f"pems           : {getattr(pems, '__file__', '?')}")
     print(f"reference      : {DEFAULT_REF_PATH}")
     df0 = reference_df()
     print(f"                 {'not found' if df0 is None else str(len(df0)) + ' rows'}")
