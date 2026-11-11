@@ -17,6 +17,9 @@ downloads/*.txt
 downloads/*.txt.*
 downloads/*.zip
 downloads/imagery/
+downloads/hpms_cache/
+downloads/station_config_cache/
+downloads/web/
 *.bk
 *.bak
 *.bak_*
@@ -38,9 +41,17 @@ Thumbs.db
 
 # Output HTML maps and logs
 route_map_*.html
+corridor_route_*.html
 all_ca_projects_map.html
 district_*_projects_map.html
+hpms_triad_audit_*.csv
+hpms_audit_report_*.csv
 *.log
+
+# Project download folders
+project_*/
 
 # Backups
 backup_legacy/
+
+*.temp

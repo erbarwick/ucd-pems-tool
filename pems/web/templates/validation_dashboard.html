@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROJECT VALIDATION: {{ target_pid }} - Route {{ primary_proj.route }}</title>
+  <style>
+{% include "_base_utilitarian.css" %}
+    body { font-size: 12px; line-height: 1.4; padding: 10px 14px 40px 14px; }
+    header { border-bottom: 2px solid #000000; padding-bottom: 8px; margin-bottom: 12px; }
+    .top-meta { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+    h1 { font-size: 15px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; }
+    .top-nav { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; }
+    .nav-btn {
+      background: #ffffff; border: 1px solid #000000; color: #000000;
+      padding: 2px 6px; font-family: inherit; font-size: 11px; text-decoration: none; cursor: pointer;
+    }
+    .nav-btn:hover, .nav-btn.active { background: #000000; color: #ffffff; }
+    .action-btn {
+      background: #ffffff; border: 1px solid #000000; color: #000000;
+      padding: 1px 4px; font-family: inherit; font-size: 10px; cursor: pointer;
+    }
+    .action-btn:hover { background: #000000; color: #ffffff; }
+    .badge {
+      display: inline-block; padding: 1px 4px; font-weight: bold;
+      font-size: 10px; border: 1px solid #000000; white-space: nowrap;
+    }
+    .badge-pass { background: #e6f4ea; color: #137333; border-color: #137333; }
+    .badge-warn { background: #fef7e0; color: #b06000; border-color: #b06000; }
+    .badge-info { background: #e8f0fe; color: #1a73e8; border-color: #1a73e8; }
+    .badge-neutral { background: #f1f3f4; color: #3c4043; border-color: #5f6368; }
+    .dashboard-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 12px; }
+    @media (max-width: 1120px) { .dashboard-grid { grid-template-columns: 1fr; } }
+    .card { border: 1px solid #000000; margin-bottom: 12px; background: #ffffff; }
+    .card-header {
+      background: #f0f0f0; border-bottom: 1px solid #000000; padding: 4px 8px;
+      font-weight: bold; font-size: 11px; display: flex; justify-content: space-between; align-items: center;
+    }
+    .card-body { padding: 8px; }
+    table { font-size: 11px; margin-bottom: 4px; }
+    th, td { padding: 4px 6px; vertical-align: top; }
+    tr:nth-child(even) td { background: #fafafa; }
+    .map-frame { width: 100%; height: 480px; border: 1px solid #000000; display: block; background: #f4f4f4; }
+    .slider-box {
+      position: relative; width: 100%; overflow: hidden;
+      border: 1px solid #000000; user-select: none; cursor: ew-resize;
+    }
+    .slider-box img { display: block; width: 100%; height: auto; }
+    .slider-box .img-top {
+      position: absolute; top: 0; left: 0; height: 100%; width: 100%; clip-path: inset(0 50% 0 0);
+    }
+    .slider-tag { top: 6px; }
+    .slider-tag-after { left: 6px; }
+    .slider-tag-before { right: 6px; }
+    .slider-handle {
+      position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+      background: #000000; pointer-events: none; z-index: 4;
+    }
+    .slider-handle::after {
+      content: "<>"; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background: #ffffff; border: 1px solid #000000; font-size: 9px; padding: 1px 3px; font-weight: bold;
+    }
+    a { color: #0000ee; text-decoration: underline; }
+    a:hover { background: #000000; color: #ffffff; text-decoration: none; }
+    .quick-actions { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 8px 0; font-size: 11px; align-items: center; }
+    .action-link {
+      padding: 2px 5px; border: 1px solid #000000; background: #ffffff;
+      text-decoration: none; color: #000000; font-weight: bold; font-size: 10px;
+    }
+    .action-link:hover { background: #000000; color: #ffffff; }
+    #global-station-tooltip {
+      position: fixed; display: none; z-index: 999999; background: #ffffff; color: #000000;
+      border: 1px solid #000000; padding: 8px 10px; font-family: inherit; font-size: 11px;
+      line-height: 1.35; white-space: pre; pointer-events: none; max-width: 90vw; max-height: 85vh; overflow: auto;
+    }
+    .st-hover { display: inline-block; cursor: help; border-bottom: 1px dotted #000000; }
+    .st-hover:hover, .st-hover:focus { background: #000000; color: #ffffff; }
+    .st-hover:hover a, .st-hover:focus a { color: #ffffff !important; }
+  </style>
+</head>
+<body>
+
+  <div id="global-station-tooltip" role="tooltip"></div>
+  <script id="station-tooltips-data" type="application/json">
+{{ station_tooltips_json | safe }}
+  </script>
+
+  <header>
+    <div class="top-meta">
+      <div>
+        <h1>[PROJECT VALIDATION DASHBOARD] PID: {{ target_pid }}</h1>
+        <div style="font-size: 11px; color: #444; margin-top: 2px;">
+          District {{ primary_proj.dist }}, {{ primary_proj.county }} County | Route {{ primary_proj.route }} | PM {{ primary_proj.begin_pm }} &rarr; {{ primary_proj.end_pm }}
+        </div>
+      </div>
+      <div style="font-size: 11px; text-align: right;">
+        <span>Research Tool | Single-Screen Validation Mode</span>
+      </div>
+    </div>
+
+    <div class="top-nav">
+      <span style="font-weight:bold; align-self:center;">DIRECTIONS:</span>
+      {% for d in directions %}
+      <button type="button" class="nav-btn{% if d.is_active %} active{% endif %}" data-dir-target="{{ d.dir_id }}" onclick="showDirection('{{ d.dir_id }}')">Direction {{ d.dir_label }} (Route {{ d.route }})</button>
+      {% endfor %}
+      <span style="border-left:1px solid #ccc; margin:0 4px;"></span>
+      <a href="project_map.html" target="_blank" class="nav-btn">[Open Standalone Map]</a>
+      <a href="{{ ge_corridor_url }}" target="_blank" class="nav-btn">[Google Earth Full Corridor]</a>
+      <a href="{{ gmaps_corridor_url }}" target="_blank" class="nav-btn">[Google Maps Full Corridor]</a>
+    </div>
+  </header>
+
+  <div class="dashboard-grid">
+    <div class="col-left">
+      {% for d in directions %}
+      <div class="dir-section" id="{{ d.dir_id }}" style="display: {% if d.is_active %}block{% else %}none{% endif %};">
+
+        {% if d.inverted_abs_pm %}
+        <div class="alert-banner" style="background: #fef7e0; border: 1px solid #b06000; color: #7a4100; padding: 6px 10px; margin-bottom: 10px; font-size: 11px;">
+          <strong>[DATA WARNING: BACKWARDS ABSOLUTE POSTMILES]</strong> {{ d.abs_pm_warning }}
+        </div>
+        {% endif %}
+
+        <div class="card">
+          <div class="card-header">
+            <span>GROUND TRUTH VALIDATION MATRIX</span>
+            <span>Direction: {{ d.dir_label }}</span>
+          </div>
+          <div class="card-body">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width: 22%;">Metric / Dimension</th>
+                  <th style="width: 26%;">Master Spreadsheet</th>
+                  <th style="width: 26%;">HPMS Ground Truth</th>
+                  <th style="width: 26%;">Validation Verdict</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Total Through Lanes</strong></td>
+                  <td>{{ d.sheet_lanes_str }}</td>
+                  <td>{{ d.hpms_lanes_str }}</td>
+                  <td><span class="badge {{ d.lane_badge_cls }}">{{ d.lane_badge_text }}</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Directional Lanes</strong></td>
+                  <td>Before: {{ d.dir_lanes_before }} &rarr; After: {{ d.dir_lanes_after }}</td>
+                  <td>{{ d.vds_lanes_str }}</td>
+                  <td><span class="badge badge-info">[INSPECT SENSORS]</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Corridor Postmiles &amp; Length</strong></td>
+                  <td>{{ d.pm_range_str }} ({{ d.sheet_len_str }})</td>
+                  <td>Road Alignment: {{ d.geom_len_str }}<br><span style="color:#555;">({{ d.abs_range_str }})</span></td>
+                  <td><span class="badge {{ d.pm_badge_cls }}">{{ d.pm_badge_text }}</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Traffic Volumes (AADT)</strong></td>
+                  <td>{{ d.sheet_aadt_str }}</td>
+                  <td>{{ d.hpms_aadt_str }}</td>
+                  <td><span class="badge {{ d.aadt_badge_cls }}">{{ d.aadt_badge_text }}</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Detector Sensors Audit</strong></td>
+                  <td>{{ d.sheet_sensors_cnt }} listed:
+                    {% if d.sheet_sensor_ids %}
+                      {% for sid in d.sheet_sensor_ids %}<span class="st-hover" data-station-id="{{ sid }}" tabindex="0"><strong>{{ sid }}</strong></span>{% if not loop.last %}, {% endif %}{% endfor %}
+                    {% else %}None{% endif %}
+                  </td>
+                  <td>{{ d.vds_cnt }} active:
+                    {% if d.vds_sensor_ids %}
+                      {% for sid in d.vds_sensor_ids %}<span class="st-hover" data-station-id="{{ sid }}" tabindex="0"><strong>{{ sid }}</strong></span>{% if not loop.last %}, {% endif %}{% endfor %}
+                    {% else %}None{% endif %}
+                  </td>
+                  <td><span class="badge {{ d.sensor_badge_cls }}">{{ d.sensor_badge_text }}</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span>CORRIDOR DETECTOR STATIONS AUDIT ({{ d.stations | length }} Total in Corridor &amp; Buffer)</span>
+            <span>Tolerance: &plusmn;{{ "%.2f"|format(station_buffer_mi) }} mi</span>
+          </div>
+          <div class="card-body" style="overflow-x: auto; max-height: 380px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Station ID</th>
+                  <th>Type</th>
+                  <th>Fwy/Dir</th>
+                  <th>County PM</th>
+                  <th>Abs PM</th>
+                  <th>Lanes</th>
+                  <th>Corridor Bounds</th>
+                  <th>Sheet Status</th>
+                  <th>Cross Street / Location</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% if d.stations %}
+                  {% for st in d.stations %}
+                  <tr>
+                    <td>
+                      <span class="st-hover" data-station-id="{{ st.id }}" tabindex="0"><a href="https://pems.dot.ca.gov/?report_form=1&dnode=VDS&content=summary&tab=summary&station_id={{ st.id }}" target="_blank"><strong>{{ st.id }}</strong></a></span>{% if st.has_focus %} <button type="button" class="action-btn" onclick="focusMap({{ '%.6f'|format(st.lat) }}, {{ '%.6f'|format(st.lon) }}, 17, 'Station {{ st.id }}')">[Map]</button>{% endif %}
+                    </td>
+                    <td>{{ st.type }}</td>
+                    <td>{{ st.fwy }} {{ st.dir }}</td>
+                    <td>{{ st.county }} {{ st.state_pm }}</td>
+                    <td>{{ st.abs_pm_str }}</td>
+                    <td><strong>{{ st.lanes_str }}</strong></td>
+                    <td><span class="badge {{ st.bounds_cls }}">{{ st.bounds_text }}</span></td>
+                    <td><span class="badge {{ st.sheet_cls }}">{{ st.sheet_text }}</span></td>
+                    <td>{{ st.name }}</td>
+                  </tr>
+                  {% endfor %}
+                {% else %}
+                  <tr><td colspan="9" style="text-align:center; color:#555;">(No detector stations found in corridor or sheet)</td></tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span>MASTER SPREADSHEET RECORD ATTRIBUTES</span>
+            <span>Project ID: {{ d.project_id }}</span>
+          </div>
+          <div class="card-body">
+            <div style="margin-bottom: 8px;">
+              <strong>Project Description:</strong>
+              <div style="background:#fafafa; border:1px solid #ccc; padding:6px 8px; margin-top:4px;">
+                {{ d.description }}
+              </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px;">
+              <div>
+                <strong>Timeline &amp; Cost:</strong>
+                <table style="margin-top: 4px;">
+                  <tr><td>Construction Begin</td><td><strong>{{ d.const_begin }}</strong></td></tr>
+                  <tr><td>Open to Traffic</td><td><strong>{{ d.open_date }}</strong></td></tr>
+                  <tr><td>Project Cost</td><td>{{ d.project_cost }}</td></tr>
+                  <tr><td>VMT Mitigation Cost</td><td>{{ d.vmt_cost }}</td></tr>
+                </table>
+              </div>
+              <div>
+                <strong>Added Lane Miles Itemization:</strong>
+                <table style="margin-top: 4px;">
+                  {% if d.breakdown %}
+                    {% for label, val in d.breakdown %}
+                    <tr><td>{{ label }}</td><td><strong>{{ val }}</strong></td></tr>
+                    {% endfor %}
+                  {% else %}
+                    <tr><td colspan="2" style="color:#555;">(No specific added lane miles itemized)</td></tr>
+                  {% endif %}
+                </table>
+              </div>
+            </div>
+
+            <div style="margin-top: 8px;">
+              <strong>Reviewer &amp; Audit Notes:</strong>
+              <table style="margin-top: 4px;">
+                <tr><td style="width: 25%;">Reviewer / Notes</td><td>{{ d.reviewer }}: {{ d.notes }}</td></tr>
+                <tr><td>Peer Reviewer</td><td>{{ d.peer_reviewer }}: {{ d.peer_notes }}</td></tr>
+              </table>
+            </div>
+          </div>
+        </div>
+
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="col-right">
+      <div class="card">
+        <div class="card-header">
+          <span>INTERACTIVE CORRIDOR MAP &amp; DETECTOR OVERLAY</span>
+          <div class="quick-actions" style="margin:0;">
+            <a href="project_map.html" target="_blank" class="action-link">[Fullscreen]</a>
+            <a href="{{ ge_corridor_url }}" target="_blank" class="action-link">[Google Earth]</a>
+            <a href="{{ gmaps_corridor_url }}" target="_blank" class="action-link">[Google Maps]</a>
+          </div>
+        </div>
+        <div class="card-body" style="padding:0;">
+          <iframe id="mapFrame" class="map-frame" src="project_map.html"></iframe>
+          <div style="padding: 6px 8px; font-size: 10px; color: #555; border-top: 1px solid #000; background: #fafafa;">
+            Showing highway alignment path and all detector stations (ML, HV, OR, FR). Click [Map] on any station row to center.
+          </div>
+        </div>
+      </div>
+
+      {% if slices %}
+      <div class="card">
+        <div class="card-header">
+          <span>HISTORICAL SATELLITE IMAGERY SLICES ({{ slices | length }} Segments)</span>
+          <span>Native Zoom 19 (~0.3m/px)</span>
+        </div>
+        <div class="card-body">
+          <div style="font-size:11px; margin-bottom: 6px; color:#333;">
+            <div>{{ before_flight_str }}</div>
+            <div>{{ after_flight_str }}</div>
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:8px;">
+            <div class="quick-actions" style="margin:0; max-height:85px; overflow-y:auto; border:1px solid #ccc; padding:4px;">
+              <span style="font-weight:bold;">Segments:</span>
+              {% for s in slices %}
+              <button type="button" class="nav-btn{% if s.index == 1 %} active{% endif %}" data-slice-chip="{{ s.index }}" onclick="showSlice({{ s.index }})">Seg {{ s.index }}{{ s.pm_label }}</button>
+              {% endfor %}
+            </div>
+            <div class="quick-actions" style="margin:0;">
+              <span style="font-weight:bold;">View:</span>
+              <button type="button" class="nav-btn active" id="btn-view-slider" onclick="setSliceView('slider')">[Slider]</button>
+              <button type="button" class="nav-btn" id="btn-view-stacked" onclick="setSliceView('stacked')">[Stacked]</button>
+              <button type="button" class="nav-btn" id="btn-view-split" onclick="setSliceView('split')">[Side-by-Side]</button>
+            </div>
+          </div>
+
+          {% for s in slices %}
+          <div class="slice-panel" id="slice-panel-{{ s.index }}" style="display: {% if s.index == 1 %}block{% else %}none{% endif %};">
+            <div class="quick-actions" style="margin-bottom: 6px;">
+              <span style="font-weight:bold;">Segment {{ s.index }} Links:</span>
+              <a href="{{ s.ge_url }}" target="_blank" class="action-link">[Google Earth]</a>
+              <button type="button" class="action-btn" onclick="focusMap({{ '%.6f'|format(s.mid_lat) }}, {{ '%.6f'|format(s.mid_lon) }}, 17, 'Segment {{ s.index }} Center')">[Focus on Map]</button>
+              <a href="{{ s.gmaps_url }}" target="_blank" class="action-link">[Google Maps]</a>
+              {% if s.stacked_rel %}<a href="{{ s.stacked_rel }}" target="_blank" class="action-link">[Stacked PNG]</a>{% endif %}
+            </div>
+
+            {% if s.before_rel and s.after_rel %}
+            <div class="slice-view slice-slider-view active" id="view-slider-{{ s.index }}">
+              <div class="slider-box" id="slider-box-{{ s.index }}">
+                <img src="{{ s.before_rel }}" alt="Before Image">
+                <div class="img-top"><img src="{{ s.after_rel }}" alt="After Image"></div>
+                <div class="slider-tag slider-tag-after">AFTER: {{ s.after_capture_date }}</div>
+                <div class="slider-tag slider-tag-before">BEFORE: {{ s.before_capture_date }}</div>
+                <div class="slider-handle"></div>
+              </div>
+              <div style="text-align:center; font-size:10px; color:#555; margin-top:4px;">&lt; Drag handle to wipe between Before and After imagery &gt;</div>
+            </div>
+            {% endif %}
+
+            {% if s.stacked_rel %}
+            <div class="slice-view slice-stacked-view" id="view-stacked-{{ s.index }}" style="display:none;">
+              <img src="{{ s.stacked_rel }}" style="width:100%; height:auto; border:1px solid #000;" alt="Stacked PNG">
+            </div>
+            {% endif %}
+
+            {% if s.before_rel and s.after_rel %}
+            <div class="slice-view slice-split-view" id="view-split-{{ s.index }}" style="display:none;">
+              <div style="display:grid; grid-template-columns: 1fr 1fr; gap:6px;">
+                <div><div style="font-weight:bold; font-size:10px;">BEFORE</div><img src="{{ s.before_rel }}" style="width:100%; border:1px solid #000;" alt="Before"></div>
+                <div><div style="font-weight:bold; font-size:10px;">AFTER</div><img src="{{ s.after_rel }}" style="width:100%; border:1px solid #000;" alt="After"></div>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+          {% endfor %}
+
+          {% if dedicated_report_rel %}
+          <div style="margin-top:10px; border-top:1px solid #ccc; padding-top:6px;">
+            <a href="{{ dedicated_report_rel }}" target="_blank" class="action-link">[Open Full Dedicated Slices Report (index.html)]</a>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% else %}
+      <div class="card">
+        <div class="card-header">
+          <span>HISTORICAL SATELLITE IMAGERY</span>
+          <span>Status: Not Generated</span>
+        </div>
+        <div class="card-body" style="padding:14px; background:#fafafa;">
+          <p><strong>[Imagery Slices: Not Generated]</strong></p>
+          <p style="margin-top:6px; color:#444;">No native Zoom 19 historical before/after corridor slices found for Project {{ target_pid }}.</p>
+          <p style="margin-top:8px;">To download high-resolution Before/After imagery and generate interactive curtain wipe sliders, run:</p>
+          <pre style="background:#000; color:#fff; padding:6px 10px; margin-top:6px; font-family:inherit; font-size:11px;">uv run pems_interface.py -p {{ target_pid }} --slices</pre>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <script>
+{% include "_slider.js" %}
+    function showDirection(dirId) {
+      document.querySelectorAll('.dir-section').forEach(function(s) { s.style.display = 'none'; });
+      var target = document.getElementById(dirId);
+      if (target) target.style.display = 'block';
+      document.querySelectorAll('[data-dir-target]').forEach(function(b) {
+        b.classList.toggle('active', b.getAttribute('data-dir-target') === dirId);
+      });
+    }
+
+    var currentSlice = 1;
+    function showSlice(sliceIdx) {
+      currentSlice = sliceIdx;
+      document.querySelectorAll('.slice-panel').forEach(function(p) { p.style.display = 'none'; });
+      var target = document.getElementById('slice-panel-' + sliceIdx);
+      if (target) target.style.display = 'block';
+      document.querySelectorAll('[data-slice-chip]').forEach(function(c) {
+        c.classList.toggle('active', parseInt(c.getAttribute('data-slice-chip')) === sliceIdx);
+      });
+    }
+
+    function setSliceView(mode) {
+      ['slider', 'stacked', 'split'].forEach(function(m) {
+        var btn = document.getElementById('btn-view-' + m);
+        if (btn) btn.classList.toggle('active', m === mode);
+      });
+      document.querySelectorAll('.slice-view').forEach(function(v) { v.style.display = 'none'; });
+      document.querySelectorAll('.slice-' + mode + '-view').forEach(function(v) { v.style.display = 'block'; });
+    }
+
+    var pendingMapFocus = null;
+    function focusMap(lat, lon, zoom, label) {
+      if (isNaN(lat) || isNaN(lon)) return;
+      var frame = document.getElementById('mapFrame');
+      if (!frame) return;
+      var z = zoom || 17;
+      var lbl = label || 'Focus Location';
+
+      try {
+        if (frame.contentWindow && typeof frame.contentWindow.centerMapAt === 'function') {
+          frame.contentWindow.centerMapAt(lat, lon, z, lbl);
+          return;
+        }
+      } catch (e) {}
+
+      try {
+        if (frame.contentWindow && typeof frame.contentWindow.postMessage === 'function') {
+          frame.contentWindow.postMessage({ type: 'FOCUS_MAP', lat: lat, lon: lon, zoom: z, label: lbl }, '*');
+          return;
+        }
+      } catch (e) {}
+
+      pendingMapFocus = { lat: lat, lon: lon, zoom: z, label: lbl };
+      try {
+        if (frame.contentWindow && frame.contentWindow.location) {
+          frame.contentWindow.location.hash = '#' + lat + ',' + lon + ',' + z + ',' + encodeURIComponent(lbl);
+          return;
+        }
+      } catch (e) {}
+      frame.src = 'project_map.html#' + lat + ',' + lon + ',' + z + ',' + encodeURIComponent(lbl);
+    }
+
+    window.addEventListener('DOMContentLoaded', function() {
+      var frame = document.getElementById('mapFrame');
+      if (frame) {
+        frame.addEventListener('load', function() {
+          try {
+            if (frame.contentWindow && typeof frame.contentWindow.postMessage === 'function') {
+              frame.contentWindow.postMessage({ type: 'INVALIDATE_SIZE' }, '*');
+            }
+          } catch (e) {}
+          if (pendingMapFocus) {
+            setTimeout(function() {
+              focusMap(pendingMapFocus.lat, pendingMapFocus.lon, pendingMapFocus.zoom, pendingMapFocus.label);
+              pendingMapFocus = null;
+            }, 350);
+          }
+        });
+      }
+
+      document.querySelectorAll('.slider-box').forEach(function(box) {
+        attachCurtainSlider(box, box.querySelector('.img-top'), box.querySelector('.slider-handle'));
+      });
+    });
+
+    var stationTooltipsData = {};
+    try {
+      var stDataEl = document.getElementById('station-tooltips-data');
+      if (stDataEl) stationTooltipsData = JSON.parse(stDataEl.textContent);
+    } catch (e) {}
+
+    var globalTooltip = document.getElementById('global-station-tooltip');
+    function updateTooltipPosition(e) {
+      if (!globalTooltip) return;
+      var pad = 14, x = e.clientX + pad, y = e.clientY + pad;
+      var rect = globalTooltip.getBoundingClientRect();
+      if (x + rect.width > window.innerWidth - 10) x = Math.max(10, e.clientX - rect.width - pad);
+      if (y + rect.height > window.innerHeight - 10) y = Math.max(10, e.clientY - rect.height - pad);
+      globalTooltip.style.left = Math.max(10, x) + 'px';
+      globalTooltip.style.top = Math.max(10, y) + 'px';
+    }
+
+    document.addEventListener('mouseover', function(e) {
+      var hoverTarget = e.target.closest('.st-hover');
+      if (hoverTarget && globalTooltip) {
+        var sid = hoverTarget.getAttribute('data-station-id');
+        globalTooltip.textContent = stationTooltipsData[sid] || ('Station ' + sid + '\n(No configuration data cached)');
+        globalTooltip.style.display = 'block';
+        updateTooltipPosition(e);
+      }
+    });
+    document.addEventListener('mousemove', function(e) {
+      if (globalTooltip && globalTooltip.style.display === 'block') updateTooltipPosition(e);
+    });
+    document.addEventListener('mouseout', function(e) {
+      if (e.target.closest('.st-hover') && globalTooltip) globalTooltip.style.display = 'none';
+    });
+  </script>
+</body>
+</html>

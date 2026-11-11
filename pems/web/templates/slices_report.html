@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project {{ project.project_id }} - Roadway Geometry Historical Comparison</title>
+  <style>
+{% include "_base_utilitarian.css" %}
+    body {
+      font-size: 13px;
+      padding-bottom: 60px;
+    }
+    header {
+      background: #ffffff;
+      border-bottom: 2px solid #000000;
+      padding: 14px 20px;
+    }
+    .header-content { max-width: 1400px; margin: 0 auto; }
+    h1 { font-size: 16px; font-weight: bold; color: #000000; margin-bottom: 4px; }
+    .subtitle { font-size: 12px; color: #333333; }
+    .nav-bar {
+      max-width: 1400px;
+      margin: 12px auto 0 auto;
+      padding: 0 20px;
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      font-size: 11px;
+    }
+    .nav-chip {
+      background: #ffffff;
+      border: 1px solid #000000;
+      color: #000000;
+      padding: 2px 6px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .nav-chip:hover { background: #000000; color: #ffffff; }
+    .container { max-width: 1400px; margin: 16px auto; padding: 0 20px; }
+    table { margin-bottom: 14px; font-size: 12px; }
+    th, td { padding: 5px 8px; }
+    .project-desc-box {
+      border: 1px solid #000000;
+      padding: 8px 12px;
+      margin-bottom: 20px;
+      background: #ffffff;
+      font-size: 12px;
+    }
+    .overview-section { border-bottom: 1px solid #000000; padding-bottom: 20px; margin-bottom: 24px; }
+    .overview-section h3 { font-size: 13px; font-weight: bold; margin-bottom: 8px; }
+    .overview-img { display: block; width: 100%; height: auto; border: 1px solid #000000; }
+    .segment-section { border-bottom: 1px solid #000000; padding-bottom: 24px; margin-bottom: 28px; }
+    .segment-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding-bottom: 6px; margin-bottom: 8px; border-bottom: 1px solid #cccccc; flex-wrap: wrap; gap: 8px;
+    }
+    .segment-title-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .seg-idx, .seg-title { font-weight: bold; }
+    .seg-bearing { font-size: 11px; color: #555555; }
+    .sensor-table { margin: 8px 0; width: auto; }
+    .view-toggles { display: flex; gap: 4px; }
+    .toggle-btn {
+      background: #ffffff; border: 1px solid #000000; color: #000000;
+      padding: 3px 8px; font-family: inherit; font-size: 11px; cursor: pointer;
+    }
+    .toggle-btn.active { background: #000000; color: #ffffff; font-weight: bold; }
+    .view-panel { display: none; padding: 8px 0; background: #ffffff; }
+    .view-panel.active { display: block; }
+    .compare-box {
+      position: relative; width: 100%; overflow: hidden; border: 1px solid #000000;
+      user-select: none; cursor: ew-resize; background: #ffffff; line-height: 0;
+    }
+    .img-base { display: block; width: 100%; height: auto; pointer-events: none; }
+    .img-overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; pointer-events: none; clip-path: inset(0 50% 0 0);
+    }
+    .slider-tag { top: 8px; letter-spacing: 0.5px; }
+    .slider-tag-after { left: 8px; }
+    .slider-tag-before { right: 8px; }
+    .slider-divider {
+      position: absolute; top: 0; bottom: 0; left: 50%; width: 2px;
+      background: #ffffff; pointer-events: none; z-index: 4;
+    }
+    .slider-thumb {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      width: 24px; height: 24px; background: #ffffff; color: #000000;
+      border: 1px solid #000000; display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: bold;
+    }
+    .slider-hint { text-align: center; font-size: 11px; color: #555555; margin-top: 6px; }
+    .full-stacked-img, .split-img { display: block; width: 100%; height: auto; border: 1px solid #000000; }
+    .split-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .split-col { position: relative; }
+    .col-tag { font-size: 11px; font-weight: bold; margin-bottom: 4px; }
+    .segment-footer { padding: 8px 0; font-size: 11px; color: #555555; }
+    .slice-verification-bar {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      margin: 8px 0 12px 0; padding: 6px 10px; background: #fafafa;
+      border: 1px solid #000000; font-size: 11px;
+    }
+    .verif-label {
+      font-weight: bold; color: #000000; text-transform: uppercase;
+      font-size: 10px; letter-spacing: 0.5px; margin-right: 4px;
+    }
+    .verif-link {
+      display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px;
+      background: #ffffff; color: #000000; border: 1px solid #000000;
+      text-decoration: none; font-size: 11px; font-weight: bold; line-height: 1.2;
+    }
+    .verif-link:hover { background: #000000; color: #ffffff; }
+    .verif-link.ge-link { background: #f0fdf4; border-color: #166534; color: #166534; }
+    .verif-link.ge-link:hover { background: #166534; color: #ffffff; }
+    .verif-link.map-link { background: #eff6ff; border-color: #1d4ed8; color: #1d4ed8; }
+    .verif-link.map-link:hover { background: #1d4ed8; color: #ffffff; }
+    .verif-link.gmaps-link { background: #fffbeb; border-color: #b45309; color: #b45309; }
+    .verif-link.gmaps-link:hover { background: #b45309; color: #ffffff; }
+    .verif-link.file-link { background: #f8fafc; border-color: #334155; color: #334155; }
+    .verif-link.file-link:hover { background: #334155; color: #ffffff; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="header-content">
+    <div class="title-area">
+      <h1>[PID {{ project.project_id }}] Route {{ project.route }} {{ project.direction }} Roadway Geometry Comparison</h1>
+      <div class="subtitle">{{ project.county }} County (District {{ project.dist }}) | Postmile Range: {{ project.begin_pm }} &rarr; {{ project.end_pm }}</div>
+    </div>
+  </div>
+</header>
+
+<div class="nav-bar">
+  <span style="font-weight:bold; color:#444; align-self:center; margin-right:4px;">SLICES:</span>
+  {% for s in cards %}
+  <a href="#seg-{{ s.index }}" class="nav-chip">Seg {{ s.index }} ({{ s.pm_range_label }})</a>
+  {% endfor %}
+  {% if map_file %}
+  <span style="border-left: 1px solid #ccc; margin: 0 4px;"></span>
+  <a href="{{ map_file }}" target="_blank" class="nav-chip" style="background:#eff6ff; border-color:#1d4ed8; color:#1d4ed8; font-weight:bold;">[Full Project Map with Stations]</a>
+  {% endif %}
+</div>
+
+<div class="container">
+  <table class="project-info-table">
+    <thead>
+      <tr>
+        <th>Route &amp; Corridor</th>
+        <th>Postmile Range</th>
+        <th>Pre-Construction Target</th>
+        <th>Post-Opening Target</th>
+        <th>Total Slices</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Route {{ project.route }} {{ project.direction }} ({{ project.county }})</td>
+        <td>{{ project.begin_pm }} &rarr; {{ project.end_pm }}</td>
+        <td>{{ project.construction_begin_date or 'N/A' }}</td>
+        <td>{{ project.open_to_traffic_date or 'N/A' }}</td>
+        <td>{{ cards | length }} Segments (Zoom 19)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  {% if project.project_description %}
+  <div class="project-desc-box"><strong>Project Description:</strong> {{ project.project_description }}</div>
+  {% endif %}
+
+  {% if overview_img_exists %}
+  <div class="overview-section">
+    <h3>Full Project Corridor Overview</h3>
+    <img src="{{ overview_img }}" class="overview-img" alt="Project Corridor Overview">
+  </div>
+  {% endif %}
+
+  {% for s in cards %}
+  <div class="segment-section" id="seg-{{ s.index }}">
+    <div class="segment-header">
+      <div class="segment-title-group">
+        <span class="seg-idx">[Segment {{ s.index }} of {{ cards | length }}]</span>
+        <span class="seg-title">{{ s.pm_range_label }} ({{ "%.2f"|format(s.length_mi) }} mi)</span>
+        {% if s.bearing_str %}<span class="seg-bearing">Heading {{ s.bearing_str }}&deg;</span>{% endif %}
+      </div>
+      <div class="view-toggles" data-seg="{{ s.index }}">
+        <button class="toggle-btn active" data-view="slider">Curtain Slider</button>
+        <button class="toggle-btn" data-view="stacked">Stacked</button>
+        <button class="toggle-btn" data-view="split">Side-by-Side</button>
+      </div>
+    </div>
+
+    <div class="slice-verification-bar">
+      <span class="verif-label">Ground-Truth Verification:</span>
+      <a href="{{ s.ge_url }}" target="_blank" rel="noopener noreferrer" class="verif-link ge-link" title="Open Google Earth 3D at midpoint ({{ '%.5f'|format(s.mid_lat) }}, {{ '%.5f'|format(s.mid_lon) }}) to inspect road markings, turn pockets, and lanes">[Google Earth]</a>
+      <a href="{{ s.local_map_target }}" target="_blank" rel="noopener noreferrer" class="verif-link map-link" title="Open local project map centered on this segment with all PeMS detector stations and lane overlays">[Local Station Map]</a>
+      <a href="{{ s.gmaps_url }}" target="_blank" rel="noopener noreferrer" class="verif-link gmaps-link" title="Open Google Maps satellite view for this segment">[Google Maps]</a>
+      <a href="{{ s.stacked_fn }}" target="_blank" rel="noopener noreferrer" class="verif-link file-link" title="Open raw full-resolution stacked comparison PNG">[Stacked PNG]</a>
+    </div>
+
+    {% if s.sensors %}
+    <table class="sensor-table">
+      <thead><tr><th>Sensor ID</th><th>Type</th><th>Postmile</th><th>Lanes</th></tr></thead>
+      <tbody>
+        {% for st in s.sensors %}
+        <tr><td>{{ st.id }}</td><td>{{ st.type }}</td><td>PM {{ st.pm }}</td><td>{{ st.lanes }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    <div class="view-panel panel-slider active" id="panel-slider-{{ s.index }}">
+      <div class="compare-box" id="compare-box-{{ s.index }}">
+        <img src="{{ s.before_fn }}" class="img-base" alt="Before Image" loading="lazy">
+        <img src="{{ s.after_fn }}" class="img-overlay" alt="After Image" loading="lazy">
+        <div class="slider-tag slider-tag-after">AFTER: {{ s.after_capture_date }}</div>
+        <div class="slider-tag slider-tag-before">BEFORE: {{ s.before_capture_date }}</div>
+        <div class="slider-divider"><div class="slider-thumb">&#8596;</div></div>
+      </div>
+      <div class="slider-hint">&lt; Drag slider to wipe between Before and After imagery &gt;</div>
+    </div>
+
+    <div class="view-panel panel-stacked" id="panel-stacked-{{ s.index }}">
+      <img src="{{ s.stacked_fn }}" class="full-stacked-img" alt="Stacked Comparison" loading="lazy">
+    </div>
+
+    <div class="view-panel panel-split" id="panel-split-{{ s.index }}">
+      <div class="split-grid">
+        <div class="split-col">
+          <div class="col-tag">BEFORE: {{ s.before_capture_date }}</div>
+          <img src="{{ s.before_fn }}" class="split-img" alt="Before" loading="lazy">
+        </div>
+        <div class="split-col">
+          <div class="col-tag">AFTER: {{ s.after_capture_date }}</div>
+          <img src="{{ s.after_fn }}" class="split-img" alt="After" loading="lazy">
+        </div>
+      </div>
+    </div>
+
+    <div class="segment-footer">
+      <span class="meta-note">
+        Midpoint: {{ "%.5f"|format(s.mid_lat) }}, {{ "%.5f"|format(s.mid_lon) }} | Resolution: Native Zoom {{ s.zoom }} (~0.3m/px) | Dimensions: {{ s.width }}&times;{{ s.height }} px |
+        <a href="{{ s.ge_url }}" target="_blank" style="color:#000; text-decoration:underline;">[Google Earth]</a>
+        <a href="{{ s.local_map_target }}" target="_blank" style="color:#000; text-decoration:underline; margin-left:6px;">[Local Station Map]</a>
+        <a href="{{ s.stacked_fn }}" target="_blank" style="color:#000; text-decoration:underline; margin-left:6px;">[View Full Stacked PNG]</a>
+      </span>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+{% include "_slider.js" %}
+  document.querySelectorAll('.compare-box').forEach(function(box) {
+    attachCurtainSlider(box, box.querySelector('.img-overlay'), box.querySelector('.slider-divider'));
+  });
+
+  document.querySelectorAll('.view-toggles').forEach(function(toggleGroup) {
+    var segIdx = toggleGroup.getAttribute('data-seg');
+    var btns = toggleGroup.querySelectorAll('.toggle-btn');
+    btns.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        btns.forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        var viewMode = btn.getAttribute('data-view');
+        var section = document.getElementById('seg-' + segIdx);
+        section.querySelectorAll('.view-panel').forEach(function(p) { p.classList.remove('active'); });
+        var targetPanel = section.querySelector('.panel-' + viewMode);
+        if (targetPanel) targetPanel.classList.add('active');
+      });
+    });
+  });
+</script>
+</body>
+</html>
